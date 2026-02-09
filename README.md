@@ -1,4 +1,4 @@
-# 17 物品管理系统 (17 Item Manager)
+# 17 物品管理系统 (17 Item Manager) 
 
 > 参考 Snipe-IT / Homebox / Grocy 设计的单文件 PHP 物品管理系统  
 > 零配置部署，SQLite 数据库，适配 Synology NAS Web Station
@@ -62,15 +62,15 @@
 
 ## 技术架构
 
-| 项目 | 说明 |
-|------|------|
-| 部署方式 | 单文件 `index.php`，零配置 |
-| 后端 | PHP + PDO |
-| 数据库 | SQLite（自动创建于 `data/items_db.sqlite`） |
-| 前端 | Tailwind CSS + RemixIcon + Vanilla JS |
-| API 风格 | RESTful，通过 `?api=` 路由 |
-| 依赖 | 无需 Composer，CSS/JS 通过 CDN 加载 |
-| 环境兼容 | Synology NAS Web Station / Apache / Nginx |
+| 项目     | 说明                                        |
+| -------- | ------------------------------------------- |
+| 部署方式 | 单文件 `index.php`，零配置                  |
+| 后端     | PHP + PDO                                   |
+| 数据库   | SQLite（自动创建于 `data/items_db.sqlite`） |
+| 前端     | Tailwind CSS + RemixIcon + Vanilla JS       |
+| API 风格 | RESTful，通过 `?api=` 路由                  |
+| 依赖     | 无需 Composer，CSS/JS 通过 CDN 加载         |
+| 环境兼容 | Synology NAS Web Station / Apache / Nginx   |
 
 ---
 
