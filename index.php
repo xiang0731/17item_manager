@@ -126,12 +126,99 @@ function initSchema($db)
             ['卧室', 0],
             ['厨房', 0],
             ['书房', 0],
-            ['阳台', 0],
-            ['储物间', 0],
         ];
         $stmt = $db->prepare("INSERT INTO locations (name, parent_id) VALUES (?, ?)");
         foreach ($defaults as $loc)
             $stmt->execute($loc);
+    }
+}
+
+function removeAllFilesInDir($dir)
+{
+    if (!is_dir($dir))
+        return;
+    $it = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::CHILD_FIRST
+    );
+    foreach ($it as $fileInfo) {
+        if ($fileInfo->isFile())
+            @unlink($fileInfo->getPathname());
+    }
+}
+
+function moveUploadFilesToTrash()
+{
+    if (!is_dir(UPLOAD_DIR))
+        return 0;
+    if (!is_dir(TRASH_DIR))
+        mkdir(TRASH_DIR, 0755, true);
+
+    $moved = 0;
+    $it = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator(UPLOAD_DIR, FilesystemIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::SELF_FIRST
+    );
+    foreach ($it as $fileInfo) {
+        if (!$fileInfo->isFile())
+            continue;
+        $src = $fileInfo->getPathname();
+        if (strpos($src, TRASH_DIR) === 0)
+            continue;
+        $targetName = basename($src);
+        if (file_exists(TRASH_DIR . $targetName)) {
+            $targetName = uniqid('trash_') . '_' . $targetName;
+        }
+        if (@rename($src, TRASH_DIR . $targetName)) {
+            $moved++;
+        }
+    }
+    return $moved;
+}
+
+function makeUniqueImportImageFilename($originalName)
+{
+    $originalName = basename((string) $originalName);
+    $base = pathinfo($originalName, PATHINFO_FILENAME);
+    $ext = strtolower(pathinfo($originalName, PATHINFO_EXTENSION));
+
+    $base = preg_replace('/[^\p{L}\p{N}_\-]/u', '', $base);
+    $ext = preg_replace('/[^a-z0-9]/', '', $ext);
+    if ($base === '')
+        $base = 'img_import';
+    if ($ext === '')
+        $ext = 'jpg';
+
+    $candidate = $base . '.' . $ext;
+    $idx = 1;
+    while (file_exists(UPLOAD_DIR . $candidate)) {
+        $candidate = $base . '_' . $idx . '.' . $ext;
+        $idx++;
+    }
+    return $candidate;
+}
+
+function getUploadErrorMessage($errCode)
+{
+    switch (intval($errCode)) {
+        case UPLOAD_ERR_OK:
+            return '';
+        case UPLOAD_ERR_INI_SIZE:
+            return '上传失败：文件超过服务器上传上限（php.ini）';
+        case UPLOAD_ERR_FORM_SIZE:
+            return '上传失败：文件超过表单限制';
+        case UPLOAD_ERR_PARTIAL:
+            return '上传失败：文件仅部分上传，请重试';
+        case UPLOAD_ERR_NO_FILE:
+            return '上传失败：未选择文件';
+        case UPLOAD_ERR_NO_TMP_DIR:
+            return '上传失败：服务器临时目录不可用';
+        case UPLOAD_ERR_CANT_WRITE:
+            return '上传失败：服务器写入文件失败';
+        case UPLOAD_ERR_EXTENSION:
+            return '上传失败：被服务器扩展拦截';
+        default:
+            return '上传失败：未知错误';
     }
 }
 
@@ -171,6 +258,7 @@ if (isset($_GET['api'])) {
                     $category = intval($_GET['category'] ?? 0);
                     $location = intval($_GET['location'] ?? 0);
                     $status = trim($_GET['status'] ?? '');
+                    $expiryOnly = intval($_GET['expiry_only'] ?? 0);
                     $sort = $_GET['sort'] ?? 'updated_at';
                     $order = ($_GET['order'] ?? 'DESC') === 'ASC' ? 'ASC' : 'DESC';
 
@@ -193,9 +281,12 @@ if (isset($_GET['api'])) {
                         $where[] = "i.status = ?";
                         $params[] = $status;
                     }
+                    if ($expiryOnly) {
+                        $where[] = "i.expiry_date IS NOT NULL AND i.expiry_date != ''";
+                    }
 
                     $whereSQL = $where ? 'WHERE ' . implode(' AND ', $where) : '';
-                    $allowedSort = ['name', 'quantity', 'purchase_price', 'created_at', 'updated_at'];
+                    $allowedSort = ['name', 'quantity', 'purchase_price', 'created_at', 'updated_at', 'expiry_date'];
                     $sortCol = in_array($sort, $allowedSort) ? $sort : 'updated_at';
 
                     $countStmt = $db->prepare("SELECT COUNT(*) FROM items i $whereSQL");
@@ -290,6 +381,56 @@ if (isset($_GET['api'])) {
                         $db->exec("UPDATE items SET deleted_at=datetime('now','localtime') WHERE id IN ($placeholders)");
                     }
                     $result = ['success' => true, 'message' => '已移入回收站'];
+                }
+                break;
+
+            case 'items/reset-all':
+                if ($method === 'POST') {
+                    $images = $db->query("SELECT image FROM items WHERE image != ''")->fetchAll(PDO::FETCH_COLUMN);
+                    $images = array_unique(array_filter($images));
+                    $moved = 0;
+                    foreach ($images as $img) {
+                        $src = UPLOAD_DIR . $img;
+                        if (!file_exists($src))
+                            continue;
+                        $targetName = $img;
+                        if (file_exists(TRASH_DIR . $targetName)) {
+                            $targetName = uniqid('trash_') . '_' . $img;
+                        }
+                        if (@rename($src, TRASH_DIR . $targetName)) {
+                            $moved++;
+                        }
+                    }
+                    $deleted = $db->exec("DELETE FROM items");
+                    try {
+                        $db->exec("DELETE FROM sqlite_sequence WHERE name='items'");
+                    } catch (Exception $e) { /* 某些 SQLite 版本可能无该表 */ }
+                    $result = ['success' => true, 'message' => '所有物品已删除，图片已移入 trash 目录', 'deleted' => intval($deleted ?: 0), 'moved_images' => $moved];
+                }
+                break;
+
+            case 'system/reset-default':
+                if ($method === 'POST') {
+                    $moved = moveUploadFilesToTrash();
+
+                    $db->beginTransaction();
+                    try {
+                        $db->exec("DELETE FROM items");
+                        $db->exec("DELETE FROM categories");
+                        $db->exec("DELETE FROM locations");
+                        try {
+                            $db->exec("DELETE FROM sqlite_sequence WHERE name IN ('items','categories','locations')");
+                        } catch (Exception $e) { /* 某些 SQLite 版本可能无该表 */ }
+                        $db->commit();
+                    } catch (Exception $e) {
+                        if ($db->inTransaction())
+                            $db->rollBack();
+                        throw $e;
+                    }
+
+                    // 重新注入默认分类和默认位置
+                    initSchema($db);
+                    $result = ['success' => true, 'message' => '已恢复默认环境，上传目录文件已移入 trash 目录', 'moved_images' => $moved];
                 }
                 break;
 
@@ -429,15 +570,31 @@ if (isset($_GET['api'])) {
 
             // ---------- 图片上传 ----------
             case 'upload':
-                if ($method === 'POST' && isset($_FILES['image'])) {
+                if ($method === 'POST') {
+                    if (!isset($_FILES['image'])) {
+                        $result = ['success' => false, 'message' => '未接收到图片文件，可能超过服务器 post_max_size 限制'];
+                        break;
+                    }
                     $file = $_FILES['image'];
+                    $uploadErr = intval($file['error'] ?? UPLOAD_ERR_NO_FILE);
+                    if ($uploadErr !== UPLOAD_ERR_OK) {
+                        $result = ['success' => false, 'message' => getUploadErrorMessage($uploadErr)];
+                        break;
+                    }
+
                     $allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
-                    if (!in_array($file['type'], $allowed)) {
+                    $mime = $file['type'] ?? '';
+                    if (function_exists('mime_content_type') && !empty($file['tmp_name']) && is_uploaded_file($file['tmp_name'])) {
+                        $detected = mime_content_type($file['tmp_name']);
+                        if ($detected)
+                            $mime = $detected;
+                    }
+                    if (!in_array($mime, $allowed, true)) {
                         $result = ['success' => false, 'message' => '不支持的图片格式'];
                         break;
                     }
                     if ($file['size'] > MAX_UPLOAD_SIZE) {
-                        $result = ['success' => false, 'message' => '文件超过10MB限制'];
+                        $result = ['success' => false, 'message' => '文件超过' . intval(MAX_UPLOAD_SIZE / 1024 / 1024) . 'MB限制'];
                         break;
                     }
                     $ext = pathinfo($file['name'], PATHINFO_EXTENSION);
@@ -451,10 +608,56 @@ if (isset($_GET['api'])) {
                     $itemName = mb_substr($itemName, 0, 30);
                     $suffix = ($origName ? '_' . $origName : '') . ($itemName ? '_' . $itemName : '');
                     $filename = uniqid('img_') . $suffix . '.' . $ext;
-                    if (move_uploaded_file($file['tmp_name'], UPLOAD_DIR . $filename)) {
+                    if (!is_uploaded_file($file['tmp_name'])) {
+                        $result = ['success' => false, 'message' => '上传失败：无效上传文件'];
+                    } elseif (move_uploaded_file($file['tmp_name'], UPLOAD_DIR . $filename)) {
                         $result = ['success' => true, 'filename' => $filename];
                     } else {
                         $result = ['success' => false, 'message' => '上传失败'];
+                    }
+                }
+                break;
+
+            case 'upload/batch-import':
+                if ($method === 'POST') {
+                    if (!isset($_FILES['images'])) {
+                        $result = ['success' => false, 'message' => '未选择图片文件'];
+                        break;
+                    }
+                    $files = $_FILES['images'];
+                    if (!is_array($files['name'] ?? null)) {
+                        $result = ['success' => false, 'message' => '图片参数格式错误'];
+                        break;
+                    }
+
+                    $map = [];
+                    $uploaded = 0;
+                    $errors = [];
+                    $count = count($files['name']);
+                    for ($i = 0; $i < $count; $i++) {
+                        $name = $files['name'][$i] ?? '';
+                        $tmpName = $files['tmp_name'][$i] ?? '';
+                        $err = intval($files['error'][$i] ?? UPLOAD_ERR_NO_FILE);
+                        $size = intval($files['size'][$i] ?? 0);
+                        if ($err !== UPLOAD_ERR_OK || !$name || !$tmpName)
+                            continue;
+                        if ($size > MAX_UPLOAD_SIZE) {
+                            $errors[] = $name . ' 超过' . intval(MAX_UPLOAD_SIZE / 1024 / 1024) . 'MB限制';
+                            continue;
+                        }
+                        $storedName = makeUniqueImportImageFilename($name);
+                        if (move_uploaded_file($tmpName, UPLOAD_DIR . $storedName)) {
+                            $map[$name] = $storedName;
+                            $uploaded++;
+                        } else {
+                            $errors[] = $name . ' 上传失败';
+                        }
+                    }
+
+                    if ($uploaded === 0) {
+                        $result = ['success' => false, 'message' => '没有成功上传任何图片', 'errors' => $errors];
+                    } else {
+                        $result = ['success' => true, 'message' => "成功上传 $uploaded 张图片", 'uploaded' => $uploaded, 'map' => $map, 'errors' => $errors];
                     }
                 }
                 break;
@@ -477,8 +680,47 @@ if (isset($_GET['api'])) {
                     }
                     $db->beginTransaction();
                     try {
+                        $imageNameMap = [];
+                        if (!empty($data['image_name_map']) && is_array($data['image_name_map'])) {
+                            foreach ($data['image_name_map'] as $old => $new) {
+                                $oldName = basename((string) $old);
+                                $newName = basename((string) $new);
+                                if ($oldName && $newName)
+                                    $imageNameMap[$oldName] = $newName;
+                            }
+                        }
+                        if (!empty($data['embedded_images']) && is_array($data['embedded_images'])) {
+                            $mimeExt = [
+                                'image/jpeg' => 'jpg',
+                                'image/jpg' => 'jpg',
+                                'image/png' => 'png',
+                                'image/gif' => 'gif',
+                                'image/webp' => 'webp',
+                                'image/bmp' => 'bmp',
+                                'image/svg+xml' => 'svg',
+                            ];
+                            foreach ($data['embedded_images'] as $oldName => $dataUrl) {
+                                $oldName = basename((string) $oldName);
+                                if (!$oldName || !is_string($dataUrl))
+                                    continue;
+                                if (!preg_match('/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/', $dataUrl, $m))
+                                    continue;
+                                $mime = strtolower($m[1]);
+                                $bin = base64_decode(str_replace(' ', '+', $m[2]), true);
+                                if ($bin === false || strlen($bin) === 0)
+                                    continue;
+
+                                $ext = $mimeExt[$mime] ?? strtolower(pathinfo($oldName, PATHINFO_EXTENSION));
+                                $seedName = pathinfo($oldName, PATHINFO_FILENAME) . '.' . ($ext ?: 'jpg');
+                                $storedName = makeUniqueImportImageFilename($seedName);
+                                if (@file_put_contents(UPLOAD_DIR . $storedName, $bin) !== false) {
+                                    $imageNameMap[$oldName] = $storedName;
+                                }
+                            }
+                        }
+
                         $imported = 0;
-                        $stmtItem = $db->prepare("INSERT INTO items (name, category_id, location_id, quantity, description, barcode, purchase_date, purchase_price, tags, status, expiry_date) VALUES (?,?,?,?,?,?,?,?,?,?,?)");
+                        $stmtItem = $db->prepare("INSERT INTO items (name, category_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
                         foreach ($data['items'] as $item) {
                             $catId = 0;
                             $locId = 0;
@@ -490,18 +732,30 @@ if (isset($_GET['api'])) {
                                 $loc = $db->query("SELECT id FROM locations WHERE name=" . $db->quote($item['location_name']))->fetchColumn();
                                 $locId = $loc ?: 0;
                             }
+                            $imageName = '';
+                            $oldImageName = basename((string) ($item['image'] ?? ''));
+                            if ($oldImageName) {
+                                if (!empty($imageNameMap[$oldImageName])) {
+                                    $imageName = $imageNameMap[$oldImageName];
+                                } elseif (file_exists(UPLOAD_DIR . $oldImageName)) {
+                                    $imageName = $oldImageName;
+                                }
+                            }
                             $stmtItem->execute([
                                 $item['name'] ?? '未命名',
                                 $catId,
                                 $locId,
                                 intval($item['quantity'] ?? 1),
                                 $item['description'] ?? '',
+                                $imageName,
                                 $item['barcode'] ?? '',
                                 $item['purchase_date'] ?? '',
                                 floatval($item['purchase_price'] ?? 0),
                                 $item['tags'] ?? '',
                                 $item['status'] ?? 'active',
-                                $item['expiry_date'] ?? ''
+                                $item['expiry_date'] ?? '',
+                                $item['purchase_from'] ?? '',
+                                $item['notes'] ?? ''
                             ]);
                             $imported++;
                         }
@@ -658,7 +912,7 @@ getDB(); // 确保数据库初始化
         }
 
         .sidebar-group.open .sidebar-submenu {
-            max-height: 200px;
+            max-height: 480px;
         }
 
         .sidebar-sub {
@@ -978,10 +1232,64 @@ getDB(); // 确保数据库初始化
             color: #475569;
         }
 
-        .empty-state i {
+        .empty-state>i {
             font-size: 64px;
             margin-bottom: 16px;
             display: block;
+        }
+
+        .empty-state .btn-first-item {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            padding: 11px 18px;
+            border-radius: 12px;
+            font-weight: 600;
+            letter-spacing: 0.2px;
+            background: linear-gradient(135deg, #22d3ee 0%, #3b82f6 55%, #6366f1 100%);
+            border: 1px solid rgba(125, 211, 252, 0.35);
+            box-shadow: 0 12px 26px rgba(37, 99, 235, 0.32);
+            transition: transform 0.2s, box-shadow 0.2s, filter 0.2s;
+        }
+
+        .empty-state .btn-first-item:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 16px 30px rgba(37, 99, 235, 0.38);
+            filter: saturate(1.08);
+        }
+
+        .empty-state .btn-first-item:active {
+            transform: translateY(0);
+            box-shadow: 0 8px 18px rgba(37, 99, 235, 0.3);
+        }
+
+        .btn-first-item-icon {
+            width: 22px;
+            height: 22px;
+            border-radius: 999px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(255, 255, 255, 0.2);
+        }
+
+        .btn-first-item-icon i {
+            font-size: 13px;
+            line-height: 1;
+            margin: 0;
+            display: inline;
+        }
+
+        .btn-first-item-text {
+            line-height: 1;
+        }
+
+        @media (max-width: 640px) {
+            .empty-state .btn-first-item {
+                width: min(100%, 320px);
+                justify-content: center;
+            }
         }
 
         /* 选中效果 */
@@ -1171,7 +1479,7 @@ getDB(); // 确保数据库初始化
                 <div class="sidebar-submenu">
                     <div class="sidebar-link sidebar-sub" data-view="import-export"
                         onclick="switchView('import-export')">
-                        <i class="ri-swap-line"></i><span class="sidebar-text">导入/导出</span>
+                        <i class="ri-swap-line"></i><span class="sidebar-text">数据管理</span>
                     </div>
                     <div class="sidebar-link sidebar-sub" data-view="settings" onclick="switchView('settings')">
                         <i class="ri-sort-asc"></i><span class="sidebar-text">排序设置</span>
@@ -1179,6 +1487,10 @@ getDB(); // 确保数据库初始化
                     <div class="sidebar-link sidebar-sub" data-view="status-settings"
                         onclick="switchView('status-settings')">
                         <i class="ri-list-settings-line"></i><span class="sidebar-text">状态管理</span>
+                    </div>
+                    <div class="sidebar-link sidebar-sub" data-view="channel-settings"
+                        onclick="switchView('channel-settings')">
+                        <i class="ri-shopping-bag-line"></i><span class="sidebar-text">购入渠道管理</span>
                     </div>
                     <div class="sidebar-link sidebar-sub" data-view="changelog" onclick="switchView('changelog')">
                         <i class="ri-history-line"></i><span class="sidebar-text">更新记录</span>
@@ -1263,7 +1575,9 @@ getDB(); // 确保数据库初始化
                     </div>
                     <div>
                         <label class="block text-sm text-slate-400 mb-1.5">购入渠道</label>
-                        <input type="text" id="itemPurchaseFrom" class="input" placeholder="例如: 京东、淘宝">
+                        <select id="itemPurchaseFrom" class="input">
+                            <option value="">未设置</option>
+                        </select>
                     </div>
                     <div>
                         <label class="block text-sm text-slate-400 mb-1.5">购入日期</label>
@@ -1289,7 +1603,7 @@ getDB(); // 确保数据库初始化
                         <label class="block text-sm text-slate-400 mb-1.5">备注</label>
                         <textarea id="itemNotes" class="input" rows="2" placeholder="内部备注，不对外显示..."></textarea>
                     </div>
-                    <div class="sm:col-span-2">
+                    <div class="sm:col-span-2 md:col-span-3">
                         <label class="block text-sm text-slate-400 mb-1.5">图片</label>
                         <div id="uploadZone" class="upload-zone"
                             onclick="document.getElementById('imageInput').click()">
@@ -1454,8 +1768,39 @@ getDB(); // 确保数据库初始化
             return App.statuses.map(s => ({ key: s.key, label: s.label, icon: s.icon, color: s.color }));
         }
 
+        // ---------- 购入渠道管理 ----------
+        const CHANNEL_KEY = 'item_manager_purchase_channels';
+        const defaultPurchaseChannels = ['淘宝', '京东', '拼多多', '闲鱼', '线下', '礼品'];
+        function normalizeChannels(arr) {
+            const seen = new Set();
+            const normalized = [];
+            const source = Array.isArray(arr) ? arr : [];
+            for (const value of source) {
+                const channel = String(value || '').trim();
+                if (!channel || seen.has(channel)) continue;
+                seen.add(channel);
+                normalized.push(channel);
+            }
+            return normalized;
+        }
+        function loadPurchaseChannels() {
+            try {
+                const saved = localStorage.getItem(CHANNEL_KEY);
+                if (!saved) return [...defaultPurchaseChannels];
+                return normalizeChannels(JSON.parse(saved));
+            } catch {
+                return [...defaultPurchaseChannels];
+            }
+        }
+        function savePurchaseChannels(arr) {
+            const normalized = normalizeChannels(arr);
+            localStorage.setItem(CHANNEL_KEY, JSON.stringify(normalized));
+            App.purchaseChannels = normalized;
+        }
+
         const App = {
             statuses: loadStatuses(),
+            purchaseChannels: loadPurchaseChannels(),
             currentView: 'dashboard',
             categories: [],
             itemsSize: loadItemsSize(),
@@ -1465,7 +1810,7 @@ getDB(); // 确保数据库初始化
             itemsPage: 1,
             itemsSort: 'updated_at',
             itemsOrder: 'DESC',
-            itemsFilter: { search: '', category: 0, location: 0, status: '' },
+            itemsFilter: { search: '', category: 0, location: 0, status: '', expiryOnly: false },
             sortSettings: loadSortSettings(),
             _cachedItems: null,   // 缓存物品列表数据，避免频繁 API 请求
             _cachedTotal: 0,
@@ -1533,14 +1878,14 @@ getDB(); // 确保数据库初始化
         }
 
         // ---------- 视图切换 ----------
-        const settingsSubViews = ['import-export', 'settings', 'status-settings', 'changelog'];
+        const settingsSubViews = ['import-export', 'settings', 'status-settings', 'channel-settings', 'changelog'];
 
         function switchView(view) {
             App.currentView = view;
             document.querySelectorAll('.sidebar-link[data-view]').forEach(el => {
                 el.classList.toggle('active', el.dataset.view === view);
             });
-            const titles = { dashboard: '仪表盘', items: '物品管理', categories: '分类管理', locations: '位置管理', trash: '物品管理', 'import-export': '导入/导出', settings: '排序设置', 'status-settings': '状态管理', changelog: '更新记录' };
+            const titles = { dashboard: '仪表盘', items: '物品管理', categories: '分类管理', locations: '位置管理', trash: '物品管理', 'import-export': '数据管理', settings: '排序设置', 'status-settings': '状态管理', 'channel-settings': '购入渠道管理', changelog: '更新记录' };
             document.getElementById('viewTitle').textContent = titles[view] || '';
             // 回收站视图高亮物品管理侧边栏
             if (view === 'trash') document.querySelector('.sidebar-link[data-view="items"]')?.classList.add('active');
@@ -1572,6 +1917,7 @@ getDB(); // 确保数据库初始化
                 case 'import-export': renderImportExport(c); break;
                 case 'settings': renderSettings(c); break;
                 case 'status-settings': renderStatusSettings(c); break;
+                case 'channel-settings': renderChannelSettings(c); break;
                 case 'changelog': renderChangelog(c); break;
             }
         }
@@ -1699,6 +2045,7 @@ getDB(); // 确保数据库初始化
                 page: App.itemsPage, limit: 24, sort: App.itemsSort, order: App.itemsOrder,
                 search: f.search, category: f.category, location: f.location, status: f.status
             });
+            if (f.expiryOnly) params.set('expiry_only', '1');
 
             const res = await api('items&' + params.toString());
             if (!res.success) { container.innerHTML = '<p class="text-red-400">加载失败</p>'; return; }
@@ -1714,7 +2061,9 @@ getDB(); // 确保数据库初始化
         // 纯 HTML 渲染，不发起 API 请求
         function renderItemsHTML(container, items, total, pages) {
             const f = App.itemsFilter;
+            const sortValue = `${App.itemsSort}:${App.itemsOrder}`;
             const scrollY = window.scrollY;
+            const isFiltering = f.search || f.category || f.location || f.status || f.expiryOnly;
 
             container.innerHTML = `
         <div class="glass rounded-2xl p-4 mb-6 anim-up">
@@ -1736,13 +2085,13 @@ getDB(); // 确保数据库初始化
                     ${App.statuses.map(s => `<option value="${s.key}" ${f.status === s.key ? 'selected' : ''}>${s.label}</option>`).join('')}
                 </select>
                 <select class="input !w-auto !py-2" onchange="const [s,o]=this.value.split(':');App.itemsSort=s;App.itemsOrder=o;renderView()">
-                    <option value="updated_at:DESC" ${App.itemsSort === 'updated_at' && App.itemsOrder === 'DESC' ? 'selected' : ''}>最近更新</option>
-                    <option value="created_at:DESC" ${App.itemsSort === 'created_at' && App.itemsOrder === 'DESC' ? 'selected' : ''}>最近添加</option>
-                    <option value="name:ASC" ${App.itemsSort === 'name' && App.itemsOrder === 'ASC' ? 'selected' : ''}>名称 A-Z</option>
-                    <option value="purchase_price:DESC" ${App.itemsSort === 'purchase_price' && App.itemsOrder === 'DESC' ? 'selected' : ''}>价格高→低</option>
-                    <option value="quantity:DESC" ${App.itemsSort === 'quantity' && App.itemsOrder === 'DESC' ? 'selected' : ''}>数量多→少</option>
+                    <option value="updated_at:DESC" ${sortValue === 'updated_at:DESC' ? 'selected' : ''}>最近更新</option>
+                    <option value="created_at:DESC" ${sortValue === 'created_at:DESC' ? 'selected' : ''}>最近添加</option>
+                    <option value="name:ASC" ${sortValue === 'name:ASC' ? 'selected' : ''}>名称 A-Z</option>
+                    <option value="purchase_price:DESC" ${sortValue === 'purchase_price:DESC' ? 'selected' : ''}>价格高→低</option>
+                    <option value="quantity:DESC" ${sortValue === 'quantity:DESC' ? 'selected' : ''}>数量多→少</option>
                 </select>
-                ${(f.search || f.category || f.location || f.status || App.itemsSort !== 'updated_at' || App.itemsOrder !== 'DESC') ? `
+                ${(isFiltering || sortValue !== 'updated_at:DESC') ? `
                 <button onclick="resetItemsFilter()" class="btn btn-ghost !py-2 !px-3 text-xs text-slate-400 hover:text-white border border-white/10 hover:border-white/20 rounded-lg transition flex items-center gap-1.5 flex-shrink-0" title="重置所有筛选条件">
                     <i class="ri-refresh-line"></i><span class="hidden sm:inline">重置</span>
                 </button>` : ''}
@@ -1757,7 +2106,7 @@ getDB(); // 确保数据库初始化
         </div>
 
         <div class="flex items-center justify-between mb-4">
-            <p class="text-sm text-slate-500">共 ${total} 件物品</p>
+            <p class="text-sm text-slate-500">共 ${total} 件物品${f.expiryOnly ? '（仅显示已设置过期时间）' : ''}</p>
             <div class="flex items-center gap-2">
                 <div class="relative">
                     <button onclick="toggleAttrPanel(this)" class="glass rounded-lg px-3 py-1.5 text-slate-300 hover:text-white transition flex items-center gap-1.5 text-xs border border-white/10 hover:border-sky-500/40 hover:bg-sky-500/10 active:scale-95" title="选择要显示的属性">
@@ -1777,6 +2126,9 @@ getDB(); // 确保数据库初始化
                     <button onclick="setItemsSize('medium')" class="size-btn ${App.itemsSize === 'medium' ? 'active' : ''}" title="中"><i class="ri-grid-fill"></i></button>
                     <button onclick="setItemsSize('small')" class="size-btn ${App.itemsSize === 'small' ? 'active' : ''}" title="小"><i class="ri-list-check"></i></button>
                 </div>
+                <button onclick="toggleExpiryOnlyFilter()" class="btn btn-ghost btn-sm ${f.expiryOnly ? 'text-amber-400 border-amber-400/30 bg-amber-500/10' : 'text-slate-400 hover:text-amber-400'}" title="只显示带过期时间的物品">
+                    <i class="ri-alarm-warning-line mr-1"></i>过期管理
+                </button>
                 <button onclick="switchView('trash')" class="btn btn-ghost btn-sm text-slate-400 hover:text-red-400 transition" title="回收站">
                     <i class="ri-delete-bin-line mr-1"></i>回收站
                 </button>
@@ -1786,9 +2138,9 @@ getDB(); // 确保数据库初始化
         ${items.length === 0 ? `
             <div class="empty-state anim-up">
                 <i class="ri-archive-line"></i>
-                <h3 class="text-xl font-semibold text-slate-400 mb-2">暂无物品</h3>
-                <p class="text-slate-500 mb-4">${f.search || f.category || f.location || f.status ? '没有找到匹配的物品，试试其他搜索条件？' : '点击「添加物品」按钮开始管理你的物品吧'}</p>
-                ${!f.search && !f.category && !f.location && !f.status ? '<button onclick="openAddItem()" class="btn btn-primary"><i class="ri-add-line"></i>添加第一件物品</button>' : ''}
+                <h3 class="text-xl font-semibold text-slate-400 mb-2">${f.expiryOnly ? '暂无带过期时间的物品' : '暂无物品'}</h3>
+                <p class="text-slate-500 mb-4">${isFiltering ? '没有找到匹配的物品，试试其他搜索条件？' : '点击「添加物品」按钮开始管理你的物品吧'}</p>
+                ${!isFiltering ? '<button onclick="openAddItem()" class="btn btn-primary btn-first-item"><span class="btn-first-item-icon"><i class="ri-add-line"></i></span><span class="btn-first-item-text">添加第一件物品</span></button>' : ''}
             </div>
         ` : renderItemsByStatus(items)}
 
@@ -1804,6 +2156,12 @@ getDB(); // 确保数据库初始化
     `;
             // 恢复滚动位置
             window.scrollTo(0, scrollY);
+        }
+
+        function toggleExpiryOnlyFilter() {
+            App.itemsFilter.expiryOnly = !App.itemsFilter.expiryOnly;
+            App.itemsPage = 1;
+            renderView();
         }
 
         // 快速渲染：使用缓存数据渲染，不发 API 请求，不显示加载动画
@@ -2006,16 +2364,24 @@ getDB(); // 确保数据库初始化
         }
 
         function goPage(p) { App.itemsPage = p; renderView(); }
-        function handleItemSearch(e) { if (e.key === 'Enter' || e.target.value === '') { App.itemsFilter.search = e.target.value; App.itemsPage = 1; renderView(); } }
+        function handleItemSearch(e) {
+            if (e.key !== 'Enter' && e.target.value !== '') return;
+            App.itemsFilter.search = e.target.value;
+            App.itemsPage = 1;
+            renderView();
+        }
         function handleGlobalSearch(e) { if (e.key === 'Enter') { App.itemsFilter.search = e.target.value; switchView('items'); } }
         function resetItemsFilter() {
-            App.itemsFilter = { search: '', category: 0, location: 0, status: '' };
+            App.itemsFilter = { search: '', category: 0, location: 0, status: '', expiryOnly: false };
             App.itemsSort = 'updated_at';
             App.itemsOrder = 'DESC';
             App.itemsPage = 1;
             renderView();
         }
-        function toggleSelect(id, checked) { checked ? App.selectedItems.add(id) : App.selectedItems.delete(id); renderItemsFast(); }
+        function toggleSelect(id, checked) {
+            checked ? App.selectedItems.add(id) : App.selectedItems.delete(id);
+            renderItemsFast();
+        }
 
         async function batchDelete() {
             if (!confirm(`确定删除选中的 ${App.selectedItems.size} 件物品？物品将移入回收站。`)) return;
@@ -2081,12 +2447,10 @@ getDB(); // 确保数据库初始化
             document.getElementById('itemImage').value = '';
             document.getElementById('itemQuantity').value = '1';
             document.getElementById('itemPrice').value = '0';
-            document.getElementById('itemStatus').value = 'active';
             document.getElementById('itemExpiry').value = '';
-            document.getElementById('itemPurchaseFrom').value = '';
             document.getElementById('itemNotes').value = '';
             resetUploadZone();
-            await populateSelects();
+            await populateSelects({ status: 'active', purchaseFrom: App.purchaseChannels[0] || '' });
             document.getElementById('itemModal').classList.add('show');
         }
 
@@ -2106,9 +2470,7 @@ getDB(); // 确保数据库初始化
             document.getElementById('itemBarcode').value = item.barcode;
             document.getElementById('itemTags').value = item.tags;
             document.getElementById('itemDesc').value = item.description;
-            document.getElementById('itemStatus').value = item.status;
             document.getElementById('itemImage').value = item.image || '';
-            document.getElementById('itemPurchaseFrom').value = item.purchase_from || '';
             document.getElementById('itemNotes').value = item.notes || '';
 
             resetUploadZone();
@@ -2120,13 +2482,13 @@ getDB(); // 确保数据库初始化
             }
 
             // 关键：await 等待下拉框填充完成后再设置值
-            await populateSelects();
+            await populateSelects({ status: item.status, purchaseFrom: item.purchase_from || '' });
             document.getElementById('itemCategory').value = item.category_id;
             document.getElementById('itemLocation').value = item.location_id;
             document.getElementById('itemModal').classList.add('show');
         }
 
-        async function populateSelects() {
+        async function populateSelects(options = {}) {
             await loadBaseData();
             const catSelect = document.getElementById('itemCategory');
             catSelect.innerHTML = '<option value="0">选择分类</option>' + App.categories.map(c => `<option value="${c.id}">${c.icon} ${esc(c.name)}</option>`).join('');
@@ -2134,6 +2496,16 @@ getDB(); // 确保数据库初始化
             locSelect.innerHTML = '<option value="0">选择位置</option>' + App.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join('');
             const statusSelect = document.getElementById('itemStatus');
             statusSelect.innerHTML = App.statuses.map(s => `<option value="${s.key}">${s.label}</option>`).join('');
+            const purchaseSelect = document.getElementById('itemPurchaseFrom');
+            if (purchaseSelect) {
+                let channelOptions = [...App.purchaseChannels];
+                if (options.purchaseFrom && !channelOptions.includes(options.purchaseFrom)) {
+                    channelOptions = [options.purchaseFrom, ...channelOptions];
+                }
+                purchaseSelect.innerHTML = '<option value="">未设置</option>' + channelOptions.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('');
+            }
+            if (options.status) statusSelect.value = options.status;
+            if (purchaseSelect) purchaseSelect.value = options.purchaseFrom || '';
         }
 
         async function saveItem(e) {
@@ -2153,7 +2525,7 @@ getDB(); // 确保数据库初始化
                 description: document.getElementById('itemDesc').value.trim(),
                 status: document.getElementById('itemStatus').value,
                 image: document.getElementById('itemImage').value,
-                purchase_from: document.getElementById('itemPurchaseFrom').value.trim(),
+                purchase_from: document.getElementById('itemPurchaseFrom').value,
                 notes: document.getElementById('itemNotes').value.trim()
             };
             if (!data.name) { toast('请输入物品名称', 'error'); return false; }
@@ -2185,15 +2557,31 @@ getDB(); // 确保数据库初始化
             const fd = new FormData();
             fd.append('image', file);
             fd.append('item_name', document.getElementById('itemName').value.trim());
-            const res = await fetch('?api=upload', { method: 'POST', body: fd }).then(r => r.json());
-            if (res.success) {
-                document.getElementById('itemImage').value = res.filename;
-                document.getElementById('uploadPreview').src = `?img=${res.filename}`;
-                document.getElementById('uploadPreview').classList.remove('hidden');
-                document.getElementById('uploadPlaceholder').classList.add('hidden');
-                document.getElementById('uploadZone').classList.add('has-image');
-            } else {
-                toast(res.message || '上传失败', 'error');
+            try {
+                const response = await fetch('?api=upload', { method: 'POST', body: fd });
+                let res = null;
+                try {
+                    res = await response.json();
+                } catch (e) {
+                    res = null;
+                }
+
+                if (!response.ok) {
+                    toast((res && res.message) || '上传失败：服务器拒绝请求，可能超过服务器上传限制', 'error');
+                    return;
+                }
+
+                if (res && res.success) {
+                    document.getElementById('itemImage').value = res.filename;
+                    document.getElementById('uploadPreview').src = `?img=${res.filename}`;
+                    document.getElementById('uploadPreview').classList.remove('hidden');
+                    document.getElementById('uploadPlaceholder').classList.add('hidden');
+                    document.getElementById('uploadZone').classList.add('has-image');
+                } else {
+                    toast((res && res.message) || '上传失败', 'error');
+                }
+            } catch (e) {
+                toast('上传失败：网络异常或服务器限制导致中断', 'error');
             }
             input.value = '';
         }
@@ -2327,13 +2715,13 @@ getDB(); // 确保数据库初始化
         }
 
         function viewItemsByCategory(catId) {
-            App.itemsFilter = { search: '', category: catId, location: 0, status: '' };
+            App.itemsFilter = { search: '', category: catId, location: 0, status: '', expiryOnly: false };
             App.itemsPage = 1;
             switchView('items');
         }
 
         function viewItemsByLocation(locId) {
-            App.itemsFilter = { search: '', category: 0, location: locId, status: '' };
+            App.itemsFilter = { search: '', category: 0, location: locId, status: '', expiryOnly: false };
             App.itemsPage = 1;
             switchView('items');
         }
@@ -2385,7 +2773,7 @@ getDB(); // 确保数据库初始化
         function closeLocationModal() { document.getElementById('locationModal').classList.remove('show'); }
 
         // ============================================================
-        // 🔄 导入 / 导出
+        // 🔄 数据管理
         // ============================================================
         function renderImportExport(container) {
             container.innerHTML = `
@@ -2395,6 +2783,10 @@ getDB(); // 确保数据库初始化
                     <div class="w-12 h-12 rounded-xl bg-sky-500/10 flex items-center justify-center"><i class="ri-download-cloud-line text-2xl text-sky-400"></i></div>
                     <div><h3 class="font-semibold text-white text-lg">导出数据</h3><p class="text-sm text-slate-500">将所有物品、分类和位置数据导出为 JSON 文件</p></div>
                 </div>
+                <label class="flex items-center gap-2 text-sm text-slate-400 mb-4 cursor-pointer">
+                    <input type="checkbox" id="exportIncludeImages" class="accent-sky-500">
+                    <span>同时导出图片数据（文件会更大）</span>
+                </label>
                 <button onclick="exportData()" class="btn btn-primary w-full"><i class="ri-download-line"></i>导出 JSON 文件</button>
             </div>
 
@@ -2417,6 +2809,22 @@ getDB(); // 确保数据库初始化
                 </div>
                 <button onclick="exportCSV()" class="btn btn-ghost w-full"><i class="ri-file-download-line"></i>导出 CSV 文件</button>
             </div>
+
+            <div class="glass rounded-2xl p-6 anim-up" style="animation-delay:0.3s">
+                <div class="flex items-center gap-3 mb-4">
+                    <div class="w-12 h-12 rounded-xl bg-red-500/10 flex items-center justify-center"><i class="ri-delete-bin-6-line text-2xl text-red-400"></i></div>
+                    <div><h3 class="font-semibold text-white text-lg">物品数据重置</h3><p class="text-sm text-slate-500">仅清空物品与回收站数据，图片会移动到 uploads/trash，不影响分类/位置和设置</p></div>
+                </div>
+                <button onclick="resetItemData()" class="btn btn-danger w-full"><i class="ri-delete-bin-5-line"></i>删除所有物品数据</button>
+            </div>
+
+            <div class="glass rounded-2xl p-6 anim-up" style="animation-delay:0.4s">
+                <div class="flex items-center gap-3 mb-4">
+                    <div class="w-12 h-12 rounded-xl bg-amber-500/10 flex items-center justify-center"><i class="ri-restart-line text-2xl text-amber-400"></i></div>
+                    <div><h3 class="font-semibold text-white text-lg">恢复默认</h3><p class="text-sm text-slate-500">恢复整个环境到初始状态（含分类、位置、物品与本地设置，图片将移动到uploads/trash）</p></div>
+                </div>
+                <button onclick="restoreDefaultEnvironment()" class="btn btn-ghost w-full" style="color:#f59e0b;border-color:rgba(245,158,11,0.35)"><i class="ri-restart-line"></i>恢复默认环境</button>
+            </div>
         </div>
     `;
         }
@@ -2424,9 +2832,19 @@ getDB(); // 确保数据库初始化
         async function exportData() {
             const res = await api('export');
             if (!res.success) { toast('导出失败', 'error'); return; }
-            const blob = new Blob([JSON.stringify(res.data, null, 2)], { type: 'application/json' });
+            const payload = { ...res.data };
+            const includeImages = !!document.getElementById('exportIncludeImages')?.checked;
+            if (includeImages) {
+                toast('正在打包图片数据，请稍候...');
+                const bundled = await buildEmbeddedImages(payload.items || []);
+                payload.embedded_images = bundled.images;
+                payload.images_included = true;
+                payload.images_total = bundled.total;
+                payload.images_failed = bundled.failed;
+            }
+            const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
             downloadBlob(blob, `items_backup_${dateStr()}.json`);
-            toast('导出成功');
+            toast(includeImages ? '导出成功（含图片）' : '导出成功');
         }
 
         async function exportCSV() {
@@ -2447,10 +2865,16 @@ getDB(); // 确保数据库初始化
                 const text = await file.text();
                 const data = JSON.parse(text);
                 if (!data.items && !Array.isArray(data)) { toast('无法识别的数据格式', 'error'); return; }
-                const importPayload = data.items ? data : { items: data };
-                if (!confirm(`即将导入 ${importPayload.items.length} 件物品，确认继续？`)) return;
+                const importPayload = data.items ? { ...data } : { items: data };
+
+                const embeddedCount = importPayload.embedded_images ? Object.keys(importPayload.embedded_images).length : 0;
+                const imageHint = embeddedCount > 0 ? `，含 ${embeddedCount} 张内置图片` : '';
+                if (!confirm(`即将导入 ${importPayload.items.length} 件物品${imageHint}，确认继续？`)) return;
                 const res = await apiPost('import', importPayload);
-                if (res.success) { toast(res.message); renderView(); } else toast(res.message, 'error');
+                if (res.success) {
+                    toast(res.message);
+                    renderView();
+                } else toast(res.message, 'error');
             } catch (e) { toast('文件解析失败', 'error'); }
             input.value = '';
         }
@@ -2459,6 +2883,30 @@ getDB(); // 确保数据库初始化
         function esc(str) { if (!str) return ''; const d = document.createElement('div'); d.textContent = str; return d.innerHTML; }
         function dateStr() { return new Date().toISOString().slice(0, 10); }
         function downloadBlob(blob, name) { const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(a.href); }
+        function blobToDataURL(blob) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = () => reject(new Error('read failed'));
+                reader.readAsDataURL(blob);
+            });
+        }
+        async function buildEmbeddedImages(items) {
+            const names = [...new Set(items.map(i => (i.image || '').trim()).filter(Boolean))];
+            const images = {};
+            let failed = 0;
+            for (const name of names) {
+                try {
+                    const resp = await fetch(`?img=${encodeURIComponent(name)}`);
+                    if (!resp.ok) { failed++; continue; }
+                    const blob = await resp.blob();
+                    images[name] = await blobToDataURL(blob);
+                } catch {
+                    failed++;
+                }
+            }
+            return { images, total: names.length, failed };
+        }
 
         // ---------- 复制物品 ----------
         async function copyItem(id) {
@@ -2478,9 +2926,7 @@ getDB(); // 确保数据库初始化
             document.getElementById('itemBarcode').value = item.barcode;
             document.getElementById('itemTags').value = item.tags;
             document.getElementById('itemDesc').value = item.description;
-            document.getElementById('itemStatus').value = item.status;
             document.getElementById('itemImage').value = item.image || '';
-            document.getElementById('itemPurchaseFrom').value = item.purchase_from || '';
             document.getElementById('itemNotes').value = item.notes || '';
 
             resetUploadZone();
@@ -2491,7 +2937,7 @@ getDB(); // 确保数据库初始化
                 document.getElementById('uploadZone').classList.add('has-image');
             }
 
-            await populateSelects();
+            await populateSelects({ status: item.status, purchaseFrom: item.purchase_from || '' });
             document.getElementById('itemCategory').value = item.category_id;
             document.getElementById('itemLocation').value = item.location_id;
             document.getElementById('itemModal').classList.add('show');
@@ -2880,6 +3326,52 @@ getDB(); // 确保数据库初始化
             toast('设置已保存');
         }
 
+        async function resetItemData() {
+            if (!confirm('确定重置物品数据吗？此操作仅清空物品列表和回收站，图片会移动到 uploads/trash，且不可撤销。')) return;
+            const res = await apiPost('items/reset-all', {});
+            if (!res.success) { toast(res.message || '删除失败', 'error'); return; }
+            App.selectedItems.clear();
+            App._cachedItems = null;
+            App._cachedTotal = 0;
+            App._cachedPages = 0;
+            toast('物品数据已重置');
+            renderView();
+        }
+
+        async function restoreDefaultEnvironment() {
+            if (!confirm('确定恢复默认环境吗？此操作会清空所有数据并重置本地设置，且不可撤销。')) return;
+            const res = await apiPost('system/reset-default', {});
+            if (!res.success) { toast(res.message || '恢复失败', 'error'); return; }
+
+            localStorage.removeItem(SORT_SETTINGS_KEY);
+            localStorage.removeItem(ITEMS_SIZE_KEY);
+            localStorage.removeItem(ITEM_ATTRS_KEY);
+            localStorage.removeItem(STATUS_KEY);
+            localStorage.removeItem(CHANNEL_KEY);
+            localStorage.removeItem('item_theme');
+
+            App.statuses = defaultStatuses.map(s => ({ ...s }));
+            App.purchaseChannels = [...defaultPurchaseChannels];
+            App.itemsSize = 'large';
+            App.itemAttrs = [...defaultItemAttrs];
+            App.sortSettings = { ...defaultSortSettings };
+            App.itemsFilter = { search: '', category: 0, location: 0, status: '', expiryOnly: false };
+            App.itemsPage = 1;
+            App.itemsSort = 'updated_at';
+            App.itemsOrder = 'DESC';
+            App.selectedItems.clear();
+            App._cachedItems = null;
+            App._cachedTotal = 0;
+            App._cachedPages = 0;
+
+            document.body.classList.remove('light');
+            document.getElementById('themeIcon').className = 'ri-moon-line';
+            document.getElementById('themeText').textContent = '深色模式';
+
+            toast('已恢复默认环境');
+            switchView('dashboard');
+        }
+
         // ---------- 状态管理页面 ----------
         function renderStatusSettings(container) {
             const badgeColors = [
@@ -3031,6 +3523,101 @@ getDB(); // 确保数据库初始化
             if (!confirm('确定恢复为默认状态？')) return;
             saveStatuses(defaultStatuses.map(s => ({ ...s })));
             toast('已恢复默认状态');
+            renderView();
+        }
+
+        // ---------- 购入渠道管理页面 ----------
+        function renderChannelSettings(container) {
+            container.innerHTML = `
+        <div class="max-w-2xl mx-auto space-y-6">
+            <div class="glass rounded-2xl p-6 anim-up">
+                <div class="flex items-center gap-3 mb-5">
+                    <div class="w-10 h-10 rounded-xl bg-sky-500/10 flex items-center justify-center"><i class="ri-shopping-bag-line text-xl text-sky-400"></i></div>
+                    <div><h3 class="font-semibold text-white">购入渠道列表</h3><p class="text-xs text-slate-500">用于物品表单中的购入渠道下拉选项</p></div>
+                </div>
+                <div class="space-y-3">
+                    ${App.purchaseChannels.map((channel, idx) => `
+                    <div class="flex items-center gap-3 p-3 rounded-xl bg-white/[0.03] border border-white/[0.04]" id="channelRow${idx}">
+                        <i class="ri-shopping-bag-line text-sky-400"></i>
+                        <span class="text-sm text-white flex-1">${esc(channel)}</span>
+                        <button onclick="openEditChannel(${idx})" class="p-1 text-slate-600 hover:text-sky-400 transition" title="编辑"><i class="ri-edit-line"></i></button>
+                        <button onclick="removePurchaseChannel(${idx})" class="p-1 text-slate-600 hover:text-red-400 transition" title="删除"><i class="ri-close-line"></i></button>
+                    </div>`).join('')}
+                    ${App.purchaseChannels.length === 0 ? '<p class="text-xs text-slate-500 text-center py-4">暂无购入渠道，请先添加</p>' : ''}
+                </div>
+            </div>
+
+            <div class="glass rounded-2xl p-6 anim-up" style="animation-delay:0.05s">
+                <div class="flex items-center gap-3 mb-5">
+                    <div class="w-10 h-10 rounded-xl bg-emerald-500/10 flex items-center justify-center"><i class="ri-add-circle-line text-xl text-emerald-400"></i></div>
+                    <div><h3 class="font-semibold text-white">添加购入渠道</h3><p class="text-xs text-slate-500">例如：淘宝、京东、线下门店</p></div>
+                </div>
+                <div class="flex gap-3">
+                    <input type="text" id="newChannel" class="input flex-1" placeholder="输入渠道名称">
+                    <button onclick="addPurchaseChannel()" class="btn btn-primary"><i class="ri-add-line"></i>添加</button>
+                </div>
+            </div>
+
+            <button onclick="resetPurchaseChannels()" class="btn btn-ghost w-full text-slate-500 text-sm">恢复默认渠道</button>
+        </div>
+    `;
+        }
+
+        function addPurchaseChannel() {
+            const input = document.getElementById('newChannel');
+            if (!input) return;
+            const channel = input.value.trim();
+            if (!channel) { toast('请输入渠道名称', 'error'); return; }
+            if (App.purchaseChannels.includes(channel)) { toast('该渠道已存在', 'error'); return; }
+            savePurchaseChannels([...App.purchaseChannels, channel]);
+            toast('购入渠道已添加');
+            renderView();
+        }
+
+        function removePurchaseChannel(idx) {
+            const channel = App.purchaseChannels[idx];
+            if (!channel) return;
+            if (!confirm(`确定删除渠道「${channel}」？已保存到物品中的该值不会被修改。`)) return;
+            const next = [...App.purchaseChannels];
+            next.splice(idx, 1);
+            savePurchaseChannels(next);
+            toast('购入渠道已删除');
+            renderView();
+        }
+
+        function openEditChannel(idx) {
+            const channel = App.purchaseChannels[idx];
+            const row = document.getElementById('channelRow' + idx);
+            if (!channel || !row) return;
+            row.innerHTML = `
+                <div class="w-full space-y-2">
+                    <label class="block text-[10px] text-slate-500">渠道名称</label>
+                    <div class="flex gap-2">
+                        <input type="text" id="editChannel${idx}" class="input !py-1 text-xs flex-1" value="${esc(channel)}">
+                        <button onclick="saveEditChannel(${idx})" class="btn btn-primary btn-sm text-xs"><i class="ri-check-line"></i>保存</button>
+                        <button onclick="renderView()" class="btn btn-ghost btn-sm text-xs">取消</button>
+                    </div>
+                </div>`;
+        }
+
+        function saveEditChannel(idx) {
+            const input = document.getElementById('editChannel' + idx);
+            if (!input) return;
+            const channel = input.value.trim();
+            if (!channel) { toast('渠道名称不能为空', 'error'); return; }
+            const duplicated = App.purchaseChannels.some((c, i) => i !== idx && c === channel);
+            if (duplicated) { toast('该渠道已存在', 'error'); return; }
+            const next = [...App.purchaseChannels];
+            next[idx] = channel;
+            savePurchaseChannels(next);
+            toast('购入渠道已更新');
+            renderView();
+        }
+
+        function resetPurchaseChannels() {
+            if (!confirm('确定恢复默认购入渠道？')) return;
+            savePurchaseChannels([...defaultPurchaseChannels]);
+            toast('已恢复默认渠道');
             renderView();
         }
 
