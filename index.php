@@ -82,16 +82,24 @@ function initSchema($db)
     // 数据库迁移：为旧数据库添加 expiry_date 字段
     try {
         $db->exec("ALTER TABLE items ADD COLUMN expiry_date TEXT DEFAULT ''");
-    } catch (Exception $e) { /* 字段已存在则忽略 */ }
+    } catch (Exception $e) { /* 字段已存在则忽略 */
+    }
 
     // 数据库迁移：为旧数据库添加 deleted_at 字段（回收站软删除）
     try {
         $db->exec("ALTER TABLE items ADD COLUMN deleted_at DATETIME DEFAULT NULL");
-    } catch (Exception $e) { /* 字段已存在则忽略 */ }
+    } catch (Exception $e) { /* 字段已存在则忽略 */
+    }
 
     // 数据库迁移：购入渠道、备注
-    try { $db->exec("ALTER TABLE items ADD COLUMN purchase_from TEXT DEFAULT ''"); } catch (Exception $e) {}
-    try { $db->exec("ALTER TABLE items ADD COLUMN notes TEXT DEFAULT ''"); } catch (Exception $e) {}
+    try {
+        $db->exec("ALTER TABLE items ADD COLUMN purchase_from TEXT DEFAULT ''");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("ALTER TABLE items ADD COLUMN notes TEXT DEFAULT ''");
+    } catch (Exception $e) {
+    }
 
     // 插入默认分类（仅在表为空时）
     $count = $db->query("SELECT COUNT(*) FROM categories")->fetchColumn();
@@ -261,7 +269,8 @@ if (isset($_GET['api'])) {
                     $id = intval($data['id'] ?? 0);
                     // 软删除：移入回收站，图片移到 trash 目录
                     $img = $db->query("SELECT image FROM items WHERE id=$id")->fetchColumn();
-                    if ($img && file_exists(UPLOAD_DIR . $img)) @rename(UPLOAD_DIR . $img, TRASH_DIR . $img);
+                    if ($img && file_exists(UPLOAD_DIR . $img))
+                        @rename(UPLOAD_DIR . $img, TRASH_DIR . $img);
                     $db->exec("UPDATE items SET deleted_at=datetime('now','localtime') WHERE id=$id");
                     $result = ['success' => true, 'message' => '已移入回收站'];
                 }
@@ -275,7 +284,8 @@ if (isset($_GET['api'])) {
                         $placeholders = implode(',', $ids);
                         $images = $db->query("SELECT image FROM items WHERE id IN ($placeholders) AND image != ''")->fetchAll(PDO::FETCH_COLUMN);
                         foreach ($images as $img) {
-                            if (file_exists(UPLOAD_DIR . $img)) @rename(UPLOAD_DIR . $img, TRASH_DIR . $img);
+                            if (file_exists(UPLOAD_DIR . $img))
+                                @rename(UPLOAD_DIR . $img, TRASH_DIR . $img);
                         }
                         $db->exec("UPDATE items SET deleted_at=datetime('now','localtime') WHERE id IN ($placeholders)");
                     }
@@ -296,7 +306,8 @@ if (isset($_GET['api'])) {
                     $data = json_decode(file_get_contents('php://input'), true);
                     $id = intval($data['id'] ?? 0);
                     $img = $db->query("SELECT image FROM items WHERE id=$id")->fetchColumn();
-                    if ($img && file_exists(TRASH_DIR . $img)) @rename(TRASH_DIR . $img, UPLOAD_DIR . $img);
+                    if ($img && file_exists(TRASH_DIR . $img))
+                        @rename(TRASH_DIR . $img, UPLOAD_DIR . $img);
                     $db->exec("UPDATE items SET deleted_at=NULL, updated_at=datetime('now','localtime') WHERE id=$id");
                     $result = ['success' => true, 'message' => '已恢复'];
                 }
@@ -310,7 +321,8 @@ if (isset($_GET['api'])) {
                         $placeholders = implode(',', $ids);
                         $images = $db->query("SELECT image FROM items WHERE id IN ($placeholders) AND image != ''")->fetchAll(PDO::FETCH_COLUMN);
                         foreach ($images as $img) {
-                            if (file_exists(TRASH_DIR . $img)) @rename(TRASH_DIR . $img, UPLOAD_DIR . $img);
+                            if (file_exists(TRASH_DIR . $img))
+                                @rename(TRASH_DIR . $img, UPLOAD_DIR . $img);
                         }
                         $db->exec("UPDATE items SET deleted_at=NULL, updated_at=datetime('now','localtime') WHERE id IN ($placeholders)");
                     }
@@ -323,7 +335,8 @@ if (isset($_GET['api'])) {
                     $data = json_decode(file_get_contents('php://input'), true);
                     $id = intval($data['id'] ?? 0);
                     $img = $db->query("SELECT image FROM items WHERE id=$id")->fetchColumn();
-                    if ($img && file_exists(TRASH_DIR . $img)) unlink(TRASH_DIR . $img);
+                    if ($img && file_exists(TRASH_DIR . $img))
+                        unlink(TRASH_DIR . $img);
                     $db->exec("DELETE FROM items WHERE id=$id");
                     $result = ['success' => true, 'message' => '已彻底删除'];
                 }
@@ -333,7 +346,8 @@ if (isset($_GET['api'])) {
                 if ($method === 'POST') {
                     $images = $db->query("SELECT image FROM items WHERE deleted_at IS NOT NULL AND image != ''")->fetchAll(PDO::FETCH_COLUMN);
                     foreach ($images as $img) {
-                        if (file_exists(TRASH_DIR . $img)) unlink(TRASH_DIR . $img);
+                        if (file_exists(TRASH_DIR . $img))
+                            unlink(TRASH_DIR . $img);
                     }
                     $db->exec("DELETE FROM items WHERE deleted_at IS NOT NULL");
                     $result = ['success' => true, 'message' => '回收站已清空'];
@@ -624,15 +638,25 @@ getDB(); // 确保数据库初始化
             flex-shrink: 0;
         }
 
-        .sidebar-parent { cursor: pointer; }
-        .sidebar-parent .sub-arrow { font-size: 16px; width: auto; }
-        .sidebar-group.open .sub-arrow { transform: rotate(180deg); }
+        .sidebar-parent {
+            cursor: pointer;
+        }
+
+        .sidebar-parent .sub-arrow {
+            font-size: 16px;
+            width: auto;
+        }
+
+        .sidebar-group.open .sub-arrow {
+            transform: rotate(180deg);
+        }
 
         .sidebar-submenu {
             max-height: 0;
             overflow: hidden;
             transition: max-height 0.25s ease;
         }
+
         .sidebar-group.open .sidebar-submenu {
             max-height: 200px;
         }
@@ -641,6 +665,7 @@ getDB(); // 确保数据库初始化
             padding-left: 44px !important;
             font-size: 13px;
         }
+
         .sidebar-sub i {
             font-size: 16px;
             width: 20px;
@@ -903,9 +928,13 @@ getDB(); // 确保数据库初始化
             background: none;
             font-size: 14px;
         }
-        .size-btn:hover { color: #e2e8f0; }
+
+        .size-btn:hover {
+            color: #e2e8f0;
+        }
+
         .size-btn.active {
-            background: rgba(56,189,248,0.2);
+            background: rgba(56, 189, 248, 0.2);
             color: #38bdf8;
         }
 
@@ -1136,16 +1165,19 @@ getDB(); // 确保数据库初始化
             <div class="sidebar-group">
                 <div class="sidebar-link sidebar-parent" onclick="toggleSubMenu(this)">
                     <i class="ri-settings-3-line"></i><span class="sidebar-text">设置</span>
-                    <i class="ri-arrow-down-s-line sidebar-text ml-auto sub-arrow transition-transform duration-200"></i>
+                    <i
+                        class="ri-arrow-down-s-line sidebar-text ml-auto sub-arrow transition-transform duration-200"></i>
                 </div>
                 <div class="sidebar-submenu">
-                    <div class="sidebar-link sidebar-sub" data-view="import-export" onclick="switchView('import-export')">
+                    <div class="sidebar-link sidebar-sub" data-view="import-export"
+                        onclick="switchView('import-export')">
                         <i class="ri-swap-line"></i><span class="sidebar-text">导入/导出</span>
                     </div>
                     <div class="sidebar-link sidebar-sub" data-view="settings" onclick="switchView('settings')">
                         <i class="ri-sort-asc"></i><span class="sidebar-text">排序设置</span>
                     </div>
-                    <div class="sidebar-link sidebar-sub" data-view="status-settings" onclick="switchView('status-settings')">
+                    <div class="sidebar-link sidebar-sub" data-view="status-settings"
+                        onclick="switchView('status-settings')">
                         <i class="ri-list-settings-line"></i><span class="sidebar-text">状态管理</span>
                     </div>
                     <div class="sidebar-link sidebar-sub" data-view="changelog" onclick="switchView('changelog')">
@@ -1404,13 +1436,13 @@ getDB(); // 确保数据库初始化
         const defaultStatuses = [
             { key: 'active', label: '使用中', icon: 'ri-checkbox-circle-line', color: 'text-emerald-400', badge: 'badge-active' },
             { key: 'archived', label: '已归档', icon: 'ri-archive-line', color: 'text-slate-400', badge: 'badge-archived' },
-            { key: 'lent', label: '已借出', icon: 'ri-share-forward-line', color: 'text-sky-400', badge: 'badge-lent' },
+            { key: 'sold', label: '已转卖', icon: 'ri-share-forward-line', color: 'text-sky-400', badge: 'badge-lent' },
         ];
         function loadStatuses() {
             try {
                 const saved = localStorage.getItem(STATUS_KEY);
-                return saved ? JSON.parse(saved) : defaultStatuses.map(s => ({...s}));
-            } catch { return defaultStatuses.map(s => ({...s})); }
+                return saved ? JSON.parse(saved) : defaultStatuses.map(s => ({ ...s }));
+            } catch { return defaultStatuses.map(s => ({ ...s })); }
         }
         function saveStatuses(arr) { localStorage.setItem(STATUS_KEY, JSON.stringify(arr)); App.statuses = arr; }
         function getStatusMap() {
@@ -1741,9 +1773,9 @@ getDB(); // 确保数据库初始化
                     </div>
                 </div>
                 <div class="flex items-center glass rounded-lg p-0.5 gap-0.5">
-                    <button onclick="setItemsSize('large')" class="size-btn ${App.itemsSize==='large'?'active':''}" title="大"><i class="ri-layout-grid-fill"></i></button>
-                    <button onclick="setItemsSize('medium')" class="size-btn ${App.itemsSize==='medium'?'active':''}" title="中"><i class="ri-grid-fill"></i></button>
-                    <button onclick="setItemsSize('small')" class="size-btn ${App.itemsSize==='small'?'active':''}" title="小"><i class="ri-list-check"></i></button>
+                    <button onclick="setItemsSize('large')" class="size-btn ${App.itemsSize === 'large' ? 'active' : ''}" title="大"><i class="ri-layout-grid-fill"></i></button>
+                    <button onclick="setItemsSize('medium')" class="size-btn ${App.itemsSize === 'medium' ? 'active' : ''}" title="中"><i class="ri-grid-fill"></i></button>
+                    <button onclick="setItemsSize('small')" class="size-btn ${App.itemsSize === 'small' ? 'active' : ''}" title="小"><i class="ri-list-check"></i></button>
                 </div>
                 <button onclick="switchView('trash')" class="btn btn-ghost btn-sm text-slate-400 hover:text-red-400 transition" title="回收站">
                     <i class="ri-delete-bin-line mr-1"></i>回收站
@@ -2527,9 +2559,9 @@ getDB(); // 确保数据库初始化
                 </div>` : `
                 <div class="space-y-3">
                     ${items.map(item => {
-                        const imgSrc = item.image ? 'data/uploads/trash/' + item.image : '';
-                        const deletedAt = item.deleted_at || '';
-                        return `
+                const imgSrc = item.image ? 'data/uploads/trash/' + item.image : '';
+                const deletedAt = item.deleted_at || '';
+                return `
                     <div class="flex items-center gap-4 p-4 rounded-xl bg-white/[0.03] hover:bg-white/[0.06] border border-white/[0.04] transition group cursor-pointer" onclick="showTrashDetail(${item.id})">
                         <div class="w-14 h-14 rounded-xl overflow-hidden flex-shrink-0 bg-white/[0.03] flex items-center justify-center">
                             ${imgSrc ? `<img src="${imgSrc}" class="w-full h-full object-cover" onerror="this.parentNode.innerHTML='<i class=\\'ri-image-line text-2xl text-slate-600\\'></i>'">` : `<i class="ri-archive-line text-2xl text-slate-600"></i>`}
@@ -2552,7 +2584,7 @@ getDB(); // 确保数据库初始化
                             </button>
                         </div>
                     </div>`;
-                    }).join('')}
+            }).join('')}
                 </div>`}
             </div>
         </div>`;
@@ -2899,7 +2931,7 @@ getDB(); // 确保数据库初始化
                     <div>
                         <label class="block text-xs text-slate-500 mb-1">图标</label>
                         <select id="newStatusIcon" class="input">
-                            ${iconOptions.map(ic => `<option value="${ic}"><i class="${ic}"></i> ${ic.replace('ri-','').replace('-line','')}</option>`).join('')}
+                            ${iconOptions.map(ic => `<option value="${ic}"><i class="${ic}"></i> ${ic.replace('ri-', '').replace('-line', '')}</option>`).join('')}
                         </select>
                     </div>
                     <div>
@@ -2946,7 +2978,7 @@ getDB(); // 确保数据库初始化
                 { value: 'badge-active', label: '绿色' }, { value: 'badge-lent', label: '蓝色' },
                 { value: 'badge-archived', label: '灰色' }, { value: 'badge-warning', label: '橙色' }, { value: 'badge-danger', label: '红色' },
             ];
-            const iconOptions = ['ri-checkbox-circle-line','ri-archive-line','ri-share-forward-line','ri-tools-line','ri-error-warning-line','ri-time-line','ri-shopping-bag-line','ri-gift-line','ri-heart-line','ri-star-line'];
+            const iconOptions = ['ri-checkbox-circle-line', 'ri-archive-line', 'ri-share-forward-line', 'ri-tools-line', 'ri-error-warning-line', 'ri-time-line', 'ri-shopping-bag-line', 'ri-gift-line', 'ri-heart-line', 'ri-star-line'];
             const row = document.getElementById('statusRow' + idx);
             if (!row) return;
             row.innerHTML = `
@@ -2963,7 +2995,7 @@ getDB(); // 确保数据库初始化
                         <div>
                             <label class="block text-[10px] text-slate-500 mb-0.5">图标</label>
                             <select id="editIcon${idx}" class="input !py-1 text-xs">
-                                ${iconOptions.map(ic => `<option value="${ic}" ${s.icon === ic ? 'selected' : ''}>${ic.replace('ri-','').replace('-line','')}</option>`).join('')}
+                                ${iconOptions.map(ic => `<option value="${ic}" ${s.icon === ic ? 'selected' : ''}>${ic.replace('ri-', '').replace('-line', '')}</option>`).join('')}
                             </select>
                         </div>
                         <div>
@@ -2997,7 +3029,7 @@ getDB(); // 确保数据库初始化
 
         function resetStatuses() {
             if (!confirm('确定恢复为默认状态？')) return;
-            saveStatuses(defaultStatuses.map(s => ({...s})));
+            saveStatuses(defaultStatuses.map(s => ({ ...s })));
             toast('已恢复默认状态');
             renderView();
         }
