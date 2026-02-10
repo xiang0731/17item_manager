@@ -12,10 +12,27 @@
 ini_set('display_errors', 0);
 error_reporting(E_ALL);
 
+if (session_status() !== PHP_SESSION_ACTIVE) {
+    session_start();
+}
+
 define('DB_PATH', __DIR__ . '/data/items_db.sqlite');
+define('AUTH_DB_PATH', __DIR__ . '/data/auth_db.sqlite');
 define('UPLOAD_DIR', __DIR__ . '/data/uploads/');
 define('TRASH_DIR', __DIR__ . '/data/uploads/trash/');
 define('MAX_UPLOAD_SIZE', 10 * 1024 * 1024); // 10MB
+define('ALLOW_PUBLIC_REGISTRATION', true);
+define('DEFAULT_ADMIN_USERNAME', 'admin');
+define('DEFAULT_ADMIN_PASSWORD', 'Admin@123456');
+define('DEFAULT_DEMO_USERNAME', 'test');
+define('DEFAULT_DEMO_PASSWORD', 'test123456');
+define('SECURITY_QUESTIONS', [
+    'birth_city' => '你出生的城市是？',
+    'primary_school' => '你小学的名字是？',
+    'first_pet' => '你的第一只宠物名字是？',
+    'favorite_teacher' => '你最喜欢的老师姓名是？',
+    'favorite_food' => '你最喜欢的食物是？'
+]);
 
 // 确保数据目录存在
 if (!is_dir(__DIR__ . '/data'))
@@ -30,16 +47,155 @@ if (!is_dir(TRASH_DIR))
 // ============================================================
 function getDB()
 {
-    static $db = null;
-    if ($db === null) {
-        $db = new PDO('sqlite:' . DB_PATH);
+    return getUserDB(getCurrentUserId());
+}
+
+function getCurrentUserId()
+{
+    return intval($_SESSION['user_id'] ?? 0);
+}
+
+function getUserDbPath($userId)
+{
+    $uid = intval($userId);
+    if ($uid <= 1) {
+        return DB_PATH;
+    }
+    return __DIR__ . '/data/items_db_u' . $uid . '.sqlite';
+}
+
+function getUserDB($userId)
+{
+    static $dbPool = [];
+    $uid = intval($userId);
+    if ($uid <= 0) {
+        throw new Exception('未登录用户无法访问数据');
+    }
+    $path = getUserDbPath($uid);
+    if (!isset($dbPool[$path])) {
+        $db = new PDO('sqlite:' . $path);
         $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
         $db->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
         $db->exec("PRAGMA journal_mode=WAL");
         $db->exec("PRAGMA foreign_keys=ON");
         initSchema($db);
+        $dbPool[$path] = $db;
     }
-    return $db;
+    return $dbPool[$path];
+}
+
+function getAuthDB()
+{
+    static $authDb = null;
+    if ($authDb === null) {
+        $authDb = new PDO('sqlite:' . AUTH_DB_PATH);
+        $authDb->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $authDb->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+        $authDb->exec("PRAGMA journal_mode=WAL");
+        $authDb->exec("CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            display_name TEXT DEFAULT '',
+            role TEXT DEFAULT 'user',
+            security_question_key TEXT DEFAULT '',
+            security_answer_hash TEXT DEFAULT '',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            last_login_at DATETIME DEFAULT NULL
+        )");
+        try {
+            $authDb->exec("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'user'");
+        } catch (Exception $e) {
+        }
+        try {
+            $authDb->exec("ALTER TABLE users ADD COLUMN security_question_key TEXT DEFAULT ''");
+        } catch (Exception $e) {
+        }
+        try {
+            $authDb->exec("ALTER TABLE users ADD COLUMN security_answer_hash TEXT DEFAULT ''");
+        } catch (Exception $e) {
+        }
+
+        // 历史兼容：若存在用户名 admin 的用户，默认升级为管理员
+        try {
+            $upAdmin = $authDb->prepare("UPDATE users SET role='admin' WHERE lower(username)=?");
+            $upAdmin->execute([strtolower(DEFAULT_ADMIN_USERNAME)]);
+        } catch (Exception $e) {
+        }
+
+        // 保底创建默认管理员（仅当当前无管理员账号时）
+        $adminCount = intval($authDb->query("SELECT COUNT(*) FROM users WHERE role='admin'")->fetchColumn());
+        if ($adminCount <= 0) {
+            $qKeys = array_keys(SECURITY_QUESTIONS);
+            $defaultQuestionKey = count($qKeys) > 0 ? $qKeys[0] : '';
+            $defaultAnswerHash = $defaultQuestionKey !== '' ? password_hash(normalizeSecurityAnswer('admin'), PASSWORD_DEFAULT) : '';
+            $insAdmin = $authDb->prepare("INSERT INTO users (username, password_hash, display_name, role, security_question_key, security_answer_hash, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
+            $insAdmin->execute([
+                strtolower(DEFAULT_ADMIN_USERNAME),
+                password_hash(DEFAULT_ADMIN_PASSWORD, PASSWORD_DEFAULT),
+                '系统管理员',
+                'admin',
+                $defaultQuestionKey,
+                $defaultAnswerHash
+            ]);
+        }
+    }
+    return $authDb;
+}
+
+function getCurrentAuthUser($authDb)
+{
+    $uid = getCurrentUserId();
+    if ($uid <= 0) {
+        return null;
+    }
+    $stmt = $authDb->prepare("SELECT id, username, display_name, role, security_question_key, created_at, last_login_at FROM users WHERE id=? LIMIT 1");
+    $stmt->execute([$uid]);
+    $user = $stmt->fetch();
+    if (!$user) {
+        unset($_SESSION['user_id']);
+        return null;
+    }
+    return $user;
+}
+
+function isAdminUser($user)
+{
+    return is_array($user) && (($user['role'] ?? 'user') === 'admin');
+}
+
+function normalizeSecurityAnswer($answer)
+{
+    $v = trim((string) $answer);
+    $v = preg_replace('/\s+/u', '', $v);
+    if (function_exists('mb_strtolower')) {
+        return mb_strtolower($v, 'UTF-8');
+    }
+    return strtolower($v);
+}
+
+function getSecurityQuestions()
+{
+    return SECURITY_QUESTIONS;
+}
+
+function getUserItemStats($userId)
+{
+    $uid = intval($userId);
+    if ($uid <= 0) {
+        return ['item_kinds' => 0, 'item_qty' => 0, 'last_item_at' => null];
+    }
+    try {
+        $db = getUserDB($uid);
+        $kinds = intval($db->query("SELECT COUNT(*) FROM items WHERE deleted_at IS NULL")->fetchColumn());
+        $qty = intval($db->query("SELECT COALESCE(SUM(quantity),0) FROM items WHERE deleted_at IS NULL")->fetchColumn());
+        $lastAt = $db->query("SELECT MAX(updated_at) FROM items WHERE deleted_at IS NULL")->fetchColumn();
+        return ['item_kinds' => $kinds, 'item_qty' => $qty, 'last_item_at' => $lastAt ?: null];
+    } catch (Exception $e) {
+        return ['item_kinds' => 0, 'item_qty' => 0, 'last_item_at' => null];
+    }
 }
 
 function initSchema($db)
@@ -62,6 +218,21 @@ function initSchema($db)
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )");
 
+    $db->exec("CREATE TABLE IF NOT EXISTS shopping_list (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        quantity INTEGER DEFAULT 1,
+        status TEXT DEFAULT 'pending_purchase',
+        category_id INTEGER DEFAULT 0,
+        priority TEXT DEFAULT 'normal',
+        planned_price REAL DEFAULT 0,
+        notes TEXT DEFAULT '',
+        reminder_date TEXT DEFAULT '',
+        reminder_note TEXT DEFAULT '',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )");
+
     $db->exec("CREATE TABLE IF NOT EXISTS items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
@@ -75,9 +246,28 @@ function initSchema($db)
         purchase_price REAL DEFAULT 0,
         tags TEXT DEFAULT '',
         status TEXT DEFAULT 'active',
+        reminder_date TEXT DEFAULT '',
+        reminder_next_date TEXT DEFAULT '',
+        reminder_cycle_value INTEGER DEFAULT 0,
+        reminder_cycle_unit TEXT DEFAULT '',
+        reminder_note TEXT DEFAULT '',
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )");
+
+    $db->exec("CREATE TABLE IF NOT EXISTS item_reminder_instances (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        item_id INTEGER NOT NULL,
+        due_date TEXT NOT NULL,
+        is_completed INTEGER DEFAULT 0,
+        completed_at DATETIME DEFAULT NULL,
+        generated_by_complete_id INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
+    )");
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_item_reminder_instances_item ON item_reminder_instances(item_id)");
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_item_reminder_instances_due ON item_reminder_instances(due_date, is_completed)");
 
     // 数据库迁移：为旧数据库添加 expiry_date 字段
     try {
@@ -98,6 +288,76 @@ function initSchema($db)
     }
     try {
         $db->exec("ALTER TABLE items ADD COLUMN notes TEXT DEFAULT ''");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("ALTER TABLE items ADD COLUMN reminder_date TEXT DEFAULT ''");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("ALTER TABLE items ADD COLUMN reminder_next_date TEXT DEFAULT ''");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("ALTER TABLE items ADD COLUMN reminder_cycle_value INTEGER DEFAULT 0");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("ALTER TABLE items ADD COLUMN reminder_cycle_unit TEXT DEFAULT ''");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("ALTER TABLE items ADD COLUMN reminder_note TEXT DEFAULT ''");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("ALTER TABLE shopping_list ADD COLUMN quantity INTEGER DEFAULT 1");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("ALTER TABLE shopping_list ADD COLUMN status TEXT DEFAULT 'pending_purchase'");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("ALTER TABLE shopping_list ADD COLUMN category_id INTEGER DEFAULT 0");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("ALTER TABLE shopping_list ADD COLUMN priority TEXT DEFAULT 'normal'");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("ALTER TABLE shopping_list ADD COLUMN planned_price REAL DEFAULT 0");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("ALTER TABLE shopping_list ADD COLUMN notes TEXT DEFAULT ''");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("ALTER TABLE shopping_list ADD COLUMN reminder_date TEXT DEFAULT ''");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("ALTER TABLE shopping_list ADD COLUMN reminder_note TEXT DEFAULT ''");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("ALTER TABLE shopping_list ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("ALTER TABLE shopping_list ADD COLUMN updated_at DATETIME DEFAULT CURRENT_TIMESTAMP");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("UPDATE items SET reminder_next_date = reminder_date WHERE (reminder_next_date IS NULL OR reminder_next_date='') AND reminder_date IS NOT NULL AND reminder_date != ''");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("UPDATE shopping_list SET status='pending_purchase' WHERE status IS NULL OR status=''");
+        $db->exec("UPDATE shopping_list SET status='pending_purchase' WHERE status='待购买'");
+        $db->exec("UPDATE shopping_list SET status='pending_receipt' WHERE status='待收货'");
     } catch (Exception $e) {
     }
 
@@ -126,11 +386,21 @@ function initSchema($db)
             ['书籍文档', '📚', '#10b981'],
             ['工具五金', '🔧', '#6366f1'],
             ['运动户外', '⚽', '#14b8a6'],
+            ['虚拟产品', '🧩', '#06b6d4'],
             ['其他', '📦', '#64748b'],
         ];
         $stmt = $db->prepare("INSERT INTO categories (name, icon, color) VALUES (?, ?, ?)");
         foreach ($defaults as $cat)
             $stmt->execute($cat);
+    }
+    // 数据库迁移：补充默认分类“虚拟产品”
+    try {
+        $virtualExists = $db->query("SELECT id FROM categories WHERE name='虚拟产品' LIMIT 1")->fetchColumn();
+        if (!$virtualExists) {
+            $stmt = $db->prepare("INSERT INTO categories (name, icon, color) VALUES (?,?,?)");
+            $stmt->execute(['虚拟产品', '🧩', '#06b6d4']);
+        }
+    } catch (Exception $e) {
     }
 
     $count = $db->query("SELECT COUNT(*) FROM locations")->fetchColumn();
@@ -161,7 +431,7 @@ function removeAllFilesInDir($dir)
     }
 }
 
-function moveUploadFilesToTrash()
+function moveUploadFilesToTrash($db = null)
 {
     if (!is_dir(UPLOAD_DIR))
         return 0;
@@ -169,22 +439,41 @@ function moveUploadFilesToTrash()
         mkdir(TRASH_DIR, 0755, true);
 
     $moved = 0;
-    $it = new RecursiveIteratorIterator(
-        new RecursiveDirectoryIterator(UPLOAD_DIR, FilesystemIterator::SKIP_DOTS),
-        RecursiveIteratorIterator::SELF_FIRST
-    );
-    foreach ($it as $fileInfo) {
-        if (!$fileInfo->isFile())
-            continue;
-        $src = $fileInfo->getPathname();
-        if (strpos($src, TRASH_DIR) === 0)
-            continue;
-        $targetName = basename($src);
-        if (file_exists(TRASH_DIR . $targetName)) {
-            $targetName = uniqid('trash_') . '_' . $targetName;
+    if ($db instanceof PDO) {
+        $images = $db->query("SELECT DISTINCT image FROM items WHERE image IS NOT NULL AND image != ''")->fetchAll(PDO::FETCH_COLUMN);
+        foreach ($images as $img) {
+            $img = basename((string) $img);
+            if ($img === '')
+                continue;
+            $src = UPLOAD_DIR . $img;
+            if (!file_exists($src))
+                continue;
+            $targetName = $img;
+            if (file_exists(TRASH_DIR . $targetName)) {
+                $targetName = uniqid('trash_') . '_' . $targetName;
+            }
+            if (@rename($src, TRASH_DIR . $targetName)) {
+                $moved++;
+            }
         }
-        if (@rename($src, TRASH_DIR . $targetName)) {
-            $moved++;
+    } else {
+        $it = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator(UPLOAD_DIR, FilesystemIterator::SKIP_DOTS),
+            RecursiveIteratorIterator::SELF_FIRST
+        );
+        foreach ($it as $fileInfo) {
+            if (!$fileInfo->isFile())
+                continue;
+            $src = $fileInfo->getPathname();
+            if (strpos($src, TRASH_DIR) === 0)
+                continue;
+            $targetName = basename($src);
+            if (file_exists(TRASH_DIR . $targetName)) {
+                $targetName = uniqid('trash_') . '_' . $targetName;
+            }
+            if (@rename($src, TRASH_DIR . $targetName)) {
+                $moved++;
+            }
         }
     }
     return $moved;
@@ -272,6 +561,359 @@ function normalizeStatusValue($status)
     return $v;
 }
 
+function normalizeShoppingPriority($priority)
+{
+    $p = strtolower(trim((string) $priority));
+    if ($p === 'high' || $p === 'h' || $p === '高')
+        return 'high';
+    if ($p === 'low' || $p === 'l' || $p === '低')
+        return 'low';
+    return 'normal';
+}
+
+function normalizeShoppingStatus($status)
+{
+    $s = strtolower(trim((string) $status));
+    if ($s === 'pending_receipt' || $s === 'receipt' || $s === 'receiving' || $s === '待收货')
+        return 'pending_receipt';
+    if ($s === 'pending_purchase' || $s === 'purchase' || $s === 'buy' || $s === '待购买' || $s === '')
+        return 'pending_purchase';
+    return 'pending_purchase';
+}
+
+function normalizeReminderCycleUnit($unit)
+{
+    $u = strtolower(trim((string) $unit));
+    if ($u === 'day' || $u === 'days' || $u === 'd' || $u === '天')
+        return 'day';
+    if ($u === 'week' || $u === 'weeks' || $u === 'w' || $u === '周')
+        return 'week';
+    if ($u === 'year' || $u === 'years' || $u === 'y' || $u === '年')
+        return 'year';
+    return '';
+}
+
+function normalizeReminderCycleValue($value, $unit)
+{
+    $u = normalizeReminderCycleUnit($unit);
+    if ($u === '')
+        return 0;
+    $v = intval($value);
+    if ($v < 1)
+        $v = 1;
+    if ($v > 36500)
+        $v = 36500;
+    return $v;
+}
+
+function normalizeReminderDateValue($dateStr)
+{
+    $v = normalizeDateYmd($dateStr);
+    return $v === null ? '' : $v;
+}
+
+function calcNextReminderDate($dateStr, $cycleValue, $cycleUnit)
+{
+    $baseDate = normalizeDateYmd($dateStr);
+    $unit = normalizeReminderCycleUnit($cycleUnit);
+    $value = normalizeReminderCycleValue($cycleValue, $unit);
+    if ($baseDate === null || $baseDate === '' || $unit === '' || $value < 1)
+        return null;
+
+    $dt = DateTime::createFromFormat('Y-m-d', $baseDate);
+    if (!$dt)
+        return null;
+    if ($unit === 'day')
+        $dt->modify('+' . $value . ' day');
+    elseif ($unit === 'week')
+        $dt->modify('+' . $value . ' week');
+    else
+        $dt->modify('+' . $value . ' year');
+    return $dt->format('Y-m-d');
+}
+
+function isReminderConfigValid($reminderDate, $reminderNextDate, $reminderValue, $reminderUnit)
+{
+    $date = normalizeReminderDateValue($reminderDate);
+    $nextDate = normalizeReminderDateValue($reminderNextDate);
+    $unit = normalizeReminderCycleUnit($reminderUnit);
+    $value = normalizeReminderCycleValue($reminderValue, $unit);
+    if ($date === '' || $unit === '' || $value <= 0)
+        return [false, '', 0, ''];
+    if ($nextDate === '')
+        $nextDate = $date;
+    return [true, $nextDate, $value, $unit];
+}
+
+function syncItemReminderInstances($db, $itemId, $reminderDate, $reminderNextDate, $reminderValue, $reminderUnit)
+{
+    $itemId = intval($itemId);
+    if ($itemId <= 0)
+        return;
+
+    [$valid, $dueDate] = isReminderConfigValid($reminderDate, $reminderNextDate, $reminderValue, $reminderUnit);
+    if (!$valid || $dueDate === '') {
+        $del = $db->prepare("DELETE FROM item_reminder_instances WHERE item_id=?");
+        $del->execute([$itemId]);
+        return;
+    }
+
+    $pendingStmt = $db->prepare("SELECT id, due_date FROM item_reminder_instances WHERE item_id=? AND is_completed=0 ORDER BY id ASC");
+    $pendingStmt->execute([$itemId]);
+    $pendingRows = $pendingStmt->fetchAll();
+
+    if (count($pendingRows) === 0) {
+        $ins = $db->prepare("INSERT INTO item_reminder_instances (item_id, due_date, is_completed, completed_at, generated_by_complete_id, created_at, updated_at) VALUES (?,?,0,NULL,0,datetime('now','localtime'),datetime('now','localtime'))");
+        $ins->execute([$itemId, $dueDate]);
+        return;
+    }
+
+    $primary = $pendingRows[0];
+    if (normalizeReminderDateValue($primary['due_date'] ?? '') !== $dueDate) {
+        $upd = $db->prepare("UPDATE item_reminder_instances SET due_date=?, generated_by_complete_id=0, updated_at=datetime('now','localtime') WHERE id=? AND item_id=?");
+        $upd->execute([$dueDate, intval($primary['id']), $itemId]);
+    }
+
+    if (count($pendingRows) > 1) {
+        $extraIds = array_map(function ($row) {
+            return intval($row['id']);
+        }, array_slice($pendingRows, 1));
+        if (!empty($extraIds)) {
+            $placeholders = implode(',', array_fill(0, count($extraIds), '?'));
+            $params = array_merge([$itemId], $extraIds);
+            $delExtra = $db->prepare("DELETE FROM item_reminder_instances WHERE item_id=? AND id IN ($placeholders)");
+            $delExtra->execute($params);
+        }
+    }
+}
+
+function seedReminderInstancesFromItems($db)
+{
+    $db->exec("INSERT INTO item_reminder_instances (item_id, due_date, is_completed, completed_at, generated_by_complete_id, created_at, updated_at)
+        SELECT i.id, COALESCE(NULLIF(i.reminder_next_date,''), i.reminder_date), 0, NULL, 0, datetime('now','localtime'), datetime('now','localtime')
+        FROM items i
+        WHERE i.deleted_at IS NULL
+          AND COALESCE(NULLIF(i.reminder_next_date,''), i.reminder_date) != ''
+          AND i.reminder_cycle_unit IN ('day','week','year')
+          AND COALESCE(i.reminder_cycle_value,0) > 0
+          AND NOT EXISTS (
+            SELECT 1 FROM item_reminder_instances r WHERE r.item_id=i.id AND r.is_completed=0
+          )");
+}
+
+function loadDemoDataIntoDb($db, $options = [])
+{
+    $moveImages = !empty($options['move_images']);
+    $moved = $moveImages ? moveUploadFilesToTrash($db) : 0;
+
+    $db->beginTransaction();
+    try {
+        $db->exec("DELETE FROM items");
+        $db->exec("DELETE FROM item_reminder_instances");
+        $db->exec("DELETE FROM shopping_list");
+        $db->exec("DELETE FROM categories");
+        $db->exec("DELETE FROM locations");
+        try {
+            $db->exec("DELETE FROM sqlite_sequence WHERE name IN ('items','item_reminder_instances','shopping_list','categories','locations')");
+        } catch (Exception $e) {
+        }
+
+        // 重建默认分类/位置
+        initSchema($db);
+
+        $categoryRows = $db->query("SELECT id, name FROM categories")->fetchAll();
+        $catIdByName = [];
+        foreach ($categoryRows as $row) {
+            $catIdByName[$row['name']] = intval($row['id']);
+        }
+
+        $loadLocationMap = function () use ($db) {
+            $rows = $db->query("SELECT id, name FROM locations")->fetchAll();
+            $map = [];
+            foreach ($rows as $row) {
+                $map[$row['name']] = intval($row['id']);
+            }
+            return $map;
+        };
+        $insertLocation = $db->prepare("INSERT INTO locations (name, parent_id, description) VALUES (?,?,?)");
+        $locMap = $loadLocationMap();
+        $requiredLocations = [
+            ['储物间', '集中存放不常用物品'],
+            ['阳台', '户外和工具相关物品'],
+            ['电视柜', '客厅电子设备与配件'],
+            ['书桌抽屉', '文具和常用小配件'],
+            ['玄关', '出门随手物品存放']
+        ];
+        foreach ($requiredLocations as $locMeta) {
+            [$name, $desc] = $locMeta;
+            if (!isset($locMap[$name])) {
+                $insertLocation->execute([$name, 0, $desc]);
+                $locMap = $loadLocationMap();
+            }
+        }
+
+        $today = date('Y-m-d');
+        $demoItems = [
+            ['name' => 'MacBook Air M2', 'category' => '电子设备', 'location' => '书房', 'quantity' => 1, 'description' => '日常办公主力设备', 'barcode' => 'SN-MBA-2026', 'purchase_date' => date('Y-m-d', strtotime('-420 days')), 'purchase_price' => 7999, 'tags' => '电脑,办公', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '附带保护壳与扩展坞'],
+            ['name' => 'AirPods Pro', 'category' => '电子设备', 'location' => '卧室', 'quantity' => 1, 'description' => '蓝牙耳机', 'barcode' => 'SN-AIRPODS-02', 'purchase_date' => date('Y-m-d', strtotime('-260 days')), 'purchase_price' => 1499, 'tags' => '耳机,音频', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '淘宝', 'notes' => '配件齐全'],
+            ['name' => '机械键盘', 'category' => '电子设备', 'location' => '书桌抽屉', 'quantity' => 1, 'description' => '备用键盘', 'barcode' => 'KB-RED-87', 'purchase_date' => date('Y-m-d', strtotime('-540 days')), 'purchase_price' => 399, 'tags' => '键盘,外设', 'status' => 'archived', 'expiry_date' => '', 'purchase_from' => '拼多多', 'notes' => '近期未使用，已归档保存'],
+            ['name' => '二手显示器', 'category' => '电子设备', 'location' => '储物间', 'quantity' => 1, 'description' => '已转卖物品', 'barcode' => 'MON-USED-24', 'purchase_date' => date('Y-m-d', strtotime('-800 days')), 'purchase_price' => 1200, 'tags' => '显示器,转卖', 'status' => 'sold', 'expiry_date' => '', 'purchase_from' => '闲鱼', 'notes' => '已完成交易，保留记录'],
+            ['name' => '胶囊咖啡机', 'category' => '厨房用品', 'location' => '厨房', 'quantity' => 1, 'description' => '家用咖啡机', 'barcode' => 'COFFEE-01', 'purchase_date' => date('Y-m-d', strtotime('-320 days')), 'purchase_price' => 899, 'tags' => '咖啡,厨房', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '线下', 'notes' => '常用设备', 'reminder_date' => date('Y-m-d', strtotime('-28 days')), 'reminder_next_date' => date('Y-m-d', strtotime('+2 days')), 'reminder_cycle_value' => 30, 'reminder_cycle_unit' => 'day', 'reminder_note' => '需要清洗水箱并补充咖啡胶囊'],
+            ['name' => '维生素 D3', 'category' => '其他', 'location' => '厨房', 'quantity' => 2, 'description' => '保健品', 'barcode' => 'HEALTH-D3-01', 'purchase_date' => date('Y-m-d', strtotime('-60 days')), 'purchase_price' => 128, 'tags' => '保健,补剂', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+5 days')), 'purchase_from' => '线下', 'notes' => '还有约一周到期，优先使用'],
+            ['name' => '车载灭火器', 'category' => '工具五金', 'location' => '阳台', 'quantity' => 1, 'description' => '安全应急用品', 'barcode' => 'SAFE-FIRE-01', 'purchase_date' => date('Y-m-d', strtotime('-480 days')), 'purchase_price' => 89, 'tags' => '安全,应急', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('-12 days')), 'purchase_from' => '京东', 'notes' => '已超过有效期，需尽快更换'],
+            ['name' => '沐浴露补充装', 'category' => '其他', 'location' => '储物间', 'quantity' => 3, 'description' => '家庭日用品', 'barcode' => 'HOME-BATH-03', 'purchase_date' => date('Y-m-d', strtotime('-30 days')), 'purchase_price' => 75, 'tags' => '日用品,家居', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+25 days')), 'purchase_from' => '拼多多', 'notes' => '本月内到期，先用旧库存'],
+            ['name' => '训练足球', 'category' => '运动户外', 'location' => '阳台', 'quantity' => 1, 'description' => '周末运动使用', 'barcode' => 'SPORT-BALL-01', 'purchase_date' => date('Y-m-d', strtotime('-210 days')), 'purchase_price' => 199, 'tags' => '运动,户外', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '淘宝', 'notes' => '周末固定训练用球', 'reminder_date' => date('Y-m-d', strtotime('-13 days')), 'reminder_next_date' => date('Y-m-d', strtotime('+1 day')), 'reminder_cycle_value' => 1, 'reminder_cycle_unit' => 'week', 'reminder_note' => '周末出门前检查气压'],
+            ['name' => '空气净化器滤芯', 'category' => '家具家居', 'location' => '客厅', 'quantity' => 1, 'description' => '客厅净化器维护项目', 'barcode' => 'AIR-FILTER-01', 'purchase_date' => date('Y-m-d', strtotime('-200 days')), 'purchase_price' => 169, 'tags' => '家居,维护', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '上次维护后需持续追踪更换周期', 'reminder_date' => date('Y-m-d', strtotime('-1 day')), 'reminder_next_date' => $today, 'reminder_cycle_value' => 1, 'reminder_cycle_unit' => 'day', 'reminder_note' => '每日检查滤芯状态并记录'],
+            ['name' => '空气净化器滤芯（原厂）', 'category' => '家具家居', 'location' => '储物间', 'quantity' => 1, 'description' => '上一批次原厂滤芯采购记录', 'barcode' => 'AIR-FILTER-OEM-02', 'purchase_date' => date('Y-m-d', strtotime('-35 days')), 'purchase_price' => 199, 'tags' => '滤芯,原厂', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '价格较高但安装更稳'],
+            ['name' => '空气净化器滤芯（兼容款）', 'category' => '家具家居', 'location' => '储物间', 'quantity' => 2, 'description' => '兼容款滤芯采购记录', 'barcode' => 'AIR-FILTER-COMP-03', 'purchase_date' => date('Y-m-d', strtotime('-120 days')), 'purchase_price' => 129, 'tags' => '滤芯,兼容', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '拼多多', 'notes' => '单价更低，适合备货'],
+            ['name' => '维生素D3滴剂', 'category' => '其他', 'location' => '厨房', 'quantity' => 1, 'description' => '儿童可用滴剂版本', 'barcode' => 'HEALTH-D3-DROP-02', 'purchase_date' => date('Y-m-d', strtotime('-22 days')), 'purchase_price' => 139, 'tags' => '保健,滴剂', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+320 days')), 'purchase_from' => '淘宝', 'notes' => '最近一次补货'],
+            ['name' => '维生素 D3 软胶囊', 'category' => '其他', 'location' => '厨房', 'quantity' => 1, 'description' => '成人常规补充版本', 'barcode' => 'HEALTH-D3-CAPS-03', 'purchase_date' => date('Y-m-d', strtotime('-180 days')), 'purchase_price' => 109, 'tags' => '保健,胶囊', 'status' => 'archived', 'expiry_date' => date('Y-m-d', strtotime('+120 days')), 'purchase_from' => '京东', 'notes' => '旧批次价格较低'],
+            ['name' => '车载灭火器（标准版）', 'category' => '工具五金', 'location' => '阳台', 'quantity' => 1, 'description' => '上一代标准版灭火器', 'barcode' => 'SAFE-FIRE-STD-02', 'purchase_date' => date('Y-m-d', strtotime('-90 days')), 'purchase_price' => 109, 'tags' => '安全,应急', 'status' => 'archived', 'expiry_date' => date('Y-m-d', strtotime('+280 days')), 'purchase_from' => '线下', 'notes' => '作为价格对比记录'],
+            ['name' => '车载灭火器（便携款）', 'category' => '工具五金', 'location' => '储物间', 'quantity' => 1, 'description' => '便携款采购记录', 'barcode' => 'SAFE-FIRE-MINI-03', 'purchase_date' => date('Y-m-d', strtotime('-300 days')), 'purchase_price' => 79, 'tags' => '安全,便携', 'status' => 'archived', 'expiry_date' => date('Y-m-d', strtotime('+60 days')), 'purchase_from' => '淘宝', 'notes' => '历史最低购入价记录'],
+            ['name' => '设计模式（第2版）', 'category' => '书籍文档', 'location' => '书房', 'quantity' => 1, 'description' => '技术书籍', 'barcode' => 'BOOK-DESIGN-02', 'purchase_date' => date('Y-m-d', strtotime('-700 days')), 'purchase_price' => 88, 'tags' => '书籍,学习', 'status' => 'archived', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '已读完，暂存书架'],
+            ['name' => '纪念手表', 'category' => '电子设备', 'location' => '卧室', 'quantity' => 1, 'description' => '礼品来源物品', 'barcode' => 'GIFT-WATCH-01', 'purchase_date' => date('Y-m-d', strtotime('-95 days')), 'purchase_price' => 0, 'tags' => '礼物,收藏', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '礼品', 'notes' => '生日礼物，定期保养'],
+            ['name' => '在线课程年度会员', 'category' => '虚拟产品', 'location' => '书房', 'quantity' => 1, 'description' => '在线学习会员服务', 'barcode' => 'VIP-COURSE-2026', 'purchase_date' => date('Y-m-d', strtotime('-20 days')), 'purchase_price' => 399, 'tags' => '会员,学习', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+340 days')), 'purchase_from' => '线下', 'notes' => '到期前一个月提醒续费'],
+            ['name' => '未分类收纳箱', 'category' => '', 'location' => '', 'quantity' => 2, 'description' => '暂未归类，等待整理', 'barcode' => 'BOX-UNCAT-01', 'purchase_date' => date('Y-m-d', strtotime('-15 days')), 'purchase_price' => 59, 'tags' => '收纳,未分类', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '线下', 'notes' => '暂放玄关，待统一收纳'],
+        ];
+
+        $insertItem = $db->prepare("INSERT INTO items (name, category_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        $created = 0;
+        foreach ($demoItems as $item) {
+            $categoryId = isset($catIdByName[$item['category'] ?? '']) ? intval($catIdByName[$item['category']]) : 0;
+            $locationId = isset($locMap[$item['location'] ?? '']) ? intval($locMap[$item['location']]) : 0;
+            $insertItem->execute([
+                $item['name'],
+                $categoryId,
+                $locationId,
+                max(0, intval($item['quantity'] ?? 1)),
+                $item['description'] ?? '',
+                '',
+                $item['barcode'] ?? '',
+                normalizeDateYmd($item['purchase_date'] ?? '') ?? '',
+                floatval($item['purchase_price'] ?? 0),
+                $item['tags'] ?? '',
+                normalizeStatusValue($item['status'] ?? 'active'),
+                normalizeDateYmd($item['expiry_date'] ?? '') ?? '',
+                $item['purchase_from'] ?? '',
+                $item['notes'] ?? '',
+                normalizeReminderDateValue($item['reminder_date'] ?? ''),
+                normalizeReminderDateValue($item['reminder_next_date'] ?? ''),
+                normalizeReminderCycleValue($item['reminder_cycle_value'] ?? 0, $item['reminder_cycle_unit'] ?? ''),
+                normalizeReminderCycleUnit($item['reminder_cycle_unit'] ?? ''),
+                trim((string) ($item['reminder_note'] ?? ''))
+            ]);
+            $created++;
+        }
+
+        // 回收站预置记录（用于验证恢复与彻底删除流程）
+        $insertTrash = $db->prepare("INSERT INTO items (name, category_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        $insertTrash->execute([
+            '旧数据线（待清理）',
+            isset($catIdByName['电子设备']) ? intval($catIdByName['电子设备']) : 0,
+            isset($locMap['电视柜']) ? intval($locMap['电视柜']) : 0,
+            1,
+            '已损坏，待确认是否恢复',
+            '',
+            'TRASH-DEMO-01',
+            date('Y-m-d', strtotime('-480 days')),
+            29,
+            '待清理,回收站',
+            'archived',
+            '',
+            '线下',
+            '删除于昨日，保留恢复窗口',
+            '',
+            '',
+            0,
+            '',
+            ''
+        ]);
+        $trashId = intval($db->lastInsertId());
+        if ($trashId > 0) {
+            $markTrash = $db->prepare("UPDATE items SET deleted_at=datetime('now','-1 day','localtime'), updated_at=datetime('now','-1 day','localtime') WHERE id=?");
+            $markTrash->execute([$trashId]);
+        }
+
+        // 提醒实例：预置一条已完成 + 一条待完成
+        seedReminderInstancesFromItems($db);
+        $completedReminderDemoPrepared = false;
+        $demoReminderItemStmt = $db->prepare("SELECT id, reminder_cycle_value, reminder_cycle_unit FROM items WHERE name=? LIMIT 1");
+        $demoReminderItemStmt->execute(['空气净化器滤芯']);
+        $demoReminderItem = $demoReminderItemStmt->fetch();
+        if ($demoReminderItem) {
+            $cycleUnit = normalizeReminderCycleUnit($demoReminderItem['reminder_cycle_unit'] ?? '');
+            $cycleValue = normalizeReminderCycleValue($demoReminderItem['reminder_cycle_value'] ?? 0, $cycleUnit);
+            $pendingReminderStmt = $db->prepare("SELECT id, due_date FROM item_reminder_instances WHERE item_id=? AND is_completed=0 ORDER BY due_date ASC, id ASC LIMIT 1");
+            $pendingReminderStmt->execute([intval($demoReminderItem['id'])]);
+            $pendingReminder = $pendingReminderStmt->fetch();
+            if ($pendingReminder && $cycleUnit !== '' && $cycleValue > 0) {
+                $currentDueDate = normalizeReminderDateValue($pendingReminder['due_date'] ?? '');
+                $nextDueDate = calcNextReminderDate($currentDueDate, $cycleValue, $cycleUnit);
+                if ($currentDueDate !== '' && $nextDueDate) {
+                    $completeStmt = $db->prepare("UPDATE item_reminder_instances SET is_completed=1, completed_at=datetime('now','-2 hour','localtime'), updated_at=datetime('now','localtime') WHERE id=?");
+                    $completeStmt->execute([intval($pendingReminder['id'])]);
+                    $nextExistsStmt = $db->prepare("SELECT id FROM item_reminder_instances WHERE item_id=? AND due_date=? AND is_completed=0 LIMIT 1");
+                    $nextExistsStmt->execute([intval($demoReminderItem['id']), $nextDueDate]);
+                    if (!$nextExistsStmt->fetchColumn()) {
+                        $insertNextStmt = $db->prepare("INSERT INTO item_reminder_instances (item_id, due_date, is_completed, completed_at, generated_by_complete_id, created_at, updated_at) VALUES (?,?,0,NULL,?,datetime('now','localtime'),datetime('now','localtime'))");
+                        $insertNextStmt->execute([intval($demoReminderItem['id']), $nextDueDate, intval($pendingReminder['id'])]);
+                    }
+                    $updateNextDateStmt = $db->prepare("UPDATE items SET reminder_next_date=?, updated_at=datetime('now','localtime') WHERE id=?");
+                    $updateNextDateStmt->execute([$nextDueDate, intval($demoReminderItem['id'])]);
+                    $completedReminderDemoPrepared = true;
+                }
+            }
+        }
+
+        $demoShoppingList = [
+            ['name' => '空气净化器滤芯（备用）', 'quantity' => 1, 'status' => 'pending_purchase', 'category' => '家具家居', 'priority' => 'high', 'planned_price' => 169, 'notes' => '与在用滤芯同型号，提前备货', 'reminder_date' => date('Y-m-d', strtotime('+1 day')), 'reminder_note' => '确认活动价后下单'],
+            ['name' => '维生素 D3（补充装）', 'quantity' => 2, 'status' => 'pending_receipt', 'category' => '其他', 'priority' => 'high', 'planned_price' => 128, 'notes' => '已下单待收货，收货后放入厨房抽屉', 'reminder_date' => date('Y-m-d', strtotime('-1 day')), 'reminder_note' => '到货后核对保质期'],
+            ['name' => '车载灭火器（新）', 'quantity' => 1, 'status' => 'pending_purchase', 'category' => '工具五金', 'priority' => 'high', 'planned_price' => 99, 'notes' => '替换已过期的旧灭火器', 'reminder_date' => date('Y-m-d', strtotime('+2 days')), 'reminder_note' => '确认生产日期在一年内'],
+            ['name' => '收纳箱（换季）', 'quantity' => 3, 'status' => 'pending_receipt', 'category' => '家具家居', 'priority' => 'low', 'planned_price' => 49, 'notes' => '补充衣物收纳，和现有收纳箱同尺寸', 'reminder_date' => '', 'reminder_note' => ''],
+            ['name' => '机械键盘键帽套装', 'quantity' => 1, 'status' => 'pending_purchase', 'category' => '电子设备', 'priority' => 'low', 'planned_price' => 79, 'notes' => '给备用键盘更换键帽', 'reminder_date' => '', 'reminder_note' => ''],
+        ];
+        $insertShopping = $db->prepare("INSERT INTO shopping_list (name, quantity, status, category_id, priority, planned_price, notes, reminder_date, reminder_note, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
+        $shoppingCreated = 0;
+        foreach ($demoShoppingList as $row) {
+            $categoryId = isset($catIdByName[$row['category']]) ? intval($catIdByName[$row['category']]) : 0;
+            $insertShopping->execute([
+                trim((string) ($row['name'] ?? '')),
+                max(1, intval($row['quantity'] ?? 1)),
+                normalizeShoppingStatus($row['status'] ?? 'pending_purchase'),
+                $categoryId,
+                normalizeShoppingPriority($row['priority'] ?? 'normal'),
+                max(0, floatval($row['planned_price'] ?? 0)),
+                trim((string) ($row['notes'] ?? '')),
+                normalizeReminderDateValue($row['reminder_date'] ?? ''),
+                trim((string) ($row['reminder_note'] ?? '')),
+            ]);
+            $shoppingCreated++;
+        }
+
+        $db->commit();
+        $message = "体验数据已初始化：$created 件物品、$shoppingCreated 条购物清单已就绪";
+        if ($completedReminderDemoPrepared) {
+            $message .= '，含 1 条已完成提醒记录';
+        }
+        if ($trashId > 0) {
+            $message .= '，含 1 条回收站记录';
+        }
+        return [
+            'message' => $message,
+            'created' => $created,
+            'shopping_created' => $shoppingCreated,
+            'completed_reminder_demo' => $completedReminderDemoPrepared,
+            'trash_demo' => ($trashId > 0),
+            'moved_images' => $moved
+        ];
+    } catch (Exception $e) {
+        if ($db->inTransaction()) {
+            $db->rollBack();
+        }
+        throw $e;
+    }
+}
+
 // ============================================================
 // 🌐 API 路由处理
 // ============================================================
@@ -281,8 +923,372 @@ if (isset($_GET['api'])) {
     $method = $_SERVER['REQUEST_METHOD'];
 
     try {
-        $db = getDB();
+        $authDb = getAuthDB();
         $result = ['success' => false, 'message' => '未知操作'];
+
+        if ($api === 'auth/init') {
+            $userCount = intval($authDb->query("SELECT COUNT(*) FROM users")->fetchColumn());
+            $currentUser = getCurrentAuthUser($authDb);
+            $securityQuestions = getSecurityQuestions();
+            $result = [
+                'success' => true,
+                'allow_registration' => ALLOW_PUBLIC_REGISTRATION,
+                'has_users' => $userCount > 0,
+                'needs_setup' => $userCount === 0,
+                'default_admin' => [
+                    'username' => DEFAULT_ADMIN_USERNAME
+                ],
+                'default_demo' => [
+                    'username' => DEFAULT_DEMO_USERNAME
+                ],
+                'security_questions' => $securityQuestions,
+                'authenticated' => !!$currentUser,
+                'user' => $currentUser ? [
+                    'id' => intval($currentUser['id']),
+                    'username' => $currentUser['username'],
+                    'display_name' => $currentUser['display_name'] ?: $currentUser['username'],
+                    'role' => $currentUser['role'] ?? 'user',
+                    'is_admin' => isAdminUser($currentUser)
+                ] : null
+            ];
+            echo json_encode($result, JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+
+        if ($api === 'auth/register') {
+            if ($method !== 'POST') {
+                $result = ['success' => false, 'message' => '仅支持 POST'];
+                echo json_encode($result, JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+            $data = json_decode(file_get_contents('php://input'), true);
+            $username = strtolower(trim((string) ($data['username'] ?? '')));
+            $password = strval($data['password'] ?? '');
+            $displayName = trim((string) ($data['display_name'] ?? ''));
+            $questionKey = trim((string) ($data['question_key'] ?? ''));
+            $securityAnswer = strval($data['security_answer'] ?? '');
+
+            if (!ALLOW_PUBLIC_REGISTRATION) {
+                $result = ['success' => false, 'message' => '当前已关闭注册'];
+                echo json_encode($result, JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+            if (!preg_match('/^[a-zA-Z0-9_.-]{3,32}$/', $username)) {
+                $result = ['success' => false, 'message' => '用户名需为 3-32 位字母/数字/._-'];
+                echo json_encode($result, JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+            if (strlen($password) < 6) {
+                $result = ['success' => false, 'message' => '密码至少 6 位'];
+                echo json_encode($result, JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+            $questions = getSecurityQuestions();
+            if (!isset($questions[$questionKey])) {
+                $result = ['success' => false, 'message' => '请选择有效的验证问题'];
+                echo json_encode($result, JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+            $answerLen = function_exists('mb_strlen') ? mb_strlen(trim($securityAnswer), 'UTF-8') : strlen(trim($securityAnswer));
+            if ($answerLen < 1) {
+                $result = ['success' => false, 'message' => '请填写验证答案'];
+                echo json_encode($result, JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+            if ($displayName === '') {
+                $displayName = $username;
+            }
+
+            $existsStmt = $authDb->prepare("SELECT id FROM users WHERE username=? LIMIT 1");
+            $existsStmt->execute([$username]);
+            if ($existsStmt->fetchColumn()) {
+                $result = ['success' => false, 'message' => '用户名已存在'];
+                echo json_encode($result, JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+
+            $hash = password_hash($password, PASSWORD_DEFAULT);
+            $answerHash = password_hash(normalizeSecurityAnswer($securityAnswer), PASSWORD_DEFAULT);
+            $ins = $authDb->prepare("INSERT INTO users (username, password_hash, display_name, role, security_question_key, security_answer_hash, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
+            $ins->execute([$username, $hash, $displayName, 'user', $questionKey, $answerHash]);
+            $newId = intval($authDb->lastInsertId());
+
+            $_SESSION['user_id'] = $newId;
+            session_regenerate_id(true);
+            $result = [
+                'success' => true,
+                'message' => '注册成功',
+                'user' => ['id' => $newId, 'username' => $username, 'display_name' => $displayName, 'role' => 'user', 'is_admin' => false]
+            ];
+            echo json_encode($result, JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+
+        if ($api === 'auth/login') {
+            if ($method !== 'POST') {
+                $result = ['success' => false, 'message' => '仅支持 POST'];
+                echo json_encode($result, JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+            $data = json_decode(file_get_contents('php://input'), true);
+            $username = strtolower(trim((string) ($data['username'] ?? '')));
+            $password = strval($data['password'] ?? '');
+
+            $stmt = $authDb->prepare("SELECT id, username, password_hash, display_name, role FROM users WHERE username=? LIMIT 1");
+            $stmt->execute([$username]);
+            $user = $stmt->fetch();
+            if (!$user || !password_verify($password, strval($user['password_hash'] ?? ''))) {
+                $result = ['success' => false, 'message' => '用户名或密码错误'];
+                echo json_encode($result, JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+
+            $_SESSION['user_id'] = intval($user['id']);
+            session_regenerate_id(true);
+            $up = $authDb->prepare("UPDATE users SET last_login_at=datetime('now','localtime'), updated_at=datetime('now','localtime') WHERE id=?");
+            $up->execute([intval($user['id'])]);
+            $result = [
+                'success' => true,
+                'message' => '登录成功',
+                'user' => [
+                    'id' => intval($user['id']),
+                    'username' => $user['username'],
+                    'display_name' => ($user['display_name'] ?: $user['username']),
+                    'role' => ($user['role'] ?: 'user'),
+                    'is_admin' => (($user['role'] ?? 'user') === 'admin')
+                ]
+            ];
+            echo json_encode($result, JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+
+        if ($api === 'auth/demo-login') {
+            if ($method !== 'POST') {
+                $result = ['success' => false, 'message' => '仅支持 POST'];
+                echo json_encode($result, JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+
+            $demoUsername = strtolower(DEFAULT_DEMO_USERNAME);
+            $demoPassword = DEFAULT_DEMO_PASSWORD;
+            $demoDisplayName = '测试用户';
+            $questions = getSecurityQuestions();
+            $qKeys = array_keys($questions);
+            $defaultQuestionKey = count($qKeys) > 0 ? $qKeys[0] : '';
+
+            $findStmt = $authDb->prepare("SELECT id, username, display_name, role FROM users WHERE username=? LIMIT 1");
+            $findStmt->execute([$demoUsername]);
+            $demoUser = $findStmt->fetch();
+            $demoId = intval($demoUser['id'] ?? 0);
+            if ($demoId <= 0) {
+                $ins = $authDb->prepare("INSERT INTO users (username, password_hash, display_name, role, security_question_key, security_answer_hash, created_at, updated_at)
+                    VALUES (?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
+                $ins->execute([
+                    $demoUsername,
+                    password_hash($demoPassword, PASSWORD_DEFAULT),
+                    $demoDisplayName,
+                    'user',
+                    $defaultQuestionKey,
+                    $defaultQuestionKey !== '' ? password_hash(normalizeSecurityAnswer('test'), PASSWORD_DEFAULT) : ''
+                ]);
+                $demoId = intval($authDb->lastInsertId());
+            } else {
+                $syncStmt = $authDb->prepare("UPDATE users SET password_hash=?, display_name=?, role='user', security_question_key=?, security_answer_hash=?, updated_at=datetime('now','localtime') WHERE id=?");
+                $syncStmt->execute([
+                    password_hash($demoPassword, PASSWORD_DEFAULT),
+                    $demoDisplayName,
+                    $defaultQuestionKey,
+                    $defaultQuestionKey !== '' ? password_hash(normalizeSecurityAnswer('test'), PASSWORD_DEFAULT) : '',
+                    $demoId
+                ]);
+            }
+
+            $demoDb = getUserDB($demoId);
+            $demoLoad = loadDemoDataIntoDb($demoDb, ['move_images' => true]);
+
+            $_SESSION['user_id'] = $demoId;
+            session_regenerate_id(true);
+            $up = $authDb->prepare("UPDATE users SET last_login_at=datetime('now','localtime'), updated_at=datetime('now','localtime') WHERE id=?");
+            $up->execute([$demoId]);
+
+            $result = [
+                'success' => true,
+                'message' => '已进入 Demo 环境（数据已重置）',
+                'demo' => $demoLoad,
+                'user' => [
+                    'id' => $demoId,
+                    'username' => $demoUsername,
+                    'display_name' => $demoDisplayName,
+                    'role' => 'user',
+                    'is_admin' => false
+                ]
+            ];
+            echo json_encode($result, JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+
+        if ($api === 'auth/logout') {
+            unset($_SESSION['user_id']);
+            session_regenerate_id(true);
+            $result = ['success' => true, 'message' => '已退出登录'];
+            echo json_encode($result, JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+
+        if ($api === 'auth/me') {
+            $currentUser = getCurrentAuthUser($authDb);
+            if (!$currentUser) {
+                http_response_code(401);
+                echo json_encode(['success' => false, 'message' => '未登录', 'code' => 'AUTH_REQUIRED'], JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+            $result = [
+                'success' => true,
+                'user' => [
+                    'id' => intval($currentUser['id']),
+                    'username' => $currentUser['username'],
+                    'display_name' => $currentUser['display_name'] ?: $currentUser['username'],
+                    'role' => $currentUser['role'] ?? 'user',
+                    'is_admin' => isAdminUser($currentUser)
+                ]
+            ];
+            echo json_encode($result, JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+
+        if ($api === 'auth/get-reset-question') {
+            $username = strtolower(trim((string) ($_GET['username'] ?? '')));
+            if ($username === '') {
+                $result = ['success' => false, 'message' => '请输入用户名'];
+                echo json_encode($result, JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+            $stmt = $authDb->prepare("SELECT security_question_key FROM users WHERE username=? LIMIT 1");
+            $stmt->execute([$username]);
+            $row = $stmt->fetch();
+            if (!$row) {
+                $result = ['success' => false, 'message' => '用户不存在'];
+                echo json_encode($result, JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+            $questions = getSecurityQuestions();
+            $key = trim((string) ($row['security_question_key'] ?? ''));
+            if ($key === '' || !isset($questions[$key])) {
+                $result = ['success' => false, 'message' => '该账号未设置验证问题'];
+                echo json_encode($result, JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+            $result = ['success' => true, 'question_key' => $key, 'question_label' => $questions[$key]];
+            echo json_encode($result, JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+
+        if ($api === 'auth/reset-password-by-question') {
+            if ($method !== 'POST') {
+                $result = ['success' => false, 'message' => '仅支持 POST'];
+                echo json_encode($result, JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+            $data = json_decode(file_get_contents('php://input'), true);
+            $username = strtolower(trim((string) ($data['username'] ?? '')));
+            $answer = strval($data['security_answer'] ?? '');
+            $newPassword = strval($data['new_password'] ?? '');
+            if ($username === '' || $answer === '' || $newPassword === '') {
+                $result = ['success' => false, 'message' => '请完整填写重置信息'];
+                echo json_encode($result, JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+            if (strlen($newPassword) < 6) {
+                $result = ['success' => false, 'message' => '新密码至少 6 位'];
+                echo json_encode($result, JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+            $stmt = $authDb->prepare("SELECT id, security_answer_hash FROM users WHERE username=? LIMIT 1");
+            $stmt->execute([$username]);
+            $user = $stmt->fetch();
+            if (!$user || !password_verify(normalizeSecurityAnswer($answer), strval($user['security_answer_hash'] ?? ''))) {
+                $result = ['success' => false, 'message' => '验证答案错误'];
+                echo json_encode($result, JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+            $up = $authDb->prepare("UPDATE users SET password_hash=?, updated_at=datetime('now','localtime') WHERE id=?");
+            $up->execute([password_hash($newPassword, PASSWORD_DEFAULT), intval($user['id'])]);
+            $result = ['success' => true, 'message' => '密码已重置，请使用新密码登录'];
+            echo json_encode($result, JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+
+        $currentUser = getCurrentAuthUser($authDb);
+        if (!$currentUser) {
+            http_response_code(401);
+            echo json_encode(['success' => false, 'message' => '请先登录', 'code' => 'AUTH_REQUIRED'], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+
+        if ($api === 'auth/users') {
+            if (!isAdminUser($currentUser)) {
+                http_response_code(403);
+                echo json_encode(['success' => false, 'message' => '仅管理员可访问', 'code' => 'ADMIN_REQUIRED'], JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+            $rows = $authDb->query("SELECT id, username, display_name, role, created_at, updated_at, last_login_at FROM users ORDER BY CASE role WHEN 'admin' THEN 0 ELSE 1 END, id ASC")->fetchAll();
+            $users = [];
+            foreach ($rows as $row) {
+                $stats = getUserItemStats(intval($row['id']));
+                $users[] = [
+                    'id' => intval($row['id']),
+                    'username' => $row['username'],
+                    'display_name' => $row['display_name'] ?: $row['username'],
+                    'role' => $row['role'] ?: 'user',
+                    'is_admin' => (($row['role'] ?? 'user') === 'admin'),
+                    'created_at' => $row['created_at'],
+                    'updated_at' => $row['updated_at'],
+                    'last_login_at' => $row['last_login_at'],
+                    'item_kinds' => intval($stats['item_kinds'] ?? 0),
+                    'item_qty' => intval($stats['item_qty'] ?? 0),
+                    'last_item_at' => $stats['last_item_at'] ?? null
+                ];
+            }
+            $result = ['success' => true, 'data' => $users];
+            echo json_encode($result, JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+
+        if ($api === 'auth/admin-reset-password') {
+            if (!isAdminUser($currentUser)) {
+                http_response_code(403);
+                echo json_encode(['success' => false, 'message' => '仅管理员可操作', 'code' => 'ADMIN_REQUIRED'], JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+            if ($method !== 'POST') {
+                $result = ['success' => false, 'message' => '仅支持 POST'];
+                echo json_encode($result, JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+            $data = json_decode(file_get_contents('php://input'), true);
+            $targetId = intval($data['user_id'] ?? 0);
+            $newPassword = strval($data['new_password'] ?? '');
+            if ($targetId <= 0 || strlen($newPassword) < 6) {
+                $result = ['success' => false, 'message' => '参数无效（密码至少 6 位）'];
+                echo json_encode($result, JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+            $existsStmt = $authDb->prepare("SELECT id, username, role FROM users WHERE id=? LIMIT 1");
+            $existsStmt->execute([$targetId]);
+            $targetUser = $existsStmt->fetch();
+            if (!$targetUser) {
+                $result = ['success' => false, 'message' => '用户不存在'];
+                echo json_encode($result, JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+            $up = $authDb->prepare("UPDATE users SET password_hash=?, updated_at=datetime('now','localtime') WHERE id=?");
+            $up->execute([password_hash($newPassword, PASSWORD_DEFAULT), $targetId]);
+            $result = ['success' => true, 'message' => "已重置用户 {$targetUser['username']} 的密码"];
+            echo json_encode($result, JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        $db = getUserDB(intval($currentUser['id']));
 
         switch ($api) {
             // ---------- 仪表盘 ----------
@@ -297,7 +1303,29 @@ if (isset($_GET['api'])) {
                 $statusStats = $db->query("SELECT status, COUNT(*) as count, COALESCE(SUM(quantity),0) as total_qty FROM items WHERE deleted_at IS NULL GROUP BY status ORDER BY total_qty DESC")->fetchAll();
                 $uncategorizedQty = $db->query("SELECT COALESCE(SUM(i.quantity),0) FROM items i LEFT JOIN categories c ON i.category_id=c.id WHERE i.deleted_at IS NULL AND i.status='active' AND (i.category_id=0 OR c.id IS NULL)")->fetchColumn();
                 $expiringItems = $db->query("SELECT i.*, c.name as category_name, c.icon as category_icon, l.name as location_name FROM items i LEFT JOIN categories c ON i.category_id=c.id LEFT JOIN locations l ON i.location_id=l.id WHERE i.deleted_at IS NULL AND i.expiry_date != '' AND i.expiry_date IS NOT NULL ORDER BY i.expiry_date ASC LIMIT 10")->fetchAll();
-                $result = ['success' => true, 'data' => compact('totalItems', 'totalKinds', 'totalCategories', 'totalLocations', 'totalValue', 'recentItems', 'categoryStats', 'statusStats', 'uncategorizedQty', 'expiringItems')];
+                seedReminderInstancesFromItems($db);
+                $reminderItems = $db->query("SELECT
+                        r.id as reminder_instance_id,
+                        r.due_date as reminder_due_date,
+                        COALESCE(r.is_completed,0) as reminder_completed,
+                        r.generated_by_complete_id as reminder_generated_by,
+                        i.*,
+                        c.name as category_name,
+                        c.icon as category_icon,
+                        l.name as location_name
+                    FROM item_reminder_instances r
+                    INNER JOIN items i ON i.id=r.item_id
+                    LEFT JOIN categories c ON i.category_id=c.id
+                    LEFT JOIN locations l ON i.location_id=l.id
+                    WHERE i.deleted_at IS NULL
+                      AND r.due_date != ''
+                      AND r.due_date IS NOT NULL
+                      AND r.due_date >= date('now','-3 day','localtime')
+                      AND r.due_date <= date('now','+3 day','localtime')
+                    ORDER BY r.due_date ASC, r.is_completed ASC, r.id ASC
+                    LIMIT 20")->fetchAll();
+                $shoppingReminderItems = $db->query("SELECT s.*, c.name as category_name, c.icon as category_icon, c.color as category_color FROM shopping_list s LEFT JOIN categories c ON s.category_id=c.id WHERE s.reminder_date != '' AND s.reminder_date IS NOT NULL AND s.reminder_date <= date('now','+3 day','localtime') ORDER BY s.reminder_date ASC LIMIT 10")->fetchAll();
+                $result = ['success' => true, 'data' => compact('totalItems', 'totalKinds', 'totalCategories', 'totalLocations', 'totalValue', 'recentItems', 'categoryStats', 'statusStats', 'uncategorizedQty', 'expiringItems', 'reminderItems', 'shoppingReminderItems')];
                 break;
 
             // ---------- 物品 CRUD ----------
@@ -326,6 +1354,12 @@ if (isset($_GET['api'])) {
                             OR i.notes LIKE ?
                             OR i.purchase_date LIKE ?
                             OR i.expiry_date LIKE ?
+                            OR i.reminder_date LIKE ?
+                            OR i.reminder_next_date LIKE ?
+                            OR CAST(i.reminder_cycle_value AS TEXT) LIKE ?
+                            OR i.reminder_cycle_unit LIKE ?
+                            OR (CASE i.reminder_cycle_unit WHEN 'day' THEN '天' WHEN 'week' THEN '周' WHEN 'year' THEN '年' ELSE '' END) LIKE ?
+                            OR i.reminder_note LIKE ?
                             OR CAST(i.quantity AS TEXT) LIKE ?
                             OR CAST(i.purchase_price AS TEXT) LIKE ?
                             OR c.name LIKE ?
@@ -334,7 +1368,7 @@ if (isset($_GET['api'])) {
                             OR (CASE i.status WHEN 'active' THEN '使用中' WHEN 'archived' THEN '已归档' WHEN 'sold' THEN '已转卖' ELSE i.status END) LIKE ?
                         )";
                         $s = "%$search%";
-                        $params = array_merge($params, [$s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s]);
+                        $params = array_merge($params, [$s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s]);
                     }
                     if ($category !== 0) {
                         if ($category === -1) {
@@ -385,35 +1419,20 @@ if (isset($_GET['api'])) {
                         $result = ['success' => false, 'message' => '物品名称不能为空'];
                         break;
                     }
-                    $stmt = $db->prepare("INSERT INTO items (name, category_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-                    $stmt->execute([
-                        $data['name'],
-                        intval($data['category_id'] ?? 0),
-                        intval($data['location_id'] ?? 0),
-                        max(0, intval($data['quantity'] ?? 1)),
-                        $data['description'] ?? '',
-                        $data['image'] ?? '',
-                        $data['barcode'] ?? '',
-                        $data['purchase_date'] ?? '',
-                        floatval($data['purchase_price'] ?? 0),
-                        $data['tags'] ?? '',
-                        normalizeStatusValue($data['status'] ?? 'active'),
-                        $data['expiry_date'] ?? '',
-                        $data['purchase_from'] ?? '',
-                        $data['notes'] ?? ''
-                    ]);
-                    $result = ['success' => true, 'message' => '添加成功', 'id' => $db->lastInsertId()];
-                }
-                break;
-
-            case 'items/update':
-                if ($method === 'POST') {
-                    $data = json_decode(file_get_contents('php://input'), true);
-                    if (empty($data['id'])) {
-                        $result = ['success' => false, 'message' => '缺少物品ID'];
-                        break;
+                    $reminderDate = normalizeReminderDateValue($data['reminder_date'] ?? '');
+                    $reminderNextDate = normalizeReminderDateValue($data['reminder_next_date'] ?? '');
+                    $reminderUnit = normalizeReminderCycleUnit($data['reminder_cycle_unit'] ?? '');
+                    $reminderValue = normalizeReminderCycleValue($data['reminder_cycle_value'] ?? 0, $reminderUnit);
+                    if ($reminderDate === '' || $reminderUnit === '' || $reminderValue <= 0) {
+                        $reminderDate = '';
+                        $reminderNextDate = '';
+                        $reminderUnit = '';
+                        $reminderValue = 0;
+                    } elseif ($reminderNextDate === '') {
+                        $reminderNextDate = $reminderDate;
                     }
-                    $stmt = $db->prepare("UPDATE items SET name=?, category_id=?, location_id=?, quantity=?, description=?, image=?, barcode=?, purchase_date=?, purchase_price=?, tags=?, status=?, expiry_date=?, purchase_from=?, notes=?, updated_at=CURRENT_TIMESTAMP WHERE id=?");
+                    $reminderNote = trim((string) ($data['reminder_note'] ?? ''));
+                    $stmt = $db->prepare("INSERT INTO items (name, category_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
                     $stmt->execute([
                         $data['name'],
                         intval($data['category_id'] ?? 0),
@@ -429,9 +1448,209 @@ if (isset($_GET['api'])) {
                         $data['expiry_date'] ?? '',
                         $data['purchase_from'] ?? '',
                         $data['notes'] ?? '',
+                        $reminderDate,
+                        $reminderNextDate,
+                        $reminderValue,
+                        $reminderUnit,
+                        $reminderNote
+                    ]);
+                    $newItemId = intval($db->lastInsertId());
+                    syncItemReminderInstances($db, $newItemId, $reminderDate, $reminderNextDate, $reminderValue, $reminderUnit);
+                    $result = ['success' => true, 'message' => '添加成功', 'id' => $newItemId];
+                }
+                break;
+
+            case 'items/update':
+                if ($method === 'POST') {
+                    $data = json_decode(file_get_contents('php://input'), true);
+                    if (empty($data['id'])) {
+                        $result = ['success' => false, 'message' => '缺少物品ID'];
+                        break;
+                    }
+                    $reminderDate = normalizeReminderDateValue($data['reminder_date'] ?? '');
+                    $reminderNextDate = normalizeReminderDateValue($data['reminder_next_date'] ?? '');
+                    $reminderUnit = normalizeReminderCycleUnit($data['reminder_cycle_unit'] ?? '');
+                    $reminderValue = normalizeReminderCycleValue($data['reminder_cycle_value'] ?? 0, $reminderUnit);
+                    if ($reminderDate === '' || $reminderUnit === '' || $reminderValue <= 0) {
+                        $reminderDate = '';
+                        $reminderNextDate = '';
+                        $reminderUnit = '';
+                        $reminderValue = 0;
+                    } elseif ($reminderNextDate === '') {
+                        $reminderNextDate = $reminderDate;
+                    }
+                    $reminderNote = trim((string) ($data['reminder_note'] ?? ''));
+                    $stmt = $db->prepare("UPDATE items SET name=?, category_id=?, location_id=?, quantity=?, description=?, image=?, barcode=?, purchase_date=?, purchase_price=?, tags=?, status=?, expiry_date=?, purchase_from=?, notes=?, reminder_date=?, reminder_next_date=?, reminder_cycle_value=?, reminder_cycle_unit=?, reminder_note=?, updated_at=CURRENT_TIMESTAMP WHERE id=?");
+                    $stmt->execute([
+                        $data['name'],
+                        intval($data['category_id'] ?? 0),
+                        intval($data['location_id'] ?? 0),
+                        max(0, intval($data['quantity'] ?? 1)),
+                        $data['description'] ?? '',
+                        $data['image'] ?? '',
+                        $data['barcode'] ?? '',
+                        $data['purchase_date'] ?? '',
+                        floatval($data['purchase_price'] ?? 0),
+                        $data['tags'] ?? '',
+                        normalizeStatusValue($data['status'] ?? 'active'),
+                        $data['expiry_date'] ?? '',
+                        $data['purchase_from'] ?? '',
+                        $data['notes'] ?? '',
+                        $reminderDate,
+                        $reminderNextDate,
+                        $reminderValue,
+                        $reminderUnit,
+                        $reminderNote,
                         intval($data['id'])
                     ]);
+                    syncItemReminderInstances($db, intval($data['id']), $reminderDate, $reminderNextDate, $reminderValue, $reminderUnit);
                     $result = ['success' => true, 'message' => '更新成功'];
+                }
+                break;
+
+            case 'items/complete-reminder':
+                if ($method === 'POST') {
+                    $data = json_decode(file_get_contents('php://input'), true);
+                    $id = intval($data['id'] ?? 0);
+                    $reminderId = intval($data['reminder_id'] ?? 0);
+                    if ($id <= 0) {
+                        $result = ['success' => false, 'message' => '缺少物品ID'];
+                        break;
+                    }
+                    $stmt = $db->prepare("SELECT id, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit FROM items WHERE id=? AND deleted_at IS NULL");
+                    $stmt->execute([$id]);
+                    $item = $stmt->fetch();
+                    if (!$item) {
+                        $result = ['success' => false, 'message' => '物品不存在'];
+                        break;
+                    }
+
+                    $reminderUnit = normalizeReminderCycleUnit($item['reminder_cycle_unit'] ?? '');
+                    $reminderValue = normalizeReminderCycleValue($item['reminder_cycle_value'] ?? 0, $reminderUnit);
+                    if ($reminderUnit === '' || $reminderValue <= 0) {
+                        $result = ['success' => false, 'message' => '该物品未设置有效的循环提醒'];
+                        break;
+                    }
+
+                    seedReminderInstancesFromItems($db);
+                    if ($reminderId > 0) {
+                        $instanceStmt = $db->prepare("SELECT id, due_date, is_completed FROM item_reminder_instances WHERE id=? AND item_id=? LIMIT 1");
+                        $instanceStmt->execute([$reminderId, $id]);
+                    } else {
+                        $instanceStmt = $db->prepare("SELECT id, due_date, is_completed FROM item_reminder_instances WHERE item_id=? AND is_completed=0 ORDER BY due_date ASC, id ASC LIMIT 1");
+                        $instanceStmt->execute([$id]);
+                    }
+                    $instance = $instanceStmt->fetch();
+                    if (!$instance) {
+                        $result = ['success' => false, 'message' => '提醒记录不存在'];
+                        break;
+                    }
+                    if (intval($instance['is_completed']) === 1) {
+                        $result = ['success' => true, 'message' => '该提醒已是完成状态'];
+                        break;
+                    }
+
+                    $currentDueDate = normalizeReminderDateValue($instance['due_date'] ?? '');
+                    if ($currentDueDate === '') {
+                        $result = ['success' => false, 'message' => '提醒日期无效'];
+                        break;
+                    }
+
+                    $nextDate = calcNextReminderDate($currentDueDate, $reminderValue, $reminderUnit);
+                    if (!$nextDate) {
+                        $result = ['success' => false, 'message' => '该物品未设置有效的循环提醒'];
+                        break;
+                    }
+
+                    $db->beginTransaction();
+                    try {
+                        $markDone = $db->prepare("UPDATE item_reminder_instances SET is_completed=1, completed_at=datetime('now','localtime'), updated_at=datetime('now','localtime') WHERE id=? AND item_id=?");
+                        $markDone->execute([intval($instance['id']), $id]);
+
+                        $checkNext = $db->prepare("SELECT id FROM item_reminder_instances WHERE item_id=? AND due_date=? AND is_completed=0 LIMIT 1");
+                        $checkNext->execute([$id, $nextDate]);
+                        $existingNext = $checkNext->fetchColumn();
+                        if (!$existingNext) {
+                            $insertNext = $db->prepare("INSERT INTO item_reminder_instances (item_id, due_date, is_completed, completed_at, generated_by_complete_id, created_at, updated_at) VALUES (?,?,0,NULL,?,datetime('now','localtime'),datetime('now','localtime'))");
+                            $insertNext->execute([$id, $nextDate, intval($instance['id'])]);
+                        }
+
+                        $up = $db->prepare("UPDATE items SET reminder_next_date=?, updated_at=datetime('now','localtime') WHERE id=?");
+                        $up->execute([$nextDate, $id]);
+
+                        $db->commit();
+                        $result = ['success' => true, 'message' => '提醒已完成，已生成下一次提醒', 'next_date' => $nextDate];
+                    } catch (Exception $e) {
+                        if ($db->inTransaction())
+                            $db->rollBack();
+                        throw $e;
+                    }
+                }
+                break;
+
+            case 'items/undo-reminder':
+                if ($method === 'POST') {
+                    $data = json_decode(file_get_contents('php://input'), true);
+                    $id = intval($data['id'] ?? 0);
+                    $reminderId = intval($data['reminder_id'] ?? 0);
+                    if ($id <= 0 || $reminderId <= 0) {
+                        $result = ['success' => false, 'message' => '缺少提醒参数'];
+                        break;
+                    }
+
+                    $itemStmt = $db->prepare("SELECT id FROM items WHERE id=? AND deleted_at IS NULL LIMIT 1");
+                    $itemStmt->execute([$id]);
+                    $item = $itemStmt->fetch();
+                    if (!$item) {
+                        $result = ['success' => false, 'message' => '物品不存在'];
+                        break;
+                    }
+
+                    $instanceStmt = $db->prepare("SELECT id, due_date, is_completed FROM item_reminder_instances WHERE id=? AND item_id=? LIMIT 1");
+                    $instanceStmt->execute([$reminderId, $id]);
+                    $instance = $instanceStmt->fetch();
+                    if (!$instance) {
+                        $result = ['success' => false, 'message' => '提醒记录不存在'];
+                        break;
+                    }
+                    if (intval($instance['is_completed']) !== 1) {
+                        $result = ['success' => false, 'message' => '该提醒尚未完成'];
+                        break;
+                    }
+
+                    $dueDate = normalizeReminderDateValue($instance['due_date'] ?? '');
+                    if ($dueDate === '') {
+                        $result = ['success' => false, 'message' => '提醒日期无效'];
+                        break;
+                    }
+
+                    $db->beginTransaction();
+                    try {
+                        $hasCompletedChildrenStmt = $db->prepare("SELECT COUNT(*) FROM item_reminder_instances WHERE item_id=? AND generated_by_complete_id=? AND is_completed=1");
+                        $hasCompletedChildrenStmt->execute([$id, $reminderId]);
+                        $hasCompletedChildren = intval($hasCompletedChildrenStmt->fetchColumn() ?: 0) > 0;
+                        if ($hasCompletedChildren) {
+                            $db->rollBack();
+                            $result = ['success' => false, 'message' => '后续提醒已完成，无法撤销该记录'];
+                            break;
+                        }
+
+                        $undo = $db->prepare("UPDATE item_reminder_instances SET is_completed=0, completed_at=NULL, updated_at=datetime('now','localtime') WHERE id=? AND item_id=?");
+                        $undo->execute([$reminderId, $id]);
+
+                        $deleteGenerated = $db->prepare("DELETE FROM item_reminder_instances WHERE item_id=? AND generated_by_complete_id=? AND is_completed=0");
+                        $deleteGenerated->execute([$id, $reminderId]);
+
+                        $up = $db->prepare("UPDATE items SET reminder_next_date=?, updated_at=datetime('now','localtime') WHERE id=?");
+                        $up->execute([$dueDate, $id]);
+
+                        $db->commit();
+                        $result = ['success' => true, 'message' => '已撤销完成状态并移除下一次提醒'];
+                    } catch (Exception $e) {
+                        if ($db->inTransaction())
+                            $db->rollBack();
+                        throw $e;
+                    }
                 }
                 break;
 
@@ -501,7 +1720,7 @@ if (isset($_GET['api'])) {
 
                     $db->beginTransaction();
                     try {
-                        $stmt = $db->prepare("INSERT INTO items (name, category_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+                        $stmt = $db->prepare("INSERT INTO items (name, category_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, reminder_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
                         $created = 0;
                         $skipped = 0;
                         $errors = [];
@@ -545,6 +1764,10 @@ if (isset($_GET['api'])) {
                                     $expiryDate,
                                     trim((string) ($row['purchase_from'] ?? '')),
                                     trim((string) ($row['notes'] ?? '')),
+                                    '',
+                                    0,
+                                    '',
+                                    trim((string) ($row['reminder_note'] ?? '')),
                                 ]);
                                 $created++;
                             } catch (Exception $e) {
@@ -570,15 +1793,16 @@ if (isset($_GET['api'])) {
 
             case 'system/reset-default':
                 if ($method === 'POST') {
-                    $moved = moveUploadFilesToTrash();
+                    $moved = moveUploadFilesToTrash($db);
 
                     $db->beginTransaction();
                     try {
                         $db->exec("DELETE FROM items");
                         $db->exec("DELETE FROM categories");
                         $db->exec("DELETE FROM locations");
+                        $db->exec("DELETE FROM shopping_list");
                         try {
-                            $db->exec("DELETE FROM sqlite_sequence WHERE name IN ('items','categories','locations')");
+                            $db->exec("DELETE FROM sqlite_sequence WHERE name IN ('items','categories','locations','shopping_list')");
                         } catch (Exception $e) { /* 某些 SQLite 版本可能无该表 */ }
                         $db->commit();
                     } catch (Exception $e) {
@@ -595,268 +1819,8 @@ if (isset($_GET['api'])) {
 
             case 'system/load-demo':
                 if ($method === 'POST') {
-                    $moved = moveUploadFilesToTrash();
-
-                    $db->beginTransaction();
-                    try {
-                        $db->exec("DELETE FROM items");
-                        $db->exec("DELETE FROM categories");
-                        $db->exec("DELETE FROM locations");
-                        try {
-                            $db->exec("DELETE FROM sqlite_sequence WHERE name IN ('items','categories','locations')");
-                        } catch (Exception $e) { /* 某些 SQLite 版本可能无该表 */ }
-
-                        // 先恢复默认分类与位置，再叠加展示用数据
-                        initSchema($db);
-
-                        $categoryRows = $db->query("SELECT id, name FROM categories")->fetchAll();
-                        $catIdByName = [];
-                        foreach ($categoryRows as $row) {
-                            $catIdByName[$row['name']] = intval($row['id']);
-                        }
-
-                        $loadLocationMap = function () use ($db) {
-                            $rows = $db->query("SELECT id, name FROM locations")->fetchAll();
-                            $map = [];
-                            foreach ($rows as $row) {
-                                $map[$row['name']] = intval($row['id']);
-                            }
-                            return $map;
-                        };
-
-                        $insertLocation = $db->prepare("INSERT INTO locations (name, parent_id, description) VALUES (?,?,?)");
-                        $locMap = $loadLocationMap();
-                        if (!isset($locMap['储物间'])) {
-                            $insertLocation->execute(['储物间', 0, '集中存放不常用物品']);
-                            $locMap = $loadLocationMap();
-                        }
-                        if (!isset($locMap['阳台'])) {
-                            $insertLocation->execute(['阳台', 0, '户外和工具相关物品']);
-                            $locMap = $loadLocationMap();
-                        }
-                        if (!isset($locMap['电视柜'])) {
-                            $insertLocation->execute(['电视柜', 0, '位置示例']);
-                            $locMap = $loadLocationMap();
-                        }
-                        if (!isset($locMap['书桌抽屉'])) {
-                            $insertLocation->execute(['书桌抽屉', 0, '位置示例']);
-                            $locMap = $loadLocationMap();
-                        }
-
-                        $demoItems = [
-                            [
-                                'name' => 'MacBook Air M2',
-                                'category' => '电子设备',
-                                'location' => '书房',
-                                'quantity' => 1,
-                                'description' => '日常办公主力设备',
-                                'barcode' => 'SN-MBA-2026',
-                                'purchase_date' => date('Y-m-d', strtotime('-420 days')),
-                                'purchase_price' => 7999,
-                                'tags' => '电脑,办公',
-                                'status' => 'active',
-                                'expiry_date' => '',
-                                'purchase_from' => '京东',
-                                'notes' => '附带保护壳与扩展坞'
-                            ],
-                            [
-                                'name' => 'AirPods Pro',
-                                'category' => '电子设备',
-                                'location' => '卧室',
-                                'quantity' => 1,
-                                'description' => '蓝牙耳机',
-                                'barcode' => 'SN-AIRPODS-02',
-                                'purchase_date' => date('Y-m-d', strtotime('-260 days')),
-                                'purchase_price' => 1499,
-                                'tags' => '耳机,音频',
-                                'status' => 'active',
-                                'expiry_date' => '',
-                                'purchase_from' => '淘宝',
-                                'notes' => '配件齐全'
-                            ],
-                            [
-                                'name' => '机械键盘',
-                                'category' => '电子设备',
-                                'location' => '书桌抽屉',
-                                'quantity' => 1,
-                                'description' => '备用键盘',
-                                'barcode' => 'KB-RED-87',
-                                'purchase_date' => date('Y-m-d', strtotime('-540 days')),
-                                'purchase_price' => 399,
-                                'tags' => '键盘,外设',
-                                'status' => 'archived',
-                                'expiry_date' => '',
-                                'purchase_from' => '拼多多',
-                                'notes' => '归档展示状态'
-                            ],
-                            [
-                                'name' => '二手显示器',
-                                'category' => '电子设备',
-                                'location' => '储物间',
-                                'quantity' => 1,
-                                'description' => '已转卖示例物品',
-                                'barcode' => 'MON-USED-24',
-                                'purchase_date' => date('Y-m-d', strtotime('-800 days')),
-                                'purchase_price' => 1200,
-                                'tags' => '显示器,转卖',
-                                'status' => 'sold',
-                                'expiry_date' => '',
-                                'purchase_from' => '闲鱼',
-                                'notes' => '用于状态统计展示'
-                            ],
-                            [
-                                'name' => '胶囊咖啡机',
-                                'category' => '厨房用品',
-                                'location' => '厨房',
-                                'quantity' => 1,
-                                'description' => '家用咖啡机',
-                                'barcode' => 'COFFEE-01',
-                                'purchase_date' => date('Y-m-d', strtotime('-320 days')),
-                                'purchase_price' => 899,
-                                'tags' => '咖啡,厨房',
-                                'status' => 'active',
-                                'expiry_date' => '',
-                                'purchase_from' => '线下',
-                                'notes' => '常用设备'
-                            ],
-                            [
-                                'name' => '维生素 D3',
-                                'category' => '其他',
-                                'location' => '厨房',
-                                'quantity' => 2,
-                                'description' => '保健品',
-                                'barcode' => 'HEALTH-D3-01',
-                                'purchase_date' => date('Y-m-d', strtotime('-60 days')),
-                                'purchase_price' => 128,
-                                'tags' => '保健,补剂',
-                                'status' => 'active',
-                                'expiry_date' => date('Y-m-d', strtotime('+5 days')),
-                                'purchase_from' => '线下',
-                                'notes' => '即将过期示例'
-                            ],
-                            [
-                                'name' => '车载灭火器',
-                                'category' => '工具五金',
-                                'location' => '阳台',
-                                'quantity' => 1,
-                                'description' => '安全应急用品',
-                                'barcode' => 'SAFE-FIRE-01',
-                                'purchase_date' => date('Y-m-d', strtotime('-480 days')),
-                                'purchase_price' => 89,
-                                'tags' => '安全,应急',
-                                'status' => 'active',
-                                'expiry_date' => date('Y-m-d', strtotime('-12 days')),
-                                'purchase_from' => '京东',
-                                'notes' => '已过期示例'
-                            ],
-                            [
-                                'name' => '沐浴露补充装',
-                                'category' => '其他',
-                                'location' => '储物间',
-                                'quantity' => 3,
-                                'description' => '家庭日用品',
-                                'barcode' => 'HOME-BATH-03',
-                                'purchase_date' => date('Y-m-d', strtotime('-30 days')),
-                                'purchase_price' => 75,
-                                'tags' => '日用品,家居',
-                                'status' => 'active',
-                                'expiry_date' => date('Y-m-d', strtotime('+25 days')),
-                                'purchase_from' => '拼多多',
-                                'notes' => '30 天内过期示例'
-                            ],
-                            [
-                                'name' => '训练足球',
-                                'category' => '运动户外',
-                                'location' => '阳台',
-                                'quantity' => 1,
-                                'description' => '周末运动使用',
-                                'barcode' => 'SPORT-BALL-01',
-                                'purchase_date' => date('Y-m-d', strtotime('-210 days')),
-                                'purchase_price' => 199,
-                                'tags' => '运动,户外',
-                                'status' => 'active',
-                                'expiry_date' => '',
-                                'purchase_from' => '淘宝',
-                                'notes' => '展示分类统计'
-                            ],
-                            [
-                                'name' => '设计模式（第2版）',
-                                'category' => '书籍文档',
-                                'location' => '书房',
-                                'quantity' => 1,
-                                'description' => '技术书籍',
-                                'barcode' => 'BOOK-DESIGN-02',
-                                'purchase_date' => date('Y-m-d', strtotime('-700 days')),
-                                'purchase_price' => 88,
-                                'tags' => '书籍,学习',
-                                'status' => 'archived',
-                                'expiry_date' => '',
-                                'purchase_from' => '京东',
-                                'notes' => '归档示例'
-                            ],
-                            [
-                                'name' => '纪念手表',
-                                'category' => '电子设备',
-                                'location' => '卧室',
-                                'quantity' => 1,
-                                'description' => '礼品来源示例',
-                                'barcode' => 'GIFT-WATCH-01',
-                                'purchase_date' => date('Y-m-d', strtotime('-95 days')),
-                                'purchase_price' => 0,
-                                'tags' => '礼物,收藏',
-                                'status' => 'active',
-                                'expiry_date' => '',
-                                'purchase_from' => '礼品',
-                                'notes' => '展示购入渠道'
-                            ],
-                            [
-                                'name' => '未分类收纳箱',
-                                'category' => '',
-                                'location' => '',
-                                'quantity' => 2,
-                                'description' => '用于展示未分类/未设定位置',
-                                'barcode' => 'BOX-UNCAT-01',
-                                'purchase_date' => date('Y-m-d', strtotime('-15 days')),
-                                'purchase_price' => 59,
-                                'tags' => '收纳,未分类',
-                                'status' => 'active',
-                                'expiry_date' => '',
-                                'purchase_from' => '线下',
-                                'notes' => '演示筛选与统计'
-                            ],
-                        ];
-
-                        $insertItem = $db->prepare("INSERT INTO items (name, category_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-                        $created = 0;
-                        foreach ($demoItems as $item) {
-                            $categoryId = isset($catIdByName[$item['category']]) ? intval($catIdByName[$item['category']]) : 0;
-                            $locationId = isset($locMap[$item['location']]) ? intval($locMap[$item['location']]) : 0;
-                            $insertItem->execute([
-                                $item['name'],
-                                $categoryId,
-                                $locationId,
-                                max(0, intval($item['quantity'] ?? 1)),
-                                $item['description'] ?? '',
-                                '',
-                                $item['barcode'] ?? '',
-                                normalizeDateYmd($item['purchase_date'] ?? '') ?? '',
-                                floatval($item['purchase_price'] ?? 0),
-                                $item['tags'] ?? '',
-                                normalizeStatusValue($item['status'] ?? 'active'),
-                                normalizeDateYmd($item['expiry_date'] ?? '') ?? '',
-                                $item['purchase_from'] ?? '',
-                                $item['notes'] ?? ''
-                            ]);
-                            $created++;
-                        }
-
-                        $db->commit();
-                        $result = ['success' => true, 'message' => "展示模式已加载：$created 件演示物品已就绪", 'created' => $created, 'moved_images' => $moved];
-                    } catch (Exception $e) {
-                        if ($db->inTransaction())
-                            $db->rollBack();
-                        throw $e;
-                    }
+                    $demoLoad = loadDemoDataIntoDb($db, ['move_images' => true]);
+                    $result = array_merge(['success' => true], $demoLoad);
                 }
                 break;
 
@@ -993,6 +1957,235 @@ if (isset($_GET['api'])) {
                 }
                 break;
 
+            // ---------- 购物清单 CRUD ----------
+            case 'shopping-list/similar-items':
+                if ($method === 'GET') {
+                    $rawName = trim((string) ($_GET['name'] ?? ''));
+                    if ($rawName === '') {
+                        $result = ['success' => true, 'data' => []];
+                        break;
+                    }
+                    $coreName = trim(preg_replace('/[\(\（][^\)\）]*[\)\）]/u', '', $rawName));
+                    if ($coreName === '') {
+                        $coreName = $rawName;
+                    }
+                    $escapedRaw = str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $rawName);
+                    $escapedCore = str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $coreName);
+                    $compactRaw = preg_replace('/\s+/u', '', $rawName);
+                    $compactCore = preg_replace('/\s+/u', '', $coreName);
+                    if ($compactRaw === '') {
+                        $compactRaw = $rawName;
+                    }
+                    if ($compactCore === '') {
+                        $compactCore = $coreName;
+                    }
+                    $escapedCompactRaw = str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $compactRaw);
+                    $escapedCompactCore = str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $compactCore);
+                    $containsRaw = '%' . $escapedRaw . '%';
+                    $containsCore = '%' . $escapedCore . '%';
+                    $prefixRaw = $escapedRaw . '%';
+                    $prefixCore = $escapedCore . '%';
+                    $compactContainsRaw = '%' . $escapedCompactRaw . '%';
+                    $compactContainsCore = '%' . $escapedCompactCore . '%';
+                    $compactPrefixRaw = $escapedCompactRaw . '%';
+                    $compactPrefixCore = $escapedCompactCore . '%';
+                    $stmt = $db->prepare("SELECT id, name, purchase_price, purchase_from, purchase_date, updated_at
+                        FROM items
+                        WHERE deleted_at IS NULL
+                          AND name != ''
+                          AND (
+                              name LIKE ? ESCAPE '\\'
+                              OR name LIKE ? ESCAPE '\\'
+                              OR instr(?, name) > 0
+                              OR instr(?, name) > 0
+                              OR replace(replace(name,' ',''),'　','') LIKE ? ESCAPE '\\'
+                              OR replace(replace(name,' ',''),'　','') LIKE ? ESCAPE '\\'
+                          )
+                        ORDER BY CASE
+                            WHEN name = ? THEN 0
+                            WHEN name = ? THEN 0
+                            WHEN replace(replace(name,' ',''),'　','') = ? THEN 0
+                            WHEN replace(replace(name,' ',''),'　','') = ? THEN 0
+                            WHEN name LIKE ? ESCAPE '\\' THEN 1
+                            WHEN name LIKE ? ESCAPE '\\' THEN 2
+                            WHEN replace(replace(name,' ',''),'　','') LIKE ? ESCAPE '\\' THEN 3
+                            WHEN replace(replace(name,' ',''),'　','') LIKE ? ESCAPE '\\' THEN 4
+                            WHEN instr(?, name) > 0 THEN 5
+                            WHEN instr(?, name) > 0 THEN 6
+                            WHEN name LIKE ? ESCAPE '\\' THEN 7
+                            WHEN replace(replace(name,' ',''),'　','') LIKE ? ESCAPE '\\' THEN 8
+                            ELSE 9
+                        END, updated_at DESC, id DESC
+                        LIMIT 8");
+                    $stmt->execute([
+                        $containsRaw,
+                        $containsCore,
+                        $rawName,
+                        $coreName,
+                        $compactContainsRaw,
+                        $compactContainsCore,
+                        $rawName,
+                        $coreName,
+                        $compactRaw,
+                        $compactCore,
+                        $prefixRaw,
+                        $prefixCore,
+                        $compactPrefixRaw,
+                        $compactPrefixCore,
+                        $rawName,
+                        $coreName,
+                        $containsCore,
+                        $compactContainsCore
+                    ]);
+                    $rows = $stmt->fetchAll();
+                    $result = ['success' => true, 'data' => $rows];
+                }
+                break;
+
+            case 'shopping-list':
+                if ($method === 'GET') {
+                    $list = $db->query("SELECT s.*, c.name as category_name, c.icon as category_icon, c.color as category_color
+                        FROM shopping_list s
+                        LEFT JOIN categories c ON s.category_id=c.id
+                        ORDER BY CASE s.status WHEN 'pending_purchase' THEN 0 WHEN 'pending_receipt' THEN 1 ELSE 0 END,
+                                 CASE s.priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 WHEN 'low' THEN 2 ELSE 1 END,
+                                 s.created_at DESC, s.id DESC")->fetchAll();
+                    $result = ['success' => true, 'data' => $list];
+                } elseif ($method === 'POST') {
+                    $data = json_decode(file_get_contents('php://input'), true);
+                    $name = trim((string) ($data['name'] ?? ''));
+                    if ($name === '') {
+                        $result = ['success' => false, 'message' => '清单名称不能为空'];
+                        break;
+                    }
+                    $qty = max(1, intval($data['quantity'] ?? 1));
+                    $shoppingStatus = normalizeShoppingStatus($data['status'] ?? 'pending_purchase');
+                    $categoryId = max(0, intval($data['category_id'] ?? 0));
+                    $priority = normalizeShoppingPriority($data['priority'] ?? 'normal');
+                    $plannedPrice = max(0, floatval($data['planned_price'] ?? 0));
+                    $notes = trim((string) ($data['notes'] ?? ''));
+                    $reminderDate = normalizeReminderDateValue($data['reminder_date'] ?? '');
+                    $reminderNote = trim((string) ($data['reminder_note'] ?? ''));
+                    $stmt = $db->prepare("INSERT INTO shopping_list (name, quantity, status, category_id, priority, planned_price, notes, reminder_date, reminder_note, created_at, updated_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
+                    $stmt->execute([$name, $qty, $shoppingStatus, $categoryId, $priority, $plannedPrice, $notes, $reminderDate, $reminderNote]);
+                    $result = ['success' => true, 'message' => '已加入购物清单', 'id' => $db->lastInsertId()];
+                }
+                break;
+
+            case 'shopping-list/update':
+                if ($method === 'POST') {
+                    $data = json_decode(file_get_contents('php://input'), true);
+                    $id = intval($data['id'] ?? 0);
+                    $name = trim((string) ($data['name'] ?? ''));
+                    if ($id <= 0) {
+                        $result = ['success' => false, 'message' => '缺少清单ID'];
+                        break;
+                    }
+                    if ($name === '') {
+                        $result = ['success' => false, 'message' => '清单名称不能为空'];
+                        break;
+                    }
+                    $qty = max(1, intval($data['quantity'] ?? 1));
+                    $shoppingStatus = normalizeShoppingStatus($data['status'] ?? 'pending_purchase');
+                    $categoryId = max(0, intval($data['category_id'] ?? 0));
+                    $priority = normalizeShoppingPriority($data['priority'] ?? 'normal');
+                    $plannedPrice = max(0, floatval($data['planned_price'] ?? 0));
+                    $notes = trim((string) ($data['notes'] ?? ''));
+                    $reminderDate = normalizeReminderDateValue($data['reminder_date'] ?? '');
+                    $reminderNote = trim((string) ($data['reminder_note'] ?? ''));
+                    $stmt = $db->prepare("UPDATE shopping_list SET name=?, quantity=?, status=?, category_id=?, priority=?, planned_price=?, notes=?, reminder_date=?, reminder_note=?, updated_at=datetime('now','localtime') WHERE id=?");
+                    $stmt->execute([$name, $qty, $shoppingStatus, $categoryId, $priority, $plannedPrice, $notes, $reminderDate, $reminderNote, $id]);
+                    $result = ['success' => true, 'message' => '购物清单已更新'];
+                }
+                break;
+
+            case 'shopping-list/update-status':
+                if ($method === 'POST') {
+                    $data = json_decode(file_get_contents('php://input'), true);
+                    $id = intval($data['id'] ?? 0);
+                    if ($id <= 0) {
+                        $result = ['success' => false, 'message' => '缺少清单ID'];
+                        break;
+                    }
+                    $shoppingStatus = normalizeShoppingStatus($data['status'] ?? 'pending_purchase');
+                    $stmt = $db->prepare("UPDATE shopping_list SET status=?, updated_at=datetime('now','localtime') WHERE id=?");
+                    $stmt->execute([$shoppingStatus, $id]);
+                    $result = ['success' => true, 'message' => '清单状态已更新', 'status' => $shoppingStatus];
+                }
+                break;
+
+            case 'shopping-list/delete':
+                if ($method === 'POST') {
+                    $data = json_decode(file_get_contents('php://input'), true);
+                    $id = intval($data['id'] ?? 0);
+                    if ($id <= 0) {
+                        $result = ['success' => false, 'message' => '缺少清单ID'];
+                        break;
+                    }
+                    $db->exec("DELETE FROM shopping_list WHERE id=$id");
+                    $result = ['success' => true, 'message' => '已从购物清单删除'];
+                }
+                break;
+
+            case 'shopping-list/convert':
+                if ($method === 'POST') {
+                    $data = json_decode(file_get_contents('php://input'), true);
+                    $id = intval($data['id'] ?? 0);
+                    if ($id <= 0) {
+                        $result = ['success' => false, 'message' => '缺少清单ID'];
+                        break;
+                    }
+                    $stmt = $db->prepare("SELECT * FROM shopping_list WHERE id=? LIMIT 1");
+                    $stmt->execute([$id]);
+                    $row = $stmt->fetch();
+                    if (!$row) {
+                        $result = ['success' => false, 'message' => '购物清单项不存在'];
+                        break;
+                    }
+                    $qty = max(1, intval($row['quantity'] ?? 1));
+                    $categoryId = max(0, intval($row['category_id'] ?? 0));
+                    $price = max(0, floatval($row['planned_price'] ?? 0));
+                    $notes = trim((string) ($row['notes'] ?? ''));
+
+                    $db->beginTransaction();
+                    try {
+                        $insert = $db->prepare("INSERT INTO items (name, category_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+                        $insert->execute([
+                            $row['name'],
+                            $categoryId,
+                            0,
+                            $qty,
+                            '',
+                            '',
+                            '',
+                            date('Y-m-d'),
+                            $price,
+                            '',
+                            'active',
+                            '',
+                            '',
+                            $notes,
+                            '',
+                            '',
+                            0,
+                            '',
+                            ''
+                        ]);
+                        $newItemId = intval($db->lastInsertId());
+                        $del = $db->prepare("DELETE FROM shopping_list WHERE id=?");
+                        $del->execute([$id]);
+                        $db->commit();
+                        $result = ['success' => true, 'message' => '已移入物品管理', 'item_id' => $newItemId];
+                    } catch (Exception $e) {
+                        if ($db->inTransaction())
+                            $db->rollBack();
+                        throw $e;
+                    }
+                }
+                break;
+
             // ---------- 图片上传 ----------
             case 'upload':
                 if ($method === 'POST') {
@@ -1092,7 +2285,8 @@ if (isset($_GET['api'])) {
                 $items = $db->query("SELECT i.*, c.name as category_name, l.name as location_name FROM items i LEFT JOIN categories c ON i.category_id=c.id LEFT JOIN locations l ON i.location_id=l.id WHERE i.deleted_at IS NULL ORDER BY i.id")->fetchAll();
                 $categories = $db->query("SELECT * FROM categories ORDER BY id")->fetchAll();
                 $locations = $db->query("SELECT * FROM locations ORDER BY id")->fetchAll();
-                $result = ['success' => true, 'data' => ['items' => $items, 'categories' => $categories, 'locations' => $locations, 'exported_at' => date('Y-m-d H:i:s'), 'version' => '1.2.0']];
+                $shoppingList = $db->query("SELECT s.*, c.name as category_name FROM shopping_list s LEFT JOIN categories c ON s.category_id=c.id ORDER BY s.id")->fetchAll();
+                $result = ['success' => true, 'data' => ['items' => $items, 'categories' => $categories, 'locations' => $locations, 'shopping_list' => $shoppingList, 'exported_at' => date('Y-m-d H:i:s'), 'version' => '1.3.0']];
                 break;
 
             // ---------- 数据导入 ----------
@@ -1145,7 +2339,7 @@ if (isset($_GET['api'])) {
                         }
 
                         $imported = 0;
-                        $stmtItem = $db->prepare("INSERT INTO items (name, category_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+                        $stmtItem = $db->prepare("INSERT INTO items (name, category_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
                         foreach ($data['items'] as $item) {
                             $catId = 0;
                             $locId = 0;
@@ -1166,6 +2360,19 @@ if (isset($_GET['api'])) {
                                     $imageName = $oldImageName;
                                 }
                             }
+                            $reminderDate = normalizeReminderDateValue($item['reminder_date'] ?? '');
+                            $reminderNextDate = normalizeReminderDateValue($item['reminder_next_date'] ?? '');
+                            $reminderUnit = normalizeReminderCycleUnit($item['reminder_cycle_unit'] ?? '');
+                            $reminderValue = normalizeReminderCycleValue($item['reminder_cycle_value'] ?? 0, $reminderUnit);
+                            if ($reminderDate === '' || $reminderUnit === '' || $reminderValue <= 0) {
+                                $reminderDate = '';
+                                $reminderNextDate = '';
+                                $reminderValue = 0;
+                                $reminderUnit = '';
+                            } elseif ($reminderNextDate === '') {
+                                $reminderNextDate = $reminderDate;
+                            }
+                            $reminderNote = trim((string) ($item['reminder_note'] ?? ''));
                             $stmtItem->execute([
                                 $item['name'] ?? '未命名',
                                 $catId,
@@ -1180,12 +2387,51 @@ if (isset($_GET['api'])) {
                                 normalizeStatusValue($item['status'] ?? 'active'),
                                 $item['expiry_date'] ?? '',
                                 $item['purchase_from'] ?? '',
-                                $item['notes'] ?? ''
+                                $item['notes'] ?? '',
+                                $reminderDate,
+                                $reminderNextDate,
+                                $reminderValue,
+                                $reminderUnit,
+                                $reminderNote
                             ]);
                             $imported++;
                         }
+
+                        $importedShopping = 0;
+                        if (!empty($data['shopping_list']) && is_array($data['shopping_list'])) {
+                            $stmtShopping = $db->prepare("INSERT INTO shopping_list (name, quantity, status, category_id, priority, planned_price, notes, reminder_date, reminder_note, created_at, updated_at)
+                                VALUES (?,?,?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
+                            foreach ($data['shopping_list'] as $row) {
+                                if (!is_array($row))
+                                    continue;
+                                $name = trim((string) ($row['name'] ?? ''));
+                                if ($name === '')
+                                    continue;
+                                $categoryId = 0;
+                                if (!empty($row['category_name'])) {
+                                    $cat = $db->query("SELECT id FROM categories WHERE name=" . $db->quote($row['category_name']))->fetchColumn();
+                                    $categoryId = $cat ?: 0;
+                                } elseif (intval($row['category_id'] ?? 0) > 0) {
+                                    $candidate = intval($row['category_id']);
+                                    $exists = $db->query("SELECT id FROM categories WHERE id=" . $candidate)->fetchColumn();
+                                    $categoryId = $exists ? $candidate : 0;
+                                }
+                                $stmtShopping->execute([
+                                    $name,
+                                    max(1, intval($row['quantity'] ?? 1)),
+                                    normalizeShoppingStatus($row['status'] ?? 'pending_purchase'),
+                                    $categoryId,
+                                    normalizeShoppingPriority($row['priority'] ?? 'normal'),
+                                    max(0, floatval($row['planned_price'] ?? 0)),
+                                    trim((string) ($row['notes'] ?? '')),
+                                    normalizeReminderDateValue($row['reminder_date'] ?? ''),
+                                    trim((string) ($row['reminder_note'] ?? ''))
+                                ]);
+                                $importedShopping++;
+                            }
+                        }
                         $db->commit();
-                        $result = ['success' => true, 'message' => "成功导入 $imported 件物品"];
+                        $result = ['success' => true, 'message' => "成功导入 $imported 件物品" . ($importedShopping > 0 ? "，购物清单 $importedShopping 条" : '')];
                     } catch (Exception $e) {
                         $db->rollBack();
                         $result = ['success' => false, 'message' => '导入失败: ' . $e->getMessage()];
@@ -1203,6 +2449,12 @@ if (isset($_GET['api'])) {
 
 // ---------- 图片访问 ----------
 if (isset($_GET['img'])) {
+    $authDb = getAuthDB();
+    $currentUser = getCurrentAuthUser($authDb);
+    if (!$currentUser) {
+        http_response_code(403);
+        exit;
+    }
     $file = basename($_GET['img']);
     $path = UPLOAD_DIR . $file;
     if (file_exists($path)) {
@@ -1219,7 +2471,376 @@ if (isset($_GET['img'])) {
 // ============================================================
 // 🎨 前端 HTML
 // ============================================================
-getDB(); // 确保数据库初始化
+$authDb = getAuthDB();
+$currentAuthUser = getCurrentAuthUser($authDb);
+if (!$currentAuthUser) {
+    ?>
+    <!DOCTYPE html>
+    <html lang="zh-CN">
+
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>17物品管理 | 登录</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <link href="https://cdn.jsdelivr.net/npm/remixicon@3.5.0/fonts/remixicon.css" rel="stylesheet">
+        <style>
+            body {
+                margin: 0;
+                min-height: 100vh;
+                background: radial-gradient(ellipse at 20% 30%, rgba(56, 189, 248, 0.18), transparent 50%), radial-gradient(ellipse at 80% 20%, rgba(99, 102, 241, 0.16), transparent 50%), #0f172a;
+                color: #e2e8f0;
+                font-family: Inter, "Noto Sans SC", sans-serif;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 24px;
+            }
+
+            .auth-card {
+                width: min(460px, 100%);
+                background: rgba(30, 41, 59, 0.72);
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 18px;
+                backdrop-filter: blur(14px);
+                -webkit-backdrop-filter: blur(14px);
+                padding: 24px;
+                box-shadow: 0 20px 40px rgba(2, 6, 23, 0.45);
+            }
+
+            .auth-input {
+                width: 100%;
+                border-radius: 10px;
+                border: 1px solid rgba(148, 163, 184, 0.35);
+                background: rgba(15, 23, 42, 0.64);
+                color: #e2e8f0;
+                padding: 10px 12px;
+                outline: none;
+            }
+
+            .auth-input:focus {
+                border-color: #38bdf8;
+                box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.18);
+            }
+
+            .auth-btn {
+                width: 100%;
+                border: none;
+                border-radius: 10px;
+                padding: 10px 14px;
+                color: #fff;
+                font-weight: 600;
+                cursor: pointer;
+                background: linear-gradient(135deg, #0ea5e9, #6366f1);
+            }
+
+            .auth-btn.demo {
+                background: linear-gradient(135deg, #14b8a6, #0ea5e9);
+            }
+
+            .auth-tab {
+                border: 1px solid rgba(148, 163, 184, 0.35);
+                background: transparent;
+                color: #94a3b8;
+                border-radius: 999px;
+                padding: 6px 12px;
+                font-size: 12px;
+                cursor: pointer;
+            }
+
+            .auth-tab.active {
+                color: #e2e8f0;
+                border-color: rgba(56, 189, 248, 0.45);
+                background: rgba(14, 165, 233, 0.2);
+            }
+
+            .auth-link {
+                color: #7dd3fc;
+                font-size: 12px;
+                cursor: pointer;
+                border: none;
+                background: transparent;
+                padding: 0;
+            }
+        </style>
+    </head>
+
+    <body>
+        <div class="auth-card">
+            <div class="flex items-center gap-3 mb-5">
+                <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-sky-400 to-violet-500 flex items-center justify-center">
+                    <i class="ri-lock-password-line text-white text-lg"></i>
+                </div>
+                <div>
+                    <h1 class="text-lg font-bold m-0">17 物品管理</h1>
+                    <p class="text-xs text-slate-400 m-0">登录后按用户隔离数据</p>
+                </div>
+            </div>
+
+            <div class="flex gap-2 mb-4">
+                <button type="button" id="tabLogin" class="auth-tab active" onclick="switchAuthTab('login')">登录</button>
+                <button type="button" id="tabRegister" class="auth-tab" onclick="switchAuthTab('register')">注册</button>
+            </div>
+
+            <p id="authHint" class="text-xs text-slate-400 mb-4"></p>
+
+            <form id="loginForm" class="space-y-3" onsubmit="return submitLogin(event)">
+                <div>
+                    <label class="block text-xs text-slate-400 mb-1">用户名</label>
+                    <input type="text" id="loginUsername" class="auth-input" required autocomplete="username">
+                </div>
+                <div>
+                    <label class="block text-xs text-slate-400 mb-1">密码</label>
+                    <input type="password" id="loginPassword" class="auth-input" required autocomplete="current-password">
+                </div>
+                <div class="grid grid-cols-2 gap-2">
+                    <button class="auth-btn" type="submit">登录</button>
+                    <button class="auth-btn demo" type="button" onclick="loginAsDemo()">Demo</button>
+                </div>
+                <div class="flex justify-end">
+                    <button type="button" class="auth-link" onclick="switchAuthTab('reset')">忘记密码？</button>
+                </div>
+            </form>
+
+            <form id="registerForm" class="space-y-3 hidden" onsubmit="return submitRegister(event)">
+                <div>
+                    <label class="block text-xs text-slate-400 mb-1">用户名</label>
+                    <input type="text" id="registerUsername" class="auth-input" required placeholder="3-32 位字母/数字/._-">
+                </div>
+                <div>
+                    <label class="block text-xs text-slate-400 mb-1">显示名称</label>
+                    <input type="text" id="registerDisplayName" class="auth-input" placeholder="可选，不填则同用户名">
+                </div>
+                <div>
+                    <label class="block text-xs text-slate-400 mb-1">密码</label>
+                    <input type="password" id="registerPassword" class="auth-input" required placeholder="至少 6 位">
+                </div>
+                <div>
+                    <label class="block text-xs text-slate-400 mb-1">验证问题</label>
+                    <select id="registerQuestionKey" class="auth-input" required>
+                        <option value="">请选择验证问题</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="block text-xs text-slate-400 mb-1">验证答案</label>
+                    <input type="text" id="registerSecurityAnswer" class="auth-input" required placeholder="用于找回密码">
+                </div>
+                <button class="auth-btn" type="submit">创建账号并登录</button>
+            </form>
+
+            <form id="resetForm" class="space-y-3 hidden" onsubmit="return submitResetPassword(event)">
+                <div>
+                    <label class="block text-xs text-slate-400 mb-1">用户名</label>
+                    <div class="flex gap-2">
+                        <input type="text" id="resetUsername" class="auth-input" required>
+                        <button type="button" class="auth-btn" style="width:auto;white-space:nowrap" onclick="loadResetQuestion()">查询问题</button>
+                    </div>
+                </div>
+                <div>
+                    <label class="block text-xs text-slate-400 mb-1">验证问题</label>
+                    <input type="text" id="resetQuestionLabel" class="auth-input" readonly placeholder="先查询问题">
+                </div>
+                <div>
+                    <label class="block text-xs text-slate-400 mb-1">验证答案</label>
+                    <input type="text" id="resetAnswer" class="auth-input" required>
+                </div>
+                <div>
+                    <label class="block text-xs text-slate-400 mb-1">新密码</label>
+                    <input type="password" id="resetNewPassword" class="auth-input" required placeholder="至少 6 位">
+                </div>
+                <button class="auth-btn" type="submit">验证并重置密码</button>
+                <div class="flex justify-end">
+                    <button type="button" class="auth-link" onclick="switchAuthTab('login')">返回登录</button>
+                </div>
+            </form>
+
+            <p id="authMessage" class="text-sm mt-4 text-slate-300"></p>
+        </div>
+
+        <script>
+            let authState = {
+                allow_registration: true,
+                needs_setup: false,
+                security_questions: {},
+                default_admin: { username: 'admin' },
+                default_demo: { username: 'test' }
+            };
+            let resetQuestionKey = '';
+
+            function setAuthMessage(msg, isError = false) {
+                const el = document.getElementById('authMessage');
+                if (!el) return;
+                el.textContent = msg || '';
+                el.style.color = isError ? '#f87171' : '#a5b4fc';
+            }
+
+            function switchAuthTab(tab) {
+                const loginTab = document.getElementById('tabLogin');
+                const regTab = document.getElementById('tabRegister');
+                const resetTabActive = tab === 'reset';
+                const loginForm = document.getElementById('loginForm');
+                const registerForm = document.getElementById('registerForm');
+                const resetForm = document.getElementById('resetForm');
+                const isLogin = tab === 'login';
+                loginTab.classList.toggle('active', isLogin);
+                regTab.classList.toggle('active', tab === 'register');
+                loginForm.classList.toggle('hidden', !isLogin);
+                registerForm.classList.toggle('hidden', tab !== 'register');
+                resetForm.classList.toggle('hidden', !resetTabActive);
+            }
+
+            function fillSecurityQuestionOptions() {
+                const select = document.getElementById('registerQuestionKey');
+                if (!select) return;
+                const questions = authState.security_questions || {};
+                select.innerHTML = '<option value="">请选择验证问题</option>' + Object.entries(questions).map(([key, label]) => `<option value="${key}">${label}</option>`).join('');
+            }
+
+            async function loadResetQuestion() {
+                const username = document.getElementById('resetUsername').value.trim();
+                if (!username) {
+                    setAuthMessage('请先输入用户名', true);
+                    return;
+                }
+                setAuthMessage('');
+                const res = await authApi(`auth/get-reset-question&username=${encodeURIComponent(username)}`);
+                if (!res.success) {
+                    resetQuestionKey = '';
+                    document.getElementById('resetQuestionLabel').value = '';
+                    setAuthMessage(res.message || '查询失败', true);
+                    return;
+                }
+                resetQuestionKey = res.question_key || '';
+                document.getElementById('resetQuestionLabel').value = res.question_label || '';
+                setAuthMessage('已获取验证问题，请填写答案并设置新密码');
+            }
+
+            async function authApi(endpoint, data) {
+                const res = await fetch(`?api=${endpoint}`, {
+                    method: data ? 'POST' : 'GET',
+                    headers: data ? { 'Content-Type': 'application/json' } : undefined,
+                    body: data ? JSON.stringify(data) : undefined
+                });
+                return res.json();
+            }
+
+            async function submitLogin(e) {
+                e.preventDefault();
+                setAuthMessage('');
+                const res = await authApi('auth/login', {
+                    username: document.getElementById('loginUsername').value.trim(),
+                    password: document.getElementById('loginPassword').value
+                });
+                if (!res.success) {
+                    setAuthMessage(res.message || '登录失败', true);
+                    return false;
+                }
+                location.reload();
+                return false;
+            }
+
+            async function loginAsDemo() {
+                setAuthMessage('');
+                const res = await authApi('auth/demo-login', {});
+                if (!res.success) {
+                    setAuthMessage(res.message || '进入 Demo 失败', true);
+                    return;
+                }
+                location.reload();
+            }
+
+            async function submitRegister(e) {
+                e.preventDefault();
+                if (!authState.allow_registration) {
+                    setAuthMessage('当前已关闭注册', true);
+                    return false;
+                }
+                setAuthMessage('');
+                const res = await authApi('auth/register', {
+                    username: document.getElementById('registerUsername').value.trim(),
+                    display_name: document.getElementById('registerDisplayName').value.trim(),
+                    password: document.getElementById('registerPassword').value,
+                    question_key: document.getElementById('registerQuestionKey').value,
+                    security_answer: document.getElementById('registerSecurityAnswer').value
+                });
+                if (!res.success) {
+                    setAuthMessage(res.message || '注册失败', true);
+                    return false;
+                }
+                location.reload();
+                return false;
+            }
+
+            async function submitResetPassword(e) {
+                e.preventDefault();
+                const username = document.getElementById('resetUsername').value.trim();
+                const answer = document.getElementById('resetAnswer').value;
+                const newPassword = document.getElementById('resetNewPassword').value;
+                if (!username || !answer || !newPassword) {
+                    setAuthMessage('请完整填写重置表单', true);
+                    return false;
+                }
+                if (!resetQuestionKey) {
+                    setAuthMessage('请先点击“查询问题”', true);
+                    return false;
+                }
+                setAuthMessage('');
+                const res = await authApi('auth/reset-password-by-question', {
+                    username,
+                    security_answer: answer,
+                    new_password: newPassword
+                });
+                if (!res.success) {
+                    setAuthMessage(res.message || '重置失败', true);
+                    return false;
+                }
+                setAuthMessage(res.message || '密码重置成功，请返回登录', false);
+                switchAuthTab('login');
+                document.getElementById('loginUsername').value = username;
+                document.getElementById('loginPassword').value = '';
+                document.getElementById('resetAnswer').value = '';
+                document.getElementById('resetNewPassword').value = '';
+                return false;
+            }
+
+            (async function initAuthView() {
+                try {
+                    const init = await authApi('auth/init');
+                    if (init && init.success) {
+                        authState = init;
+                        fillSecurityQuestionOptions();
+                        if (!init.allow_registration) {
+                            document.getElementById('tabRegister').style.display = 'none';
+                        }
+                        if (init.needs_setup) {
+                            document.getElementById('authHint').textContent = '首次使用，请先创建管理员账号。';
+                            switchAuthTab('register');
+                        } else {
+                            const demo = init.default_demo || {};
+                            const demoUser = demo.username || 'test';
+                            document.getElementById('authHint').textContent = `请输入账号密码登录，或点击 Demo 按钮进入体验环境（${demoUser}）。`;
+                        }
+                    }
+                } catch (e) {
+                    setAuthMessage('初始化失败，请刷新重试', true);
+                }
+            })();
+        </script>
+    </body>
+
+    </html>
+    <?php
+    exit;
+}
+
+getUserDB(intval($currentAuthUser['id'])); // 确保当前用户数据库初始化
+$currentUserJson = json_encode([
+    'id' => intval($currentAuthUser['id']),
+    'username' => $currentAuthUser['username'],
+    'display_name' => ($currentAuthUser['display_name'] ?: $currentAuthUser['username']),
+    'role' => ($currentAuthUser['role'] ?? 'user'),
+    'is_admin' => isAdminUser($currentAuthUser)
+], JSON_UNESCAPED_UNICODE);
 ?>
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -1535,8 +3156,14 @@ getDB(); // 确保数据库初始化
             border-radius: 10px;
             padding: 10px 14px;
             font-size: 14px;
-            transition: all 0.2s;
+            transition: border-color 0.2s, box-shadow 0.2s, background-color 0.2s, color 0.2s;
             outline: none;
+        }
+
+        input.input[data-date-placeholder="1"] {
+            height: 40px;
+            box-sizing: border-box;
+            line-height: 1.2;
         }
 
         .input:focus {
@@ -1554,6 +3181,27 @@ getDB(); // 确保数据库初始化
             background-repeat: no-repeat;
             background-position: right 12px center;
             padding-right: 32px;
+        }
+
+        /* 状态图标选择器 */
+        .status-icon-picker-menu {
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            background: rgba(15, 23, 42, 0.95);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+        }
+
+        .status-icon-picker-menu .status-icon-option {
+            color: #cbd5e1;
+        }
+
+        .status-icon-picker-menu .status-icon-option:hover {
+            background: rgba(255, 255, 255, 0.08);
+        }
+
+        .status-icon-picker-menu .status-icon-option.is-selected {
+            background: rgba(14, 165, 233, 0.2);
+            color: #7dd3fc;
         }
 
         /* 按钮 */
@@ -1605,6 +3253,45 @@ getDB(); // 确保数据库初始化
             padding: 6px 12px;
             font-size: 12px;
             border-radius: 8px;
+        }
+
+        /* 中尺寸物品卡片底部操作区（编辑/复制/删除） */
+        .item-card-medium-actions {
+            border-top: 1px solid rgba(255, 255, 255, 0.06);
+        }
+
+        .item-card-medium-actions .action-btn {
+            border: none;
+            border-radius: 0;
+            background: transparent;
+            color: #94a3b8;
+        }
+
+        .item-card-medium-actions .action-btn+.action-btn {
+            border-left: 1px solid rgba(255, 255, 255, 0.08);
+        }
+
+        .item-card-medium-actions .action-btn:hover {
+            background: rgba(148, 163, 184, 0.12);
+            color: #e2e8f0;
+        }
+
+        .item-card-medium-actions .action-copy {
+            color: #38bdf8;
+        }
+
+        .item-card-medium-actions .action-copy:hover {
+            background: rgba(56, 189, 248, 0.16);
+            color: #7dd3fc;
+        }
+
+        .item-card-medium-actions .action-delete {
+            color: #f87171;
+        }
+
+        .item-card-medium-actions .action-delete:hover {
+            background: rgba(239, 68, 68, 0.2);
+            color: #fca5a5;
         }
 
         /* 图片上传区域 */
@@ -1836,6 +3523,25 @@ getDB(); // 确保数据库初始化
             color: #94a3b8;
         }
 
+        body.light .status-icon-picker-menu {
+            border-color: rgba(15, 23, 42, 0.12);
+            background: rgba(255, 255, 255, 0.98);
+            box-shadow: 0 12px 24px rgba(15, 23, 42, 0.08);
+        }
+
+        body.light .status-icon-picker-menu .status-icon-option {
+            color: #334155;
+        }
+
+        body.light .status-icon-picker-menu .status-icon-option:hover {
+            background: rgba(14, 165, 233, 0.08);
+        }
+
+        body.light .status-icon-picker-menu .status-icon-option.is-selected {
+            background: rgba(14, 165, 233, 0.12);
+            color: #0369a1;
+        }
+
         body.light .modal-box {
             background: #fff;
             border-color: rgba(0, 0, 0, 0.08);
@@ -1867,46 +3573,173 @@ getDB(); // 确保数据库初始化
             color: #cbd5e1;
         }
 
+        body.light .item-card-medium-actions {
+            border-top-color: rgba(15, 23, 42, 0.08);
+            background: rgba(148, 163, 184, 0.05);
+        }
+
+        body.light .item-card-medium-actions .action-btn {
+            color: #64748b;
+        }
+
+        body.light .item-card-medium-actions .action-btn+.action-btn {
+            border-left-color: rgba(15, 23, 42, 0.08);
+        }
+
+        body.light .item-card-medium-actions .action-btn:hover {
+            background: rgba(14, 165, 233, 0.08);
+            color: #334155;
+        }
+
+        body.light .item-card-medium-actions .action-copy {
+            color: #0284c7;
+        }
+
+        body.light .item-card-medium-actions .action-copy:hover {
+            background: rgba(2, 132, 199, 0.12);
+            color: #0369a1;
+        }
+
+        body.light .item-card-medium-actions .action-delete {
+            color: #dc2626;
+        }
+
+        body.light .item-card-medium-actions .action-delete:hover {
+            background: rgba(239, 68, 68, 0.12);
+            color: #b91c1c;
+        }
+
         body.light .category-progress-track {
             background: rgba(148, 163, 184, 0.24);
         }
 
-        /* 仪表盘过期提醒（浅色模式优化） */
-        body.light .expiry-remind-item {
-            background: rgba(148, 163, 184, 0.08);
-            border-color: rgba(148, 163, 184, 0.24);
+        /* 仪表盘提醒卡片（深色模式统一优化） */
+        .expiry-remind-item,
+        .reminder-remind-item {
+            border-width: 1px;
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+            transition: background-color 0.2s, border-color 0.2s, box-shadow 0.2s;
         }
 
-        body.light .expiry-remind-item.expiry-warning {
-            background: rgba(245, 158, 11, 0.06);
-            border-color: rgba(245, 158, 11, 0.2);
+        .expiry-remind-item:hover,
+        .reminder-remind-item:hover {
+            filter: brightness(1.04);
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 8px 18px -14px rgba(2, 6, 23, 0.9);
         }
 
-        body.light .expiry-remind-item.expiry-urgent {
-            background: rgba(245, 158, 11, 0.09);
-            border-color: rgba(245, 158, 11, 0.26);
+        .expiry-remind-item.expiry-normal {
+            background: rgba(71, 85, 105, 0.22);
+            border-color: rgba(148, 163, 184, 0.28);
         }
 
-        body.light .expiry-remind-item.expiry-expired {
-            background: rgba(239, 68, 68, 0.08);
-            border-color: rgba(239, 68, 68, 0.24);
+        .expiry-remind-item.expiry-warning,
+        .reminder-remind-item.reminder-warning {
+            background: rgba(245, 158, 11, 0.14);
+            border-color: rgba(245, 158, 11, 0.34);
         }
 
-        body.light .expiry-remind-item .expiry-meta {
-            color: #64748b;
-            font-weight: 500;
+        .expiry-remind-item.expiry-urgent,
+        .reminder-remind-item.reminder-urgent {
+            background: rgba(249, 115, 22, 0.16);
+            border-color: rgba(249, 115, 22, 0.38);
         }
 
-        body.light .expiry-remind-item.expiry-warning .expiry-meta {
-            color: #b45309;
+        .expiry-remind-item.expiry-expired,
+        .reminder-remind-item.reminder-expired {
+            background: rgba(239, 68, 68, 0.16);
+            border-color: rgba(239, 68, 68, 0.36);
         }
 
-        body.light .expiry-remind-item.expiry-urgent .expiry-meta {
+        /* 仪表盘提醒卡片（浅色模式统一优化） */
+        body.light .expiry-remind-item,
+        body.light .reminder-remind-item {
+            background: rgba(255, 255, 255, 0.88);
+            border-color: rgba(148, 163, 184, 0.28);
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.6);
+        }
+
+        body.light .expiry-remind-item:hover,
+        body.light .reminder-remind-item:hover {
+            filter: brightness(1.02);
+        }
+
+        body.light .expiry-remind-item.expiry-normal {
+            background: rgba(248, 250, 252, 0.96);
+            border-color: rgba(148, 163, 184, 0.3);
+        }
+
+        body.light .expiry-remind-item.expiry-warning,
+        body.light .reminder-remind-item.reminder-warning {
+            background: rgba(254, 243, 199, 0.72);
+            border-color: rgba(217, 119, 6, 0.3);
+        }
+
+        body.light .expiry-remind-item.expiry-urgent,
+        body.light .reminder-remind-item.reminder-urgent {
+            background: rgba(255, 237, 213, 0.78);
+            border-color: rgba(194, 65, 12, 0.32);
+        }
+
+        body.light .expiry-remind-item.expiry-expired,
+        body.light .reminder-remind-item.reminder-expired {
+            background: rgba(254, 226, 226, 0.8);
+            border-color: rgba(220, 38, 38, 0.3);
+        }
+
+        body.light .expiry-remind-item .expiry-meta,
+        body.light .reminder-remind-item .reminder-meta {
+            color: #475569;
+            font-weight: 600;
+        }
+
+        body.light .expiry-remind-item.expiry-warning .expiry-meta,
+        body.light .reminder-remind-item.reminder-warning .reminder-meta {
+            color: #9a3412;
+        }
+
+        body.light .expiry-remind-item.expiry-urgent .expiry-meta,
+        body.light .reminder-remind-item.reminder-urgent .reminder-meta {
+            color: #7c2d12;
+        }
+
+        body.light .expiry-remind-item.expiry-expired .expiry-meta,
+        body.light .reminder-remind-item.reminder-expired .reminder-meta {
+            color: #991b1b;
+        }
+
+        body.light .reminder-remind-item .reminder-action-btn {
+            background: rgba(255, 255, 255, 0.78);
+            border-width: 1px;
+        }
+
+        body.light .reminder-remind-item .reminder-action-pending,
+        body.light .reminder-remind-item .reminder-action-view {
+            color: #0369a1;
+            border-color: rgba(3, 105, 161, 0.35);
+        }
+
+        body.light .reminder-remind-item .reminder-action-pending:hover,
+        body.light .reminder-remind-item .reminder-action-view:hover {
+            color: #0c4a6e;
+            border-color: rgba(12, 74, 110, 0.42);
+            background: rgba(224, 242, 254, 0.95);
+        }
+
+        body.light .reminder-remind-item .reminder-action-undo {
             color: #92400e;
+            border-color: rgba(146, 64, 14, 0.35);
         }
 
-        body.light .expiry-remind-item.expiry-expired .expiry-meta {
-            color: #b91c1c;
+        body.light .reminder-remind-item .reminder-action-undo:hover {
+            color: #78350f;
+            border-color: rgba(120, 53, 15, 0.42);
+            background: rgba(254, 243, 199, 0.95);
+        }
+
+        body.light .reminder-remind-item .reminder-action-done {
+            color: #166534;
+            border-color: rgba(22, 101, 52, 0.3);
+            background: rgba(220, 252, 231, 0.92);
         }
 
         /* 移动端 */
@@ -1964,6 +3797,9 @@ getDB(); // 确保数据库初始化
             <div class="sidebar-link" data-view="items" onclick="switchView('items')">
                 <i class="ri-archive-line"></i><span class="sidebar-text">物品管理</span>
             </div>
+            <div class="sidebar-link" data-view="shopping-list" onclick="switchView('shopping-list')">
+                <i class="ri-shopping-cart-2-line"></i><span class="sidebar-text">购物清单</span>
+            </div>
             <div class="sidebar-link" data-view="locations" onclick="switchView('locations')">
                 <i class="ri-map-pin-line"></i><span class="sidebar-text">位置管理</span>
             </div>
@@ -1996,6 +3832,12 @@ getDB(); // 确保数据库初始化
                         onclick="switchView('channel-settings')">
                         <i class="ri-shopping-bag-line"></i><span class="sidebar-text">购入渠道管理</span>
                     </div>
+                    <?php if (isAdminUser($currentAuthUser)): ?>
+                    <div class="sidebar-link sidebar-sub" data-view="user-management"
+                        onclick="switchView('user-management')">
+                        <i class="ri-admin-line"></i><span class="sidebar-text">用户管理</span>
+                    </div>
+                    <?php endif; ?>
                     <div class="sidebar-link sidebar-sub" data-view="changelog" onclick="switchView('changelog')">
                         <i class="ri-history-line"></i><span class="sidebar-text">更新记录</span>
                     </div>
@@ -2025,6 +3867,13 @@ getDB(); // 确保数据库初始化
                     <input type="text" id="globalSearch" placeholder="全局搜索物品..." class="input pl-10 !w-64 !py-2"
                         onkeyup="handleGlobalSearch(event)">
                 </div>
+                <div class="hidden lg:flex items-center gap-2 px-3 py-1.5 rounded-lg border border-white/10 text-xs text-slate-300">
+                    <i class="ri-user-3-line text-sky-400"></i>
+                    <span id="currentUserLabel"><?= htmlspecialchars(($currentAuthUser['display_name'] ?: $currentAuthUser['username']) . (isAdminUser($currentAuthUser) ? '（管理员）' : ''), ENT_QUOTES, 'UTF-8') ?></span>
+                </div>
+                <button onclick="logout()" class="btn btn-ghost !py-2 !px-3 text-xs text-slate-300 hover:text-red-300 border border-white/10 hover:border-red-400/30">
+                    <i class="ri-logout-box-r-line"></i><span class="hidden sm:inline">退出</span>
+                </button>
                 <button onclick="openAddItem()" class="btn btn-primary"><i class="ri-add-line"></i><span
                         class="hidden sm:inline">添加物品</span></button>
             </div>
@@ -2047,6 +3896,7 @@ getDB(); // 确保数据库初始化
             <form id="itemForm" onsubmit="return saveItem(event)">
                 <input type="hidden" id="itemId">
                 <input type="hidden" id="itemImage">
+                <input type="hidden" id="itemSourceShoppingId">
                 <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
                     <div class="sm:col-span-2 md:col-span-3">
                         <label class="block text-sm text-slate-400 mb-1.5">物品名称 <span
@@ -2096,12 +3946,36 @@ getDB(); // 确保数据库初始化
                         <input type="text" id="itemBarcode" class="input" placeholder="可选">
                     </div>
                     <div class="sm:col-span-2 md:col-span-3">
-                        <label class="block text-sm text-slate-400 mb-1.5">标签 (逗号分隔)</label>
-                        <input type="text" id="itemTags" class="input" placeholder="例如: 重要, 易碎, 保修期内">
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <div>
+                                <label class="block text-sm text-slate-400 mb-1.5">循环提醒初始日期</label>
+                                <input type="date" id="itemReminderDate" class="input !h-10 !py-0" onchange="syncReminderFields()">
+                            </div>
+                            <div>
+                                <label class="block text-sm mb-1.5 invisible">循环周期</label>
+                                <div class="flex items-center gap-2 min-w-0">
+                                    <span class="text-sm text-slate-400 whitespace-nowrap px-1">每</span>
+                                    <input type="number" id="itemReminderEvery" class="input !w-[88px] !h-10 !py-0" value="1" min="1" step="1" onchange="syncReminderFields()">
+                                    <select id="itemReminderUnit" class="input flex-1 min-w-0 !h-10 !py-0" onchange="syncReminderFields()">
+                                        <option value="day">天</option>
+                                        <option value="week">周</option>
+                                        <option value="year">年</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div>
+                                <label class="block text-sm text-slate-400 mb-1.5">下次提醒日期</label>
+                                <input type="date" id="itemReminderNext" class="input !h-10 !py-0">
+                            </div>
+                        </div>
                     </div>
                     <div class="sm:col-span-2 md:col-span-3">
-                        <label class="block text-sm text-slate-400 mb-1.5">描述</label>
-                        <textarea id="itemDesc" class="input" rows="2" placeholder="物品描述..."></textarea>
+                        <label class="block text-sm text-slate-400 mb-1.5">循环提醒备注</label>
+                        <input type="text" id="itemReminderNote" class="input" placeholder="例如：更换滤芯、续费订阅、补货检查">
+                    </div>
+                    <div class="sm:col-span-2 md:col-span-3">
+                        <label class="block text-sm text-slate-400 mb-1.5">标签 (逗号分隔)</label>
+                        <input type="text" id="itemTags" class="input" placeholder="例如: 重要, 易碎, 保修期内">
                     </div>
                     <div class="sm:col-span-2 md:col-span-3">
                         <label class="block text-sm text-slate-400 mb-1.5">备注</label>
@@ -2124,7 +3998,99 @@ getDB(); // 确保数据库初始化
                 </div>
                 <div class="flex justify-end gap-3 mt-6 pt-4 border-t border-white/5">
                     <button type="button" onclick="closeItemModal()" class="btn btn-ghost">取消</button>
-                    <button type="submit" class="btn btn-primary"><i class="ri-save-line"></i>保存</button>
+                    <button type="submit" class="btn btn-primary"><i class="ri-save-line"></i><span id="itemSubmitLabel">保存</span></button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- 物品未保存确认弹窗 -->
+    <div id="itemUnsavedModal" class="modal-overlay">
+        <div class="modal-box p-6" style="max-width:420px">
+            <h3 class="text-lg font-bold text-white mb-2">检测到未保存修改</h3>
+            <p class="text-sm text-slate-400 mb-6">关闭前请选择操作：</p>
+            <div class="flex justify-end gap-3">
+                <button type="button" onclick="discardItemChangesAndClose()" class="btn btn-ghost">忽略修改</button>
+                <button type="button" onclick="saveItemChangesAndClose()" class="btn btn-primary"><i class="ri-save-line"></i>保存修改</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 购物清单弹窗 -->
+    <div id="shoppingModal" class="modal-overlay" onclick="if(event.target===this)closeShoppingModal()">
+        <div class="modal-box p-6" style="max-width:720px;min-height:50vh">
+            <div class="flex items-center justify-between mb-6">
+                <h3 id="shoppingModalTitle" class="text-xl font-bold text-white">添加清单</h3>
+                <button onclick="closeShoppingModal()" class="text-slate-400 hover:text-white transition"><i
+                        class="ri-close-line text-2xl"></i></button>
+            </div>
+            <form id="shoppingForm" onsubmit="return saveShoppingItem(event)">
+                <input type="hidden" id="shoppingId">
+                <input type="hidden" id="shoppingCategoryId" value="0">
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div class="sm:col-span-2">
+                        <label class="block text-sm text-slate-400 mb-1.5">名称 <span class="text-red-400">*</span></label>
+                        <input type="text" id="shoppingName" class="input" placeholder="例如：洗衣液、充电电池、显示器支架" oninput="scheduleRefreshShoppingSimilarItemPrices()" required>
+                    </div>
+                    <div>
+                        <label class="block text-sm text-slate-400 mb-1.5">计划数量</label>
+                        <input type="number" id="shoppingQty" class="input" value="1" min="1" step="1">
+                    </div>
+                    <div>
+                        <label class="block text-sm text-slate-400 mb-1.5">状态</label>
+                        <select id="shoppingStatus" class="input" onchange="updateShoppingToggleStatusButton()">
+                            <option value="pending_purchase" selected>待购买</option>
+                            <option value="pending_receipt">待收货</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-sm text-slate-400 mb-1.5">优先级</label>
+                        <select id="shoppingPriority" class="input">
+                            <option value="high">高</option>
+                            <option value="normal" selected>普通</option>
+                            <option value="low">低</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-sm text-slate-400 mb-1.5">预算单价 (¥)</label>
+                        <input type="number" id="shoppingPrice" class="input" value="0" min="0" step="0.01">
+                    </div>
+                    <div class="sm:col-span-2 grid grid-cols-[170px_minmax(0,1fr)] gap-4">
+                        <div>
+                            <label class="block text-sm text-slate-400 mb-1.5">提醒日期</label>
+                            <input type="date" id="shoppingReminderDate" class="input">
+                        </div>
+                        <div>
+                            <label class="block text-sm text-slate-400 mb-1.5">提醒备注</label>
+                            <input type="text" id="shoppingReminderNote" class="input" placeholder="例如：活动截止前购买">
+                        </div>
+                    </div>
+                    <div class="sm:col-span-2">
+                        <label class="block text-sm text-slate-400 mb-1.5">备注</label>
+                        <textarea id="shoppingNotes" class="input" rows="5" placeholder="例如：建议品牌、型号、店铺、价格提醒..."></textarea>
+                        <div id="shoppingPriceReferenceBox" class="mt-3 p-3 rounded-xl border border-white/10 bg-white/5 hidden">
+                            <div class="flex items-center justify-between gap-2 mb-2">
+                                <p class="text-xs text-slate-400">相似物品购入价参考</p>
+                                <button type="button" id="shoppingSimilarSortBtn" class="btn btn-ghost btn-sm" onclick="toggleShoppingSimilarSortMode()">
+                                    <i class="ri-sort-desc"></i><span id="shoppingSimilarSortLabel">最新日期</span>
+                                </button>
+                            </div>
+                            <div id="shoppingPriceReferenceList" class="space-y-1.5"></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="flex items-center justify-between gap-3 mt-6 pt-4 border-t border-white/5">
+                    <div class="flex items-center gap-2">
+                        <button type="button" id="shoppingConvertBtn" onclick="convertCurrentShoppingItem()"
+                            class="btn btn-primary hidden"><i class="ri-shopping-bag-3-line"></i>已购买入库</button>
+                        <button type="button" id="shoppingToggleStatusBtn" onclick="toggleCurrentShoppingStatus()"
+                            class="btn btn-ghost hidden"><i class="ri-refresh-line"></i><span
+                                id="shoppingToggleStatusLabel">已购买</span></button>
+                    </div>
+                    <div class="flex items-center gap-3 ml-auto">
+                        <button type="button" onclick="closeShoppingModal()" class="btn btn-ghost">取消</button>
+                        <button type="submit" class="btn btn-primary"><i class="ri-save-line"></i>保存</button>
+                    </div>
                 </div>
             </form>
         </div>
@@ -2193,8 +4159,15 @@ getDB(); // 确保数据库初始化
         // ============================================================
         // 🚀 应用状态与核心逻辑
         // ============================================================
+        const CURRENT_USER = <?= $currentUserJson ?>;
+        function userScopedStorageKey(name) {
+            const uid = CURRENT_USER && CURRENT_USER.id ? String(CURRENT_USER.id) : '0';
+            return `item_manager_u${uid}_${name}`;
+        }
+        const THEME_KEY = userScopedStorageKey('theme');
+
         // ---------- 排序设置 ----------
-        const SORT_SETTINGS_KEY = 'item_manager_sort_settings';
+        const SORT_SETTINGS_KEY = userScopedStorageKey('sort_settings');
         const defaultSortSettings = {
             dashboard_categories: 'count_desc',   // count_desc | name_asc | total_qty_desc
             items_default: 'updated_at:DESC',     // 同物品列表排序选项
@@ -2213,18 +4186,19 @@ getDB(); // 确保数据库初始化
             App.sortSettings = s;
         }
 
-        const ITEMS_SIZE_KEY = 'item_manager_items_size';
+        const ITEMS_SIZE_KEY = userScopedStorageKey('items_size');
         function loadItemsSize() { return localStorage.getItem(ITEMS_SIZE_KEY) || 'large'; }
         function saveItemsSize(s) { localStorage.setItem(ITEMS_SIZE_KEY, s); App.itemsSize = s; }
 
         // ---------- 属性显示设置 ----------
-        const ITEM_ATTRS_KEY = 'item_manager_item_attrs';
+        const ITEM_ATTRS_KEY = userScopedStorageKey('item_attrs');
         const allItemAttrs = [
             { key: 'category', label: '分类' },
             { key: 'location', label: '位置' },
             { key: 'quantity', label: '件数' },
             { key: 'price', label: '价格' },
             { key: 'expiry', label: '过期日期' },
+            { key: 'reminder', label: '循环提醒' },
             { key: 'purchase_from', label: '购入渠道' },
             { key: 'notes', label: '备注' },
         ];
@@ -2246,7 +4220,7 @@ getDB(); // 确保数据库初始化
         function hasAttr(key) { return App.itemAttrs.includes(key); }
 
         // ---------- 状态管理 ----------
-        const STATUS_KEY = 'item_manager_statuses';
+        const STATUS_KEY = userScopedStorageKey('statuses');
         const STATUS_KEY_TO_LABEL_MAP = { active: '使用中', archived: '已归档', sold: '已转卖' };
         const STATUS_LABEL_TO_KEY_MAP = { 使用中: 'active', 已归档: 'archived', 已转卖: 'sold' };
         const defaultStatuses = [
@@ -2270,9 +4244,9 @@ getDB(); // 确保数据库初始化
                         </span>
                         <i class="ri-arrow-down-s-line text-slate-500"></i>
                     </button>
-                    <div id="${pickerId}Menu" class="status-icon-picker-menu hidden absolute z-30 mt-1 w-full max-h-56 overflow-auto rounded-xl border border-white/[0.1] bg-slate-900/95 backdrop-blur p-1">
+                    <div id="${pickerId}Menu" class="status-icon-picker-menu hidden absolute z-30 mt-1 w-full max-h-56 overflow-auto rounded-xl p-1">
                         ${STATUS_ICON_OPTIONS.map(ic => `
-                            <button type="button" data-icon="${ic}" onclick="pickStatusIcon('${pickerId}','${inputId}','${ic}')" class="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-left text-xs transition ${ic === selected ? 'bg-sky-500/20 text-sky-300' : 'text-slate-300 hover:bg-white/[0.08]'}">
+                            <button type="button" data-icon="${ic}" onclick="pickStatusIcon('${pickerId}','${inputId}','${ic}')" class="status-icon-option w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-left text-xs transition ${ic === selected ? 'is-selected' : ''}">
                                 <i class="${ic} text-base"></i>
                                 <span>${getStatusIconLabel(ic)}</span>
                             </button>
@@ -2301,10 +4275,7 @@ getDB(); // 确保数据库初始化
             if (menu) {
                 menu.querySelectorAll('button[data-icon]').forEach(btn => {
                     const selected = btn.getAttribute('data-icon') === icon;
-                    btn.classList.toggle('bg-sky-500/20', selected);
-                    btn.classList.toggle('text-sky-300', selected);
-                    btn.classList.toggle('text-slate-300', !selected);
-                    if (!selected) btn.classList.add('hover:bg-white/[0.08]');
+                    btn.classList.toggle('is-selected', selected);
                 });
                 menu.classList.add('hidden');
             }
@@ -2372,7 +4343,7 @@ getDB(); // 确保数据库初始化
         }
 
         // ---------- 购入渠道管理 ----------
-        const CHANNEL_KEY = 'item_manager_purchase_channels';
+        const CHANNEL_KEY = userScopedStorageKey('purchase_channels');
         const defaultPurchaseChannels = ['淘宝', '京东', '拼多多', '闲鱼', '线下', '礼品'];
         function normalizeChannels(arr) {
             const seen = new Set();
@@ -2401,11 +4372,55 @@ getDB(); // 确保数据库初始化
             App.purchaseChannels = normalized;
         }
 
+        let itemFormInitialState = '';
+        function getItemFormState() {
+            const ids = ['itemId', 'itemName', 'itemCategory', 'itemLocation', 'itemStatus', 'itemQuantity', 'itemPrice', 'itemPurchaseFrom', 'itemDate', 'itemExpiry', 'itemBarcode', 'itemReminderDate', 'itemReminderEvery', 'itemReminderUnit', 'itemReminderNext', 'itemReminderNote', 'itemTags', 'itemNotes', 'itemImage', 'itemSourceShoppingId'];
+            const state = {};
+            ids.forEach(id => {
+                const el = document.getElementById(id);
+                state[id] = el ? el.value : '';
+            });
+            return JSON.stringify(state);
+        }
+        function setItemSubmitLabel(text = '保存') {
+            const label = document.getElementById('itemSubmitLabel');
+            if (label) label.textContent = text;
+        }
+        function markItemFormClean() {
+            itemFormInitialState = getItemFormState();
+        }
+        function clearItemFormTrack() {
+            itemFormInitialState = '';
+        }
+        function hasItemFormUnsavedChanges() {
+            if (!itemFormInitialState) return false;
+            return getItemFormState() !== itemFormInitialState;
+        }
+        function openItemUnsavedConfirm() {
+            const modal = document.getElementById('itemUnsavedModal');
+            if (modal) modal.classList.add('show');
+        }
+        function closeItemUnsavedConfirm() {
+            const modal = document.getElementById('itemUnsavedModal');
+            if (modal) modal.classList.remove('show');
+        }
+        function discardItemChangesAndClose() {
+            closeItemUnsavedConfirm();
+            closeItemModal(true);
+        }
+        function saveItemChangesAndClose() {
+            closeItemUnsavedConfirm();
+            const form = document.getElementById('itemForm');
+            if (form) form.requestSubmit();
+        }
+
         const App = {
             statuses: loadStatuses(),
             purchaseChannels: loadPurchaseChannels(),
             currentView: 'dashboard',
             categories: [],
+            shoppingList: [],
+            pendingShoppingEditId: 0,
             itemsSize: loadItemsSize(),
             itemAttrs: loadItemAttrs(),
             locations: [],
@@ -2425,7 +4440,21 @@ getDB(); // 确保数据库初始化
             const url = `?api=${endpoint}`;
             try {
                 const res = await fetch(url, options);
-                return await res.json();
+                let data = null;
+                try {
+                    data = await res.json();
+                } catch (e) {
+                    data = { success: false, message: '响应解析失败' };
+                }
+                if (!res.ok && data && data.code === 'AUTH_REQUIRED') {
+                    location.reload();
+                    return data;
+                }
+                if (data && data.code === 'AUTH_REQUIRED') {
+                    location.reload();
+                    return data;
+                }
+                return data;
             } catch (e) {
                 toast('网络请求失败', 'error');
                 return { success: false };
@@ -2434,6 +4463,14 @@ getDB(); // 确保数据库初始化
 
         async function apiPost(endpoint, data) {
             return api(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+        }
+
+        async function logout() {
+            try {
+                await apiPost('auth/logout', {});
+            } finally {
+                location.reload();
+            }
         }
 
         // ---------- Toast 通知 ----------
@@ -2480,17 +4517,39 @@ getDB(); // 确保数据库初始化
         function toggleTheme() {
             document.body.classList.toggle('light');
             const isLight = document.body.classList.contains('light');
-            localStorage.setItem('item_theme', isLight ? 'light' : 'dark');
+            localStorage.setItem(THEME_KEY, isLight ? 'light' : 'dark');
             document.getElementById('themeIcon').className = isLight ? 'ri-sun-line' : 'ri-moon-line';
             document.getElementById('themeText').textContent = isLight ? '浅色模式' : '深色模式';
         }
 
         function initTheme() {
-            if (localStorage.getItem('item_theme') === 'light') {
+            if (localStorage.getItem(THEME_KEY) === 'light') {
                 document.body.classList.add('light');
                 document.getElementById('themeIcon').className = 'ri-sun-line';
                 document.getElementById('themeText').textContent = '浅色模式';
             }
+        }
+
+        const DATE_PLACEHOLDER_TEXT = '____年/__月/__日';
+        function refreshDateInputPlaceholderDisplay(root = document) {
+            root.querySelectorAll('input[data-date-placeholder="1"]').forEach(input => {
+                if (document.activeElement === input) return;
+                input.type = input.value ? 'date' : 'text';
+            });
+        }
+        function setupDateInputPlaceholders() {
+            document.querySelectorAll('input[type="date"]').forEach(input => {
+                if (input.dataset.datePlaceholderBound === '1') return;
+                input.dataset.datePlaceholderBound = '1';
+                input.dataset.datePlaceholder = '1';
+                input.placeholder = DATE_PLACEHOLDER_TEXT;
+                input.addEventListener('focus', () => { input.type = 'date'; });
+                input.addEventListener('blur', () => {
+                    if (!input.value) input.type = 'text';
+                });
+                input.addEventListener('change', () => { input.type = 'date'; });
+            });
+            refreshDateInputPlaceholderDisplay();
         }
 
         // ---------- 侧边栏 ----------
@@ -2511,14 +4570,14 @@ getDB(); // 确保数据库初始化
         }
 
         // ---------- 视图切换 ----------
-        const settingsSubViews = ['import-export', 'settings', 'status-settings', 'channel-settings', 'changelog'];
+        const settingsSubViews = ['import-export', 'settings', 'status-settings', 'channel-settings', 'user-management', 'changelog'];
 
         function switchView(view) {
             App.currentView = view;
             document.querySelectorAll('.sidebar-link[data-view]').forEach(el => {
                 el.classList.toggle('active', el.dataset.view === view);
             });
-            const titles = { dashboard: '仪表盘', items: '物品管理', categories: '分类管理', locations: '位置管理', trash: '物品管理', 'import-export': '数据管理', settings: '排序设置', 'status-settings': '状态管理', 'channel-settings': '购入渠道管理', changelog: '更新记录' };
+            const titles = { dashboard: '仪表盘', items: '物品管理', 'shopping-list': '购物清单', categories: '分类管理', locations: '位置管理', trash: '物品管理', 'import-export': '数据管理', settings: '排序设置', 'status-settings': '状态管理', 'channel-settings': '购入渠道管理', 'user-management': '用户管理', changelog: '更新记录' };
             document.getElementById('viewTitle').textContent = titles[view] || '';
             // 回收站视图高亮物品管理侧边栏
             if (view === 'trash') document.querySelector('.sidebar-link[data-view="items"]')?.classList.add('active');
@@ -2544,6 +4603,7 @@ getDB(); // 确保数据库初始化
             switch (App.currentView) {
                 case 'dashboard': await renderDashboard(c); break;
                 case 'items': await renderItems(c); break;
+                case 'shopping-list': await renderShoppingList(c); break;
                 case 'categories': await renderCategories(c); break;
                 case 'locations': await renderLocations(c); break;
                 case 'trash': await renderTrash(c); break;
@@ -2551,6 +4611,7 @@ getDB(); // 确保数据库初始化
                 case 'settings': renderSettings(c); break;
                 case 'status-settings': renderStatusSettings(c); break;
                 case 'channel-settings': renderChannelSettings(c); break;
+                case 'user-management': await renderUserManagement(c); break;
                 case 'changelog': renderChangelog(c); break;
             }
         }
@@ -2571,6 +4632,17 @@ getDB(); // 确保数据库初始化
             const d = res.data;
             const statusMap = getStatusMap();
             const expiringItems = Array.isArray(d.expiringItems) ? d.expiringItems : [];
+            const reminderItems = Array.isArray(d.reminderItems) ? d.reminderItems : [];
+            const shoppingReminderItems = Array.isArray(d.shoppingReminderItems) ? d.shoppingReminderItems : [];
+            const memoReminderItems = [
+                ...reminderItems.map(item => ({ ...item, _source: 'item', _dueDate: reminderDisplayDate(item) })),
+                ...shoppingReminderItems.map(item => ({ ...item, _source: 'shopping', _dueDate: item.reminder_date || '' }))
+            ]
+                .filter(item => item._dueDate)
+                .sort((a, b) => String(a._dueDate).localeCompare(String(b._dueDate)));
+            const memoExpiredCount = memoReminderItems.filter(item => daysUntilReminder(item._dueDate) < 0).length;
+            const memoCycleCount = memoReminderItems.filter(item => item._source === 'item').length;
+            const memoShoppingCount = memoReminderItems.filter(item => item._source === 'shopping').length;
             const dashboardStatusStats = (d.statusStats || []).filter(s => Number(s.total_qty || 0) > 0);
 
             container.innerHTML = `
@@ -2621,6 +4693,67 @@ getDB(); // 确保数据库初始化
             ` : '<p class="text-slate-500 text-sm text-center py-8">暂无设置过期日期的物品</p>'}
         </div>
 
+        <div class="glass rounded-2xl p-5 mb-6 anim-up" style="animation-delay:0.04s">
+            <div class="flex items-center justify-between mb-4">
+                <h3 class="font-semibold text-white flex items-center gap-2"><i class="ri-loop-right-line text-cyan-400"></i>备忘提醒</h3>
+                <span class="text-xs text-slate-500">过期 ${memoExpiredCount} 条 · 循环 ${memoCycleCount} 条 · 购物 ${memoShoppingCount} 条</span>
+            </div>
+            ${memoReminderItems.length > 0 ? `
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
+                ${memoReminderItems.map(item => {
+                const dueDate = item._dueDate;
+                const days = daysUntilReminder(dueDate);
+                const urgency = days < 0 ? 'expired' : days <= 1 ? 'urgent' : 'warning';
+                const bgMap = {
+                    expired: 'bg-red-500/10 border-red-500/20 reminder-remind-item reminder-expired',
+                    urgent: 'bg-amber-500/10 border-amber-500/20 reminder-remind-item reminder-urgent',
+                    warning: 'bg-yellow-500/5 border-yellow-500/15 reminder-remind-item reminder-warning'
+                };
+                const textMap = { expired: 'text-red-400', urgent: 'text-amber-400', warning: 'text-yellow-400' };
+                const isItemReminder = item._source === 'item';
+                const clickAction = isItemReminder ? `showDetail(${item.id})` : `switchView('shopping-list')`;
+                const summaryNote = String(item.reminder_note || '').trim();
+                const summaryNoteHtml = summaryNote ? esc(summaryNote) : '&nbsp;';
+                const isCompleted = isItemReminder && Number(item.reminder_completed || 0) === 1;
+                const reminderId = Number(item.reminder_instance_id || 0);
+                return `<div class="p-3 rounded-xl border ${bgMap[urgency]} cursor-pointer hover:brightness-110 transition" onclick="${clickAction}">
+                        <div class="flex items-start gap-3">
+                            <div class="w-9 h-9 rounded-lg ${isItemReminder && item.image ? '' : 'bg-slate-700/50 flex items-center justify-center text-base'} flex-shrink-0 overflow-hidden">
+                                ${isItemReminder && item.image ? `<img src="?img=${item.image}" class="w-full h-full object-cover rounded-lg">` : `<span>${isItemReminder ? (item.category_icon || '📦') : '🛒'}</span>`}
+                            </div>
+                            <div class="min-w-0 flex-1">
+                                <p class="text-sm font-medium text-slate-200 truncate">${esc(item.name)}</p>
+                                <p class="text-xs ${textMap[urgency]} font-medium reminder-meta"><span>${dueDate}</span> · <span>${reminderDueLabel(dueDate)}</span></p>
+                                <p class="text-[11px] text-slate-500 mt-0.5">${isItemReminder ? reminderCycleLabel(item.reminder_cycle_value, item.reminder_cycle_unit) : '购物清单提醒'}</p>
+                                <p class="text-[11px] text-slate-400 mt-1 truncate h-4 leading-4">${summaryNoteHtml}</p>
+                            </div>
+                        </div>
+                        <div class="mt-3 flex justify-end gap-2">
+                            ${isItemReminder ? `
+                                ${isCompleted ? `
+                                    <button onclick="event.stopPropagation();undoReminder(${item.id},${reminderId})" class="btn btn-ghost btn-sm reminder-action-btn reminder-action-undo !py-1 !px-2 text-xs text-amber-300 hover:text-amber-200 border-amber-400/25 hover:border-amber-300/40">
+                                        <i class="ri-arrow-go-back-line"></i>撤销
+                                    </button>
+                                    <button class="btn btn-ghost btn-sm reminder-action-btn reminder-action-done !py-1 !px-2 text-xs text-emerald-300 border-emerald-400/25 cursor-default pointer-events-none">
+                                        <i class="ri-checkbox-circle-line"></i>已完成
+                                    </button>
+                                ` : `
+                                    <button onclick="event.stopPropagation();completeReminder(${item.id},${reminderId})" class="btn btn-ghost btn-sm reminder-action-btn reminder-action-pending !py-1 !px-2 text-xs text-cyan-300 hover:text-cyan-200 border-cyan-400/25 hover:border-cyan-300/40">
+                                        <i class="ri-time-line"></i>待完成
+                                    </button>
+                                `}
+                            ` : `
+                            <button onclick="event.stopPropagation();openShoppingListAndEdit(${item.id})" class="btn btn-ghost btn-sm reminder-action-btn reminder-action-view !py-1 !px-2 text-xs text-cyan-300 hover:text-cyan-200 border-cyan-400/25 hover:border-cyan-300/40">
+                                <i class="ri-list-check"></i>查看清单
+                            </button>
+                            `}
+                        </div>
+                    </div>`;
+            }).join('')}
+            </div>
+            ` : '<p class="text-slate-500 text-sm text-center py-8">暂无临近 3 天的备忘提醒</p>'}
+        </div>
+
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
             <div class="lg:col-span-2 glass rounded-2xl p-5 anim-up">
                 <div class="flex items-center justify-between mb-4">
@@ -2650,13 +4783,14 @@ getDB(); // 确保数据库初始化
                         <span class="text-xs text-slate-500">未分类 ${Number(d.uncategorizedQty || 0)} 件</span>
                     </div>
                     <div class="space-y-3">
-                        ${(() => { const total = d.categoryStats.reduce((sum, c) => sum + Number(c.count || 0), 0);
+                        ${(() => { const total = d.categoryStats.reduce((sum, c) => sum + Number(c.total_qty || 0), 0);
                 return sortCategoryStats(d.categoryStats.filter(c => c.count > 0)).map(cat => {
-                    const pct = total > 0 ? Math.round(cat.count / total * 100) : 0;
+                    const qty = Number(cat.total_qty || 0);
+                    const pct = total > 0 ? Math.round(qty / total * 100) : 0;
                     return `<div>
                             <div class="flex items-center justify-between mb-1">
                                 <span class="text-sm text-slate-300">${cat.icon} ${esc(cat.name)}</span>
-                                <span class="text-xs text-slate-500">${cat.count} 种 / ${cat.total_qty} 件</span>
+                                <span class="text-xs text-slate-500">${qty} 件</span>
                             </div>
                             <div class="h-2 category-progress-track rounded-full overflow-hidden">
                                 <div class="h-full rounded-full transition-all duration-500" style="width:${pct}%;background:${cat.color}"></div>
@@ -2676,7 +4810,7 @@ getDB(); // 确保数据库初始化
                 const [label, badgeClass, iconClass] = meta;
                 return `<div class="flex items-center justify-between py-1.5 border-b border-white/5 last:border-b-0">
                                 <span class="badge ${badgeClass}"><i class="${iconClass} mr-1"></i>${label}</span>
-                                <span class="text-xs text-slate-500">${s.count} 条 / ${s.total_qty} 件</span>
+                                <span class="text-xs text-slate-500">${Number(s.total_qty || 0)} 件</span>
                             </div>`;
             }).join('')}
                     </div>
@@ -2867,6 +5001,7 @@ getDB(); // 确保数据库初始化
             const isSelected = App.selectedItems.has(item.id);
             const statusMap = getStatusMap();
             const [statusLabel, statusClass] = statusMap[item.status] || ['未知', 'badge-archived'];
+            const dueDate = reminderDisplayDate(item);
 
             return `<div class="item-card glass glass-hover anim-up ${isSelected ? 'selected' : ''}" style="animation-delay:${index * 30}ms">
         <div class="item-img relative" onclick="showDetail(${item.id})">
@@ -2889,6 +5024,7 @@ getDB(); // 确保数据库初始化
                 ${hasAttr('purchase_from') && item.purchase_from ? `<span><i class="ri-shopping-bag-line"></i> ${esc(item.purchase_from)}</span>` : ''}
             </div>
             ${hasAttr('expiry') && item.expiry_date ? `<div class="text-xs mt-1 ${expiryColor(item.expiry_date)}"><i class="ri-alarm-warning-line mr-0.5"></i>${item.expiry_date} ${expiryLabel(item.expiry_date)}</div>` : ''}
+            ${hasAttr('reminder') && dueDate && item.reminder_cycle_unit ? `<div class="text-xs mt-1 text-cyan-300/90"><i class="ri-loop-right-line mr-0.5"></i>${dueDate} ${reminderCycleLabel(item.reminder_cycle_value, item.reminder_cycle_unit)}</div>` : ''}
             ${hasAttr('notes') && item.notes ? `<div class="text-xs text-slate-600 mt-1 truncate"><i class="ri-sticky-note-line mr-0.5"></i>${esc(item.notes)}</div>` : ''}
             <div class="flex items-center gap-1 mt-3 pt-3 border-t border-white/5">
                 <button onclick="event.stopPropagation();editItem(${item.id})" class="btn btn-ghost btn-sm flex-1" title="编辑"><i class="ri-edit-line"></i>编辑</button>
@@ -2962,6 +5098,7 @@ getDB(); // 确保数据库初始化
             const isSelected = App.selectedItems.has(item.id);
             const statusMap = getStatusMap();
             const [statusLabel, statusClass] = statusMap[item.status] || ['未知', 'badge-archived'];
+            const dueDate = reminderDisplayDate(item);
 
             return `<div class="glass glass-hover rounded-xl overflow-hidden anim-up ${isSelected ? 'selected' : ''}" style="animation-delay:${index * 20}ms">
         <div class="flex items-center gap-3 p-3">
@@ -2979,6 +5116,7 @@ getDB(); // 确保数据库初始化
                     ${hasAttr('location') && item.location_name ? `<span class="truncate"><i class="ri-map-pin-2-line"></i>${esc(item.location_name)}</span>` : ''}
                     ${hasAttr('price') && item.purchase_price > 0 ? `<span class="text-amber-400">¥${Number(item.purchase_price).toLocaleString()}</span>` : ''}
                     ${hasAttr('expiry') && item.expiry_date ? `<span class="${expiryColor(item.expiry_date)}"><i class="ri-alarm-warning-line"></i>${expiryLabel(item.expiry_date)}</span>` : ''}
+                    ${hasAttr('reminder') && dueDate && item.reminder_cycle_unit ? `<span class="text-cyan-300/90"><i class="ri-loop-right-line"></i>${dueDate}</span>` : ''}
                     ${hasAttr('purchase_from') && item.purchase_from ? `<span><i class="ri-shopping-bag-line"></i>${esc(item.purchase_from)}</span>` : ''}
                     ${hasAttr('notes') && item.notes ? `<span class="text-slate-600 truncate"><i class="ri-sticky-note-line"></i>${esc(item.notes)}</span>` : ''}
                 </div>
@@ -2988,16 +5126,17 @@ getDB(); // 确保数据库初始化
                 <i class="ri-checkbox-${isSelected ? 'fill text-sky-400' : 'blank-line text-slate-600'}"></i>
             </label>
         </div>
-        <div class="flex items-center border-t border-white/5">
-            <button onclick="event.stopPropagation();editItem(${item.id})" class="btn btn-ghost btn-sm flex-1 rounded-none !py-1.5 text-xs"><i class="ri-edit-line"></i></button>
-            <button onclick="event.stopPropagation();copyItem(${item.id})" class="btn btn-ghost btn-sm flex-1 rounded-none !py-1.5 text-xs" style="color:#38bdf8"><i class="ri-file-copy-line"></i></button>
-            <button onclick="event.stopPropagation();deleteItem(${item.id},'${esc(item.name)}')" class="btn btn-danger btn-sm flex-1 rounded-none !py-1.5 text-xs"><i class="ri-delete-bin-line"></i></button>
+        <div class="item-card-medium-actions flex items-center">
+            <button onclick="event.stopPropagation();editItem(${item.id})" class="btn action-btn action-edit btn-ghost btn-sm flex-1 rounded-none !py-1.5 text-xs"><i class="ri-edit-line"></i></button>
+            <button onclick="event.stopPropagation();copyItem(${item.id})" class="btn action-btn action-copy btn-ghost btn-sm flex-1 rounded-none !py-1.5 text-xs"><i class="ri-file-copy-line"></i></button>
+            <button onclick="event.stopPropagation();deleteItem(${item.id},'${esc(item.name)}')" class="btn action-btn action-delete btn-danger btn-sm flex-1 rounded-none !py-1.5 text-xs"><i class="ri-delete-bin-line"></i></button>
         </div>
     </div>`;
         }
 
         function itemRowSmall(item, index) {
             const isSelected = App.selectedItems.has(item.id);
+            const dueDate = reminderDisplayDate(item);
 
             return `<div class="flex items-center gap-3 px-4 py-2.5 hover:bg-white/[0.03] transition cursor-pointer ${index > 0 ? 'border-t border-white/[0.04]' : ''} ${isSelected ? 'bg-sky-500/5' : ''}" onclick="showDetail(${item.id})">
         <label class="flex-shrink-0 cursor-pointer" onclick="event.stopPropagation()">
@@ -3017,6 +5156,7 @@ getDB(); // 确保数据库初始化
         <div class="flex items-center gap-3 flex-shrink-0 text-xs">
             ${hasAttr('price') && item.purchase_price > 0 ? `<span class="text-amber-400 w-16 text-right">¥${Number(item.purchase_price).toLocaleString()}</span>` : ''}
             ${hasAttr('expiry') && item.expiry_date ? `<span class="${expiryColor(item.expiry_date)} hidden md:inline text-[11px]">${expiryLabel(item.expiry_date)}</span>` : ''}
+            ${hasAttr('reminder') && dueDate && item.reminder_cycle_unit ? `<span class="text-cyan-300/90 hidden lg:inline text-[11px]"><i class="ri-loop-right-line"></i>${dueDate}</span>` : ''}
             ${hasAttr('notes') && item.notes ? `<span class="text-[11px] text-slate-600 truncate hidden lg:inline max-w-[80px]"><i class="ri-sticky-note-line"></i>${esc(item.notes)}</span>` : ''}
             <div class="flex gap-0.5" onclick="event.stopPropagation()">
                 <button onclick="editItem(${item.id})" class="p-1 text-slate-500 hover:text-white transition rounded" title="编辑"><i class="ri-edit-line"></i></button>
@@ -3101,10 +5241,10 @@ getDB(); // 确保数据库初始化
                 <div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">价值</p><p class="text-sm text-amber-400 font-medium">¥${Number(item.purchase_price || 0).toLocaleString()}</p></div>
                 ${item.purchase_date ? `<div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">购入日期</p><p class="text-sm text-white">${item.purchase_date}</p></div>` : ''}
                 ${item.expiry_date ? `<div class="p-3 rounded-xl ${expiryBg(item.expiry_date)}"><p class="text-xs text-slate-500 mb-1">过期日期</p><p class="text-sm font-medium ${expiryColor(item.expiry_date)}">${item.expiry_date} ${expiryLabel(item.expiry_date)}</p></div>` : ''}
+                ${reminderDisplayDate(item) && item.reminder_cycle_unit ? `<div class="p-3 rounded-xl bg-cyan-500/10 border border-cyan-500/20"><p class="text-xs text-slate-500 mb-1">循环提醒</p><p class="text-sm font-medium text-cyan-300">初始：${item.reminder_date || '-'} · ${reminderCycleLabel(item.reminder_cycle_value, item.reminder_cycle_unit)} · 下次：${reminderDisplayDate(item)} ${reminderDueLabel(reminderDisplayDate(item))}</p>${item.reminder_note ? `<p class="text-xs text-slate-400 mt-1">${esc(item.reminder_note)}</p>` : ''}</div>` : ''}
                 ${item.purchase_from ? `<div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">购入渠道</p><p class="text-sm text-white">${esc(item.purchase_from)}</p></div>` : ''}
                 ${item.barcode ? `<div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">条码/序列号</p><p class="text-sm text-white font-mono">${esc(item.barcode)}</p></div>` : ''}
             </div>
-            ${item.description ? `<div class="mb-4"><p class="text-xs text-slate-500 mb-1">描述</p><p class="text-sm text-slate-300 whitespace-pre-wrap">${esc(item.description)}</p></div>` : ''}
             ${item.notes ? `<div class="mb-4"><p class="text-xs text-slate-500 mb-1">备注</p><p class="text-sm text-slate-400 whitespace-pre-wrap">${esc(item.notes)}</p></div>` : ''}
             ${item.tags ? `<div class="mb-4"><p class="text-xs text-slate-500 mb-2">标签</p><div class="flex flex-wrap gap-2">${item.tags.split(',').map(t => `<span class="badge bg-white/5 text-slate-300">${esc(t.trim())}</span>`).join('')}</div></div>` : ''}
             <div class="text-xs text-slate-600 mt-4 pt-4 border-t border-white/5">
@@ -3128,13 +5268,24 @@ getDB(); // 确保数据库初始化
             document.getElementById('itemForm').reset();
             document.getElementById('itemId').value = '';
             document.getElementById('itemImage').value = '';
+            document.getElementById('itemSourceShoppingId').value = '';
             document.getElementById('itemQuantity').value = '1';
             document.getElementById('itemPrice').value = '0';
             document.getElementById('itemExpiry').value = '';
+            document.getElementById('itemReminderDate').value = '';
+            document.getElementById('itemReminderEvery').value = '1';
+            document.getElementById('itemReminderUnit').value = 'day';
+            document.getElementById('itemReminderNext').value = '';
+            document.getElementById('itemReminderNote').value = '';
             document.getElementById('itemNotes').value = '';
+            syncReminderFields();
             resetUploadZone();
             await populateSelects({ status: getDefaultStatusKey(), purchaseFrom: App.purchaseChannels[0] || '' });
             document.getElementById('itemModal').classList.add('show');
+            setItemSubmitLabel('保存');
+            refreshDateInputPlaceholderDisplay(document.getElementById('itemForm'));
+            closeItemUnsavedConfirm();
+            markItemFormClean();
         }
 
         async function editItem(id) {
@@ -3146,15 +5297,21 @@ getDB(); // 确保数据库初始化
             document.getElementById('itemModalTitle').textContent = '编辑物品';
             document.getElementById('itemId').value = item.id;
             document.getElementById('itemName').value = item.name;
+            document.getElementById('itemSourceShoppingId').value = '';
             document.getElementById('itemQuantity').value = item.quantity;
             document.getElementById('itemPrice').value = item.purchase_price;
             document.getElementById('itemDate').value = item.purchase_date;
             document.getElementById('itemExpiry').value = item.expiry_date || '';
+            document.getElementById('itemReminderDate').value = item.reminder_date || '';
+            document.getElementById('itemReminderEvery').value = item.reminder_cycle_value || 1;
+            document.getElementById('itemReminderUnit').value = ['day', 'week', 'year'].includes(item.reminder_cycle_unit) ? item.reminder_cycle_unit : 'day';
+            document.getElementById('itemReminderNext').value = item.reminder_next_date || item.reminder_date || '';
+            document.getElementById('itemReminderNote').value = item.reminder_note || '';
             document.getElementById('itemBarcode').value = item.barcode;
             document.getElementById('itemTags').value = item.tags;
-            document.getElementById('itemDesc').value = item.description;
             document.getElementById('itemImage').value = item.image || '';
             document.getElementById('itemNotes').value = item.notes || '';
+            syncReminderFields();
 
             resetUploadZone();
             if (item.image) {
@@ -3169,6 +5326,10 @@ getDB(); // 确保数据库初始化
             document.getElementById('itemCategory').value = item.category_id;
             document.getElementById('itemLocation').value = item.location_id;
             document.getElementById('itemModal').classList.add('show');
+            setItemSubmitLabel('保存');
+            refreshDateInputPlaceholderDisplay(document.getElementById('itemForm'));
+            closeItemUnsavedConfirm();
+            markItemFormClean();
         }
 
         async function populateSelects(options = {}) {
@@ -3194,6 +5355,7 @@ getDB(); // 确保数据库初始化
         async function saveItem(e) {
             e.preventDefault();
             const id = document.getElementById('itemId').value;
+            const sourceShoppingId = +document.getElementById('itemSourceShoppingId').value || 0;
             const data = {
                 id: id ? +id : undefined,
                 name: document.getElementById('itemName').value.trim(),
@@ -3205,17 +5367,37 @@ getDB(); // 确保数据库初始化
                 expiry_date: document.getElementById('itemExpiry').value,
                 barcode: document.getElementById('itemBarcode').value.trim(),
                 tags: document.getElementById('itemTags').value.trim(),
-                description: document.getElementById('itemDesc').value.trim(),
                 status: document.getElementById('itemStatus').value,
                 image: document.getElementById('itemImage').value,
                 purchase_from: document.getElementById('itemPurchaseFrom').value,
-                notes: document.getElementById('itemNotes').value.trim()
+                notes: document.getElementById('itemNotes').value.trim(),
+                reminder_note: document.getElementById('itemReminderNote').value.trim()
             };
+            const reminderDate = document.getElementById('itemReminderDate').value;
+            const reminderUnit = document.getElementById('itemReminderUnit').value;
+            const reminderNextDate = document.getElementById('itemReminderNext').value;
+            let reminderEvery = parseInt(document.getElementById('itemReminderEvery').value || '1', 10);
+            if (!Number.isFinite(reminderEvery) || reminderEvery < 1) reminderEvery = 1;
+            const normalizedReminderUnit = ['day', 'week', 'year'].includes(reminderUnit) ? reminderUnit : 'day';
+            data.reminder_date = reminderDate || '';
+            data.reminder_next_date = reminderDate ? (reminderNextDate || reminderDate) : '';
+            data.reminder_cycle_value = reminderDate ? reminderEvery : 0;
+            data.reminder_cycle_unit = reminderDate ? normalizedReminderUnit : '';
             if (!data.name) { toast('请输入物品名称', 'error'); return false; }
 
             const endpoint = id ? 'items/update' : 'items';
             const res = await apiPost(endpoint, data);
-            if (res.success) { toast(id ? '物品已更新' : '物品已添加'); closeItemModal(); renderView(); } else toast(res.message, 'error');
+            if (res.success) {
+                if (sourceShoppingId > 0) {
+                    const delRes = await apiPost('shopping-list/delete', { id: sourceShoppingId });
+                    if (!delRes.success) {
+                        toast('物品已入库，但购物清单删除失败，请手动处理', 'error');
+                    }
+                }
+                toast(sourceShoppingId > 0 ? '已保存入库' : (id ? '物品已更新' : '物品已添加'));
+                closeItemModal(true);
+                renderView();
+            } else toast(res.message, 'error');
             return false;
         }
 
@@ -3225,7 +5407,60 @@ getDB(); // 确保数据库初始化
             if (res.success) { toast('已移入回收站'); renderView(); } else toast(res.message, 'error');
         }
 
-        function closeItemModal() { document.getElementById('itemModal').classList.remove('show'); }
+        async function completeReminder(id, reminderId) {
+            const res = await apiPost('items/complete-reminder', { id, reminder_id: reminderId });
+            if (!res.success) {
+                toast(res.message || '提醒操作失败', 'error');
+                return;
+            }
+            const nextDateText = res.next_date ? `，下次提醒：${res.next_date}` : '';
+            toast(`提醒已完成${nextDateText}`);
+            renderView();
+        }
+
+        async function undoReminder(id, reminderId) {
+            const res = await apiPost('items/undo-reminder', { id, reminder_id: reminderId });
+            if (!res.success) {
+                toast(res.message || '撤销失败', 'error');
+                return;
+            }
+            toast(res.message || '已撤销提醒完成状态');
+            renderView();
+        }
+
+        function closeItemModal(force = false) {
+            if (!force && hasItemFormUnsavedChanges()) {
+                openItemUnsavedConfirm();
+                return false;
+            }
+            document.getElementById('itemModal').classList.remove('show');
+            closeItemUnsavedConfirm();
+            clearItemFormTrack();
+            return true;
+        }
+
+        function syncReminderFields() {
+            const dateInput = document.getElementById('itemReminderDate');
+            const everyInput = document.getElementById('itemReminderEvery');
+            const unitSelect = document.getElementById('itemReminderUnit');
+            const nextInput = document.getElementById('itemReminderNext');
+            if (!dateInput || !everyInput || !unitSelect || !nextInput) return;
+            const hasDate = !!dateInput.value;
+            if (!hasDate) {
+                everyInput.disabled = true;
+                unitSelect.disabled = true;
+                nextInput.value = '';
+                refreshDateInputPlaceholderDisplay(document.getElementById('itemForm'));
+                return;
+            }
+            if (!['day', 'week', 'year'].includes(unitSelect.value)) unitSelect.value = 'day';
+            const currentEvery = parseInt(everyInput.value || '1', 10);
+            if (!Number.isFinite(currentEvery) || currentEvery < 1) everyInput.value = '1';
+            everyInput.disabled = false;
+            unitSelect.disabled = false;
+            if (!nextInput.value) nextInput.value = dateInput.value;
+            refreshDateInputPlaceholderDisplay(document.getElementById('itemForm'));
+        }
 
         function resetUploadZone() {
             document.getElementById('uploadPreview').classList.add('hidden');
@@ -3267,6 +5502,486 @@ getDB(); // 确保数据库初始化
                 toast('上传失败：网络异常或服务器限制导致中断', 'error');
             }
             input.value = '';
+        }
+
+        // ============================================================
+        // 🛒 购物清单
+        // ============================================================
+        function shoppingStatusKey(status) {
+            const s = String(status || '').trim().toLowerCase();
+            if (s === 'pending_receipt' || s === '待收货') return 'pending_receipt';
+            return 'pending_purchase';
+        }
+
+        function shoppingStatusMeta(status) {
+            const key = shoppingStatusKey(status);
+            if (key === 'pending_receipt') {
+                return { key, label: '待收货', badge: 'badge-lent', icon: 'ri-truck-line', section: '待收货' };
+            }
+            return { key: 'pending_purchase', label: '待购买', badge: 'badge-warning', icon: 'ri-shopping-cart-2-line', section: '待购买' };
+        }
+
+        function updateShoppingToggleStatusButton() {
+            const btn = document.getElementById('shoppingToggleStatusBtn');
+            const label = document.getElementById('shoppingToggleStatusLabel');
+            const id = Number(document.getElementById('shoppingId')?.value || 0);
+            const statusInput = document.getElementById('shoppingStatus');
+            if (!btn || !label || !statusInput)
+                return;
+            if (id <= 0) {
+                btn.classList.add('hidden');
+                btn.dataset.targetStatus = '';
+                return;
+            }
+            const current = shoppingStatusKey(statusInput.value);
+            const target = current === 'pending_purchase' ? 'pending_receipt' : 'pending_purchase';
+            btn.dataset.targetStatus = target;
+            label.textContent = target === 'pending_receipt' ? '已购买' : '待购买';
+            btn.classList.remove('hidden');
+        }
+
+        function shoppingPriorityMeta(priority) {
+            const p = String(priority || 'normal').toLowerCase();
+            if (p === 'high') return { label: '高优先', badge: 'badge-danger', icon: 'ri-flashlight-line' };
+            if (p === 'low') return { label: '低优先', badge: 'badge-archived', icon: 'ri-hourglass-line' };
+            return { label: '普通', badge: 'badge-warning', icon: 'ri-list-check-line' };
+        }
+
+        function openShoppingListAndEdit(id) {
+            const targetId = Number(id || 0);
+            if (targetId <= 0) {
+                switchView('shopping-list');
+                return;
+            }
+            App.pendingShoppingEditId = targetId;
+            switchView('shopping-list');
+        }
+
+        async function renderShoppingList(container) {
+            await loadBaseData();
+            const res = await api('shopping-list');
+            if (!res.success) { container.innerHTML = '<p class="text-red-400">购物清单加载失败</p>'; return; }
+
+            const list = (Array.isArray(res.data) ? res.data : []).map(item => ({
+                ...item,
+                status: shoppingStatusKey(item.status)
+            }));
+            App.shoppingList = list;
+            const totalQty = list.reduce((sum, x) => sum + Math.max(1, Number(x.quantity || 1)), 0);
+            const highCount = list.filter(x => String(x.priority || '') === 'high').length;
+            const budgetTotal = list.reduce((sum, x) => sum + (Math.max(1, Number(x.quantity || 1)) * Math.max(0, Number(x.planned_price || 0))), 0);
+            const pendingPurchaseItems = list.filter(x => shoppingStatusKey(x.status) === 'pending_purchase');
+            const pendingReceiptItems = list.filter(x => shoppingStatusKey(x.status) === 'pending_receipt');
+            const renderShoppingCards = (items, startDelay = 0) => items.map((item, i) => {
+                const p = shoppingPriorityMeta(item.priority);
+                const s = shoppingStatusMeta(item.status);
+                const qty = Math.max(1, Number(item.quantity || 1));
+                const price = Math.max(0, Number(item.planned_price || 0));
+                const reminderDate = item.reminder_date || '';
+                const reminderNote = String(item.reminder_note || '').trim();
+                const reminderNoteHtml = reminderNote ? `提醒：${esc(reminderNote)}` : '&nbsp;';
+                return `
+                <div class="glass glass-hover rounded-2xl p-4 anim-up" style="animation-delay:${(startDelay + i) * 25}ms">
+                    <div class="flex items-start justify-between gap-3 mb-3">
+                        <div class="min-w-0">
+                            <h3 class="font-semibold text-white truncate">${esc(item.name)}</h3>
+                            <div class="flex flex-wrap items-center gap-2 mt-1">
+                                <span class="badge ${s.badge}"><i class="${s.icon} mr-1"></i>${s.label}</span>
+                                <span class="badge ${p.badge}"><i class="${p.icon} mr-1"></i>${p.label}</span>
+                                <span class="text-xs text-slate-500">x${qty}</span>
+                                ${item.category_name ? `<span class="text-xs text-slate-500">${item.category_icon || '📦'} ${esc(item.category_name)}</span>` : '<span class="text-xs text-slate-600">未分类</span>'}
+                                ${price > 0 ? `<span class="text-xs text-amber-400">预算 ¥${price.toLocaleString()}</span>` : ''}
+                            </div>
+                        </div>
+                        <span class="text-[11px] text-slate-600 flex-shrink-0">${String(item.created_at || '').slice(0, 10)}</span>
+                    </div>
+                    ${reminderDate ? `<p class="text-xs text-cyan-300 mb-1"><i class="ri-notification-3-line mr-1"></i>${reminderDate} · ${reminderDueLabel(reminderDate)}</p>` : '<p class="text-xs text-slate-600 mb-1">未设置提醒</p>'}
+                    <p class="text-xs text-slate-400 mb-2 truncate h-4 leading-4">${reminderNoteHtml}</p>
+                    ${item.notes ? `<p class="text-xs text-slate-500 mb-3 truncate">${esc(item.notes)}</p>` : '<p class="text-xs text-slate-600 mb-3">暂无备注</p>'}
+                    <div class="flex gap-2">
+                        <button onclick="convertShoppingItem(${item.id})" class="btn btn-primary btn-sm flex-1"><i class="ri-shopping-bag-3-line"></i>已购买入库</button>
+                        <button onclick="editShoppingItem(${item.id})" class="btn btn-ghost btn-sm flex-1"><i class="ri-edit-line"></i>编辑</button>
+                        <button onclick="deleteShoppingItem(${item.id},'${esc(item.name)}')" class="btn btn-danger btn-sm flex-1"><i class="ri-delete-bin-line"></i>删除</button>
+                    </div>
+                </div>`;
+            }).join('');
+
+            container.innerHTML = `
+        <div class="glass rounded-2xl p-4 mb-6 anim-up">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+                <div class="flex flex-wrap items-center gap-x-5 gap-y-2">
+                    <span class="text-sm text-slate-400"><i class="ri-shopping-cart-2-line mr-1 text-sky-400"></i>共 ${list.length} 条清单</span>
+                    <span class="text-sm text-slate-400"><i class="ri-shopping-basket-line mr-1 text-amber-400"></i>待购买 ${pendingPurchaseItems.length}</span>
+                    <span class="text-sm text-slate-400"><i class="ri-truck-line mr-1 text-indigo-400"></i>待收货 ${pendingReceiptItems.length}</span>
+                    <span class="text-sm text-slate-400"><i class="ri-stack-line mr-1 text-violet-400"></i>计划件数 ${totalQty}</span>
+                    <span class="text-sm text-slate-400"><i class="ri-flashlight-line mr-1 text-red-400"></i>高优先 ${highCount}</span>
+                    <span class="text-sm text-slate-400"><i class="ri-money-cny-circle-line mr-1 text-amber-400"></i>预算约 ¥${budgetTotal.toLocaleString()}</span>
+                </div>
+                <button onclick="openAddShoppingItem()" class="btn btn-primary btn-sm"><i class="ri-add-line"></i>添加清单</button>
+            </div>
+        </div>
+
+        <div class="space-y-6">
+            <div>
+                <div class="flex items-center justify-between mb-3">
+                    <h3 class="font-semibold text-white flex items-center gap-2"><i class="ri-shopping-basket-line text-amber-400"></i>待购买</h3>
+                    <span class="text-xs text-slate-500">${pendingPurchaseItems.length} 条</span>
+                </div>
+                ${pendingPurchaseItems.length > 0 ? `
+                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                    ${renderShoppingCards(pendingPurchaseItems, 0)}
+                </div>` : '<p class="text-slate-500 text-sm text-center py-5 glass rounded-xl border border-white/5">暂无待购买清单</p>'}
+            </div>
+
+            <div>
+                <div class="flex items-center justify-between mb-3">
+                    <h3 class="font-semibold text-white flex items-center gap-2"><i class="ri-truck-line text-indigo-400"></i>待收货</h3>
+                    <span class="text-xs text-slate-500">${pendingReceiptItems.length} 条</span>
+                </div>
+                ${pendingReceiptItems.length > 0 ? `
+                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                    ${renderShoppingCards(pendingReceiptItems, pendingPurchaseItems.length)}
+                </div>` : ''}
+            </div>
+        </div>
+        ${list.length === 0 ? `
+        <div class="empty-state anim-up">
+            <i class="ri-shopping-cart-line"></i>
+            <h3 class="text-xl font-semibold text-slate-400 mb-2">购物清单为空</h3>
+            <p class="text-slate-500 text-sm mb-5">把未来想买的东西先记在这里，购买后可一键转入物品管理。</p>
+            <button onclick="openAddShoppingItem()" class="btn btn-primary"><i class="ri-add-line"></i>添加第一条清单</button>
+        </div>` : ''}
+    `;
+
+            const pendingEditId = Number(App.pendingShoppingEditId || 0);
+            if (pendingEditId > 0) {
+                App.pendingShoppingEditId = 0;
+                await editShoppingItem(pendingEditId);
+            }
+        }
+
+        let shoppingSimilarSearchTimer = null;
+        let shoppingSimilarSearchSeq = 0;
+        let shoppingSimilarSortMode = 'date_desc';
+        let shoppingSimilarLatestItems = [];
+        let shoppingSimilarLatestKeyword = '';
+        let shoppingSimilarLatestState = 'idle';
+
+        function updateShoppingSimilarSortButton() {
+            const label = document.getElementById('shoppingSimilarSortLabel');
+            if (!label)
+                return;
+            label.textContent = shoppingSimilarSortMode === 'price_asc' ? '最低价' : '最新日期';
+        }
+
+        function sortShoppingSimilarItems(items) {
+            const arr = Array.isArray(items) ? [...items] : [];
+            if (shoppingSimilarSortMode === 'price_asc') {
+                arr.sort((a, b) => {
+                    const pa = Number(a.purchase_price || 0);
+                    const pb = Number(b.purchase_price || 0);
+                    const va = pa > 0 ? pa : Number.POSITIVE_INFINITY;
+                    const vb = pb > 0 ? pb : Number.POSITIVE_INFINITY;
+                    if (va !== vb)
+                        return va - vb;
+                    const da = String(a.purchase_date || a.updated_at || '');
+                    const db = String(b.purchase_date || b.updated_at || '');
+                    return db.localeCompare(da);
+                });
+                return arr;
+            }
+            arr.sort((a, b) => {
+                const da = String(a.purchase_date || a.updated_at || '');
+                const db = String(b.purchase_date || b.updated_at || '');
+                if (da !== db)
+                    return db.localeCompare(da);
+                const pa = Number(a.purchase_price || 0);
+                const pb = Number(b.purchase_price || 0);
+                return (pa > 0 ? pa : Number.POSITIVE_INFINITY) - (pb > 0 ? pb : Number.POSITIVE_INFINITY);
+            });
+            return arr;
+        }
+
+        function toggleShoppingSimilarSortMode() {
+            shoppingSimilarSortMode = shoppingSimilarSortMode === 'price_asc' ? 'date_desc' : 'price_asc';
+            updateShoppingSimilarSortButton();
+            if (shoppingSimilarLatestState === 'done') {
+                renderShoppingSimilarItemPrices(shoppingSimilarLatestItems, 'done', shoppingSimilarLatestKeyword);
+            }
+        }
+
+        function renderShoppingSimilarItemPrices(items = [], state = 'idle', keyword = '') {
+            const box = document.getElementById('shoppingPriceReferenceBox');
+            const list = document.getElementById('shoppingPriceReferenceList');
+            if (!box || !list)
+                return;
+            const q = String(keyword || '').trim();
+            shoppingSimilarLatestKeyword = q;
+            shoppingSimilarLatestState = state;
+            if (!q) {
+                shoppingSimilarLatestItems = [];
+                box.classList.add('hidden');
+                list.innerHTML = '';
+                return;
+            }
+            box.classList.remove('hidden');
+            updateShoppingSimilarSortButton();
+            if (state === 'loading') {
+                list.innerHTML = '<p class="text-xs text-slate-500">正在匹配历史物品...</p>';
+                return;
+            }
+            if (state === 'error') {
+                list.innerHTML = '<p class="text-xs text-red-400">参考价加载失败，请稍后重试</p>';
+                return;
+            }
+            const dataItems = Array.isArray(items) ? items : [];
+            shoppingSimilarLatestItems = dataItems;
+            const sortedItems = sortShoppingSimilarItems(dataItems);
+            if (sortedItems.length === 0) {
+                list.innerHTML = '<p class="text-xs text-slate-500">未找到相似物品，可按当前预算填写价格</p>';
+                return;
+            }
+            list.innerHTML = sortedItems.map(item => {
+                const name = String(item.name || '').trim() || '未命名物品';
+                const from = String(item.purchase_from || '').trim();
+                const price = Number(item.purchase_price || 0);
+                const purchaseDate = String(item.purchase_date || '').slice(0, 10);
+                const priceHtml = price > 0
+                    ? `<span class="text-amber-300 font-medium">¥${price.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })}</span>`
+                    : '<span class="text-slate-500">未记录价格</span>';
+                const metaPieces = [];
+                if (from)
+                    metaPieces.push(esc(from));
+                metaPieces.push(purchaseDate ? esc(purchaseDate) : '日期未知');
+                const metaHtml = `<span class="text-[11px] text-slate-500">${metaPieces.join(' · ')}</span>`;
+                return `<div class="flex items-center justify-between gap-3 text-xs">
+                    <span class="min-w-0 truncate text-slate-300">${esc(name)}</span>
+                    <span class="flex items-center gap-2 flex-shrink-0">${priceHtml}${metaHtml}</span>
+                </div>`;
+            }).join('');
+        }
+
+        function scheduleRefreshShoppingSimilarItemPrices() {
+            if (shoppingSimilarSearchTimer)
+                clearTimeout(shoppingSimilarSearchTimer);
+            shoppingSimilarSearchTimer = setTimeout(() => {
+                refreshShoppingSimilarItemPrices();
+            }, 220);
+        }
+
+        async function refreshShoppingSimilarItemPrices() {
+            const nameInput = document.getElementById('shoppingName');
+            const keyword = String(nameInput?.value || '').trim();
+            if (!keyword) {
+                shoppingSimilarSearchSeq++;
+                renderShoppingSimilarItemPrices([], 'idle', '');
+                return;
+            }
+            const seq = ++shoppingSimilarSearchSeq;
+            renderShoppingSimilarItemPrices([], 'loading', keyword);
+            const res = await api(`shopping-list/similar-items&name=${encodeURIComponent(keyword)}`);
+            if (seq !== shoppingSimilarSearchSeq)
+                return;
+            if (!res || !res.success) {
+                renderShoppingSimilarItemPrices([], 'error', keyword);
+                return;
+            }
+            renderShoppingSimilarItemPrices(Array.isArray(res.data) ? res.data : [], 'done', keyword);
+        }
+
+        async function openAddShoppingItem() {
+            document.getElementById('shoppingModalTitle').textContent = '添加清单';
+            document.getElementById('shoppingForm').reset();
+            document.getElementById('shoppingId').value = '';
+            document.getElementById('shoppingConvertBtn')?.classList.add('hidden');
+            document.getElementById('shoppingToggleStatusBtn')?.classList.add('hidden');
+            document.getElementById('shoppingCategoryId').value = '0';
+            document.getElementById('shoppingQty').value = '1';
+            document.getElementById('shoppingStatus').value = 'pending_purchase';
+            document.getElementById('shoppingPrice').value = '0';
+            document.getElementById('shoppingPriority').value = 'normal';
+            document.getElementById('shoppingReminderDate').value = '';
+            document.getElementById('shoppingReminderNote').value = '';
+            updateShoppingToggleStatusButton();
+            shoppingSimilarSortMode = 'date_desc';
+            updateShoppingSimilarSortButton();
+            shoppingSimilarSearchSeq++;
+            shoppingSimilarLatestItems = [];
+            shoppingSimilarLatestKeyword = '';
+            shoppingSimilarLatestState = 'idle';
+            if (shoppingSimilarSearchTimer)
+                clearTimeout(shoppingSimilarSearchTimer);
+            renderShoppingSimilarItemPrices([], 'idle', '');
+            document.getElementById('shoppingModal').classList.add('show');
+            refreshDateInputPlaceholderDisplay(document.getElementById('shoppingForm'));
+        }
+
+        async function editShoppingItem(id) {
+            let item = App.shoppingList.find(x => x.id === id);
+            if (!item) {
+                const res = await api('shopping-list');
+                if (!res.success) { toast('购物清单加载失败', 'error'); return; }
+                App.shoppingList = Array.isArray(res.data) ? res.data : [];
+                item = App.shoppingList.find(x => x.id === id);
+            }
+            if (!item) { toast('清单项不存在', 'error'); return; }
+
+            document.getElementById('shoppingModalTitle').textContent = '编辑清单';
+            document.getElementById('shoppingId').value = item.id;
+            document.getElementById('shoppingConvertBtn')?.classList.remove('hidden');
+            document.getElementById('shoppingCategoryId').value = String(Number(item.category_id || 0));
+            document.getElementById('shoppingName').value = item.name || '';
+            document.getElementById('shoppingQty').value = Math.max(1, Number(item.quantity || 1));
+            document.getElementById('shoppingStatus').value = shoppingStatusKey(item.status);
+            document.getElementById('shoppingPriority').value = ['high', 'normal', 'low'].includes(item.priority) ? item.priority : 'normal';
+            document.getElementById('shoppingPrice').value = Number(item.planned_price || 0);
+            document.getElementById('shoppingReminderDate').value = item.reminder_date || '';
+            document.getElementById('shoppingReminderNote').value = item.reminder_note || '';
+            document.getElementById('shoppingNotes').value = item.notes || '';
+            updateShoppingToggleStatusButton();
+            shoppingSimilarSortMode = 'date_desc';
+            updateShoppingSimilarSortButton();
+            document.getElementById('shoppingModal').classList.add('show');
+            refreshDateInputPlaceholderDisplay(document.getElementById('shoppingForm'));
+            await refreshShoppingSimilarItemPrices();
+        }
+
+        async function toggleCurrentShoppingStatus() {
+            const id = Number(document.getElementById('shoppingId')?.value || 0);
+            if (id <= 0) {
+                toast('请先保存清单后再切换状态', 'error');
+                return;
+            }
+            const btn = document.getElementById('shoppingToggleStatusBtn');
+            const statusInput = document.getElementById('shoppingStatus');
+            if (!btn || !statusInput)
+                return;
+            const target = shoppingStatusKey(btn.dataset.targetStatus || '');
+            const endpoint = 'shopping-list/update-status';
+            btn.disabled = true;
+            try {
+                const res = await apiPost(endpoint, { id, status: target });
+                if (!res.success) {
+                    toast(res.message || '状态切换失败', 'error');
+                    return;
+                }
+                statusInput.value = target;
+                updateShoppingToggleStatusButton();
+                const localItem = App.shoppingList.find(x => x.id === id);
+                if (localItem)
+                    localItem.status = target;
+                toast(`已切换为${target === 'pending_receipt' ? '待收货' : '待购买'}`);
+                closeShoppingModal();
+                renderView();
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        function convertCurrentShoppingItem() {
+            const id = Number(document.getElementById('shoppingId')?.value || 0);
+            if (id <= 0) {
+                toast('请先保存清单后再入库', 'error');
+                return;
+            }
+            closeShoppingModal();
+            convertShoppingItem(id);
+        }
+
+        async function saveShoppingItem(e) {
+            e.preventDefault();
+            const id = document.getElementById('shoppingId').value;
+            const name = document.getElementById('shoppingName').value.trim();
+            if (!name) { toast('请输入清单名称', 'error'); return false; }
+            const data = {
+                id: id ? +id : undefined,
+                name,
+                quantity: Math.max(1, parseInt(document.getElementById('shoppingQty').value || '1', 10)),
+                status: shoppingStatusKey(document.getElementById('shoppingStatus').value),
+                category_id: +document.getElementById('shoppingCategoryId').value,
+                priority: document.getElementById('shoppingPriority').value,
+                planned_price: Math.max(0, Number(document.getElementById('shoppingPrice').value || 0)),
+                reminder_date: document.getElementById('shoppingReminderDate').value,
+                reminder_note: document.getElementById('shoppingReminderNote').value.trim(),
+                notes: document.getElementById('shoppingNotes').value.trim()
+            };
+            const endpoint = id ? 'shopping-list/update' : 'shopping-list';
+            const res = await apiPost(endpoint, data);
+            if (res.success) {
+                toast(id ? '购物清单已更新' : '已加入购物清单');
+                closeShoppingModal();
+                renderView();
+            } else {
+                toast(res.message || '保存失败', 'error');
+            }
+            return false;
+        }
+
+        async function deleteShoppingItem(id, name) {
+            if (!confirm(`确定删除购物清单「${name}」？`)) return;
+            const res = await apiPost('shopping-list/delete', { id });
+            if (res.success) {
+                toast('已删除');
+                renderView();
+            } else {
+                toast(res.message || '删除失败', 'error');
+            }
+        }
+
+        async function convertShoppingItem(id) {
+            let item = App.shoppingList.find(x => x.id === id);
+            if (!item) {
+                const res = await api('shopping-list');
+                if (!res.success) { toast('购物清单加载失败', 'error'); return; }
+                App.shoppingList = Array.isArray(res.data) ? res.data : [];
+                item = App.shoppingList.find(x => x.id === id);
+            }
+            if (!item) { toast('清单项不存在', 'error'); return; }
+
+            const now = new Date();
+            const pad = n => String(n).padStart(2, '0');
+            const today = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+
+            document.getElementById('itemModalTitle').textContent = '已购买入库';
+            document.getElementById('itemForm').reset();
+            document.getElementById('itemId').value = '';
+            document.getElementById('itemImage').value = '';
+            document.getElementById('itemSourceShoppingId').value = item.id;
+            document.getElementById('itemName').value = item.name || '';
+            document.getElementById('itemQuantity').value = Math.max(1, Number(item.quantity || 1));
+            document.getElementById('itemPrice').value = Math.max(0, Number(item.planned_price || 0));
+            document.getElementById('itemDate').value = today;
+            document.getElementById('itemExpiry').value = '';
+            document.getElementById('itemReminderDate').value = '';
+            document.getElementById('itemReminderEvery').value = '1';
+            document.getElementById('itemReminderUnit').value = 'day';
+            document.getElementById('itemReminderNext').value = '';
+            document.getElementById('itemReminderNote').value = '';
+            document.getElementById('itemBarcode').value = '';
+            document.getElementById('itemTags').value = '';
+            document.getElementById('itemNotes').value = item.notes || '';
+            syncReminderFields();
+
+            resetUploadZone();
+            await populateSelects({ status: getDefaultStatusKey(), purchaseFrom: '' });
+            document.getElementById('itemCategory').value = Number(item.category_id || 0);
+            document.getElementById('itemLocation').value = 0;
+            document.getElementById('itemModal').classList.add('show');
+            setItemSubmitLabel('保存入库');
+            refreshDateInputPlaceholderDisplay(document.getElementById('itemForm'));
+            closeItemUnsavedConfirm();
+            markItemFormClean();
+        }
+
+        function closeShoppingModal() {
+            shoppingSimilarSearchSeq++;
+            shoppingSimilarLatestItems = [];
+            shoppingSimilarLatestKeyword = '';
+            shoppingSimilarLatestState = 'idle';
+            if (shoppingSimilarSearchTimer)
+                clearTimeout(shoppingSimilarSearchTimer);
+            renderShoppingSimilarItemPrices([], 'idle', '');
+            document.getElementById('shoppingModal').classList.remove('show');
         }
 
         // ============================================================
@@ -3420,12 +6135,14 @@ getDB(); // 确保数据库初始化
                 <div class="glass glass-hover rounded-2xl p-5 anim-up" style="animation-delay:${(i + 1) * 40}ms">
                     <div class="flex items-center gap-3 mb-3">
                         <div class="w-10 h-10 rounded-xl bg-amber-500/10 flex items-center justify-center"><i class="ri-map-pin-2-fill text-amber-400 text-xl"></i></div>
-                        <div>
-                            <h3 class="font-semibold text-white">${esc(loc.name)}</h3>
-                            <p class="text-xs text-slate-500">${loc.item_count} 件物品</p>
+                        <div class="min-w-0 flex-1 h-10 flex flex-col justify-center">
+                            <div class="flex items-center gap-2 min-w-0 leading-5">
+                                <h3 class="font-semibold text-white truncate max-w-[45%]">${esc(loc.name)}</h3>
+                                ${loc.description ? `<p class="text-xs text-slate-500 truncate flex-1 leading-5">${esc(loc.description)}</p>` : `<p class="text-xs text-slate-600 truncate flex-1 leading-5">暂无描述</p>`}
+                            </div>
+                            <p class="text-xs text-slate-500 leading-5">${loc.item_count} 件物品</p>
                         </div>
                     </div>
-                    ${loc.description ? `<p class="text-xs text-slate-500 mb-3">${esc(loc.description)}</p>` : ''}
                     <div class="flex gap-2">
                         <button onclick="viewItemsByLocation(${loc.id})" class="btn btn-ghost btn-sm flex-1" style="color:#38bdf8" title="查看物品"><i class="ri-archive-line"></i>物品</button>
                         <button onclick="editLocation(${loc.id})" class="btn btn-ghost btn-sm flex-1"><i class="ri-edit-line"></i>编辑</button>
@@ -3536,14 +6253,6 @@ getDB(); // 确保数据库初始化
                 <button onclick="exportCSV()" class="btn btn-ghost w-full"><i class="ri-file-download-line"></i>导出 CSV 文件</button>
             </div>
 
-            <div class="glass rounded-2xl p-6 anim-up" style="animation-delay:0.4s">
-                <div class="flex items-center gap-3 mb-4">
-                    <div class="w-12 h-12 rounded-xl bg-violet-500/10 flex items-center justify-center"><i class="ri-slideshow-3-line text-2xl text-violet-400"></i></div>
-                    <div><h3 class="font-semibold text-white text-lg">展示模式</h3><p class="text-sm text-slate-500">一键载入演示数据，快速体验筛选、状态、过期、统计等完整功能</p></div>
-                </div>
-                <button onclick="loadDemoMode()" class="btn btn-primary w-full" style="background:linear-gradient(135deg,#7c3aed,#4f46e5)"><i class="ri-slideshow-line"></i>加载展示数据</button>
-            </div>
-
             <div class="glass rounded-2xl p-6 anim-up" style="animation-delay:0.5s">
                 <div class="flex items-center gap-3 mb-4">
                     <div class="w-12 h-12 rounded-xl bg-red-500/10 flex items-center justify-center"><i class="ri-delete-bin-6-line text-2xl text-red-400"></i></div>
@@ -3592,8 +6301,8 @@ getDB(); // 确保数据库初始化
             const items = res.data.items;
             const statusMap = getStatusMap();
             const statusLabelByKey = key => (statusMap[key] ? statusMap[key][0] : (key || ''));
-            const header = ['ID', '名称', '分类', '位置', '数量', '价格', '购入渠道', '购入日期', '过期日期', '条码', '标签', '状态', '描述', '备注'];
-            const rows = items.map(i => [i.id, i.name, i.category_name || '', i.location_name || '', i.quantity, i.purchase_price, i.purchase_from || '', i.purchase_date, i.expiry_date || '', i.barcode, i.tags, statusLabelByKey(i.status), i.description, i.notes || ''].map(csvCell));
+            const header = ['ID', '名称', '分类', '位置', '数量', '价格', '购入渠道', '购入日期', '过期日期', '条码', '标签', '状态', '备注'];
+            const rows = items.map(i => [i.id, i.name, i.category_name || '', i.location_name || '', i.quantity, i.purchase_price, i.purchase_from || '', i.purchase_date, i.expiry_date || '', i.barcode, i.tags, statusLabelByKey(i.status), i.notes || ''].map(csvCell));
             const csv = '\uFEFF' + [header.join(','), ...rows.map(r => r.join(','))].join('\n');
             downloadBlob(new Blob([csv], { type: 'text/csv;charset=utf-8' }), `items_${dateStr()}.csv`);
             toast('CSV 导出成功');
@@ -3667,7 +6376,7 @@ getDB(); // 确保数据库初始化
         }
 
         function downloadManualImportTemplate() {
-            const header = ['名称', '分类', '位置', '数量', '状态', '购入价格', '购入渠道', '购入日期', '过期日期', '条码/序列号', '标签', '描述', '备注'];
+            const header = ['名称', '分类', '位置', '数量', '状态', '购入价格', '购入渠道', '购入日期', '过期日期', '条码/序列号', '标签', '备注'];
             const sample = [
                 '示例物品（必填）',
                 '电子设备（可选）',
@@ -3680,7 +6389,6 @@ getDB(); // 确保数据库初始化
                 '2026/12/31（可选）',
                 'SN-001（可选）',
                 '示例,批量导入（可选）',
-                '这里是描述（可选）',
                 '这里是备注（可选）'
             ];
             const csv = '\uFEFF' + [header, sample].map(r => r.map(csvCell).join(',')).join('\n');
@@ -3804,8 +6512,6 @@ getDB(); // 确保数据库初始化
                     'barcode': 'barcode',
                     '标签': 'tags',
                     'tags': 'tags',
-                    '描述': 'description',
-                    'description': 'description',
                     '备注': 'notes',
                     'notes': 'notes'
                 };
@@ -3922,7 +6628,6 @@ getDB(); // 确保数据库初始化
                         expiry_date: expiryDate,
                         barcode: getCell(row, 'barcode'),
                         tags: getCell(row, 'tags'),
-                        description: getCell(row, 'description'),
                         notes: getCell(row, 'notes')
                     });
                 }
@@ -4017,16 +6722,22 @@ getDB(); // 确保数据库初始化
             // 打开添加表单并填入被复制物品的数据（不含 ID，图片保留引用）
             document.getElementById('itemModalTitle').textContent = '复制物品';
             document.getElementById('itemId').value = '';  // 无 ID = 新建
+            document.getElementById('itemSourceShoppingId').value = '';
             document.getElementById('itemName').value = item.name + ' (副本)';
             document.getElementById('itemQuantity').value = item.quantity;
             document.getElementById('itemPrice').value = item.purchase_price;
             document.getElementById('itemDate').value = item.purchase_date;
             document.getElementById('itemExpiry').value = item.expiry_date || '';
+            document.getElementById('itemReminderDate').value = item.reminder_date || '';
+            document.getElementById('itemReminderEvery').value = item.reminder_cycle_value || 1;
+            document.getElementById('itemReminderUnit').value = ['day', 'week', 'year'].includes(item.reminder_cycle_unit) ? item.reminder_cycle_unit : 'day';
+            document.getElementById('itemReminderNext').value = item.reminder_next_date || item.reminder_date || '';
+            document.getElementById('itemReminderNote').value = item.reminder_note || '';
             document.getElementById('itemBarcode').value = item.barcode;
             document.getElementById('itemTags').value = item.tags;
-            document.getElementById('itemDesc').value = item.description;
             document.getElementById('itemImage').value = item.image || '';
             document.getElementById('itemNotes').value = item.notes || '';
+            syncReminderFields();
 
             resetUploadZone();
             if (item.image) {
@@ -4040,6 +6751,10 @@ getDB(); // 确保数据库初始化
             document.getElementById('itemCategory').value = item.category_id;
             document.getElementById('itemLocation').value = item.location_id;
             document.getElementById('itemModal').classList.add('show');
+            setItemSubmitLabel('保存');
+            refreshDateInputPlaceholderDisplay(document.getElementById('itemForm'));
+            closeItemUnsavedConfirm();
+            markItemFormClean();
             toast('已复制物品资料，请确认后保存');
         }
 
@@ -4209,7 +6924,6 @@ getDB(); // 确保数据库初始化
                 ${item.barcode ? `<div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">条码/序列号</p><p class="text-sm text-white font-mono">${esc(item.barcode)}</p></div>` : ''}
                 <div class="p-3 rounded-xl bg-red-500/5"><p class="text-xs text-slate-500 mb-1">删除时间</p><p class="text-sm text-red-400">${item.deleted_at || '-'}</p></div>
             </div>
-            ${item.description ? `<div class="mb-4"><p class="text-xs text-slate-500 mb-1">描述</p><p class="text-sm text-slate-300 whitespace-pre-wrap">${esc(item.description)}</p></div>` : ''}
             ${item.notes ? `<div class="mb-4"><p class="text-xs text-slate-500 mb-1">备注</p><p class="text-sm text-slate-400 whitespace-pre-wrap">${esc(item.notes)}</p></div>` : ''}
             ${item.tags ? `<div class="mb-4"><p class="text-xs text-slate-500 mb-2">标签</p><div class="flex flex-wrap gap-2">${item.tags.split(',').map(t => `<span class="badge bg-white/5 text-slate-300">${esc(t.trim())}</span>`).join('')}</div></div>` : ''}
             <div class="text-xs text-slate-600 mt-4 pt-4 border-t border-white/5">
@@ -4253,6 +6967,44 @@ getDB(); // 确保数据库初始化
 
         // ---------- 更新记录数据 ----------
         const CHANGELOG = [
+            {
+                version: 'v1.4.0', date: '2026-02-12', title: '多用户登录与管理 + Demo 一键体验',
+                changes: [
+                    '新增账号体系：登录/注册/退出登录，按用户隔离物品数据（每用户独立 SQLite）',
+                    '新增管理员角色与默认管理员账号（admin），支持历史账号自动升级为管理员',
+                    '注册流程新增验证问题与答案，用于后续密码找回',
+                    '新增“忘记密码”流程：先查询验证问题，再校验答案并重置密码',
+                    '新增管理员“用户管理”页面：查看用户、角色、物品种类数/总件数、最近登录时间，并可重置用户密码',
+                    '登录页新增 Demo 按钮，点击即可一键进入展示环境（无需预填账号密码）',
+                    '新增 auth/demo-login 接口：自动创建/同步测试账号并装载展示模式数据',
+                    '展示模式数据重构为统一函数 loadDemoDataIntoDb：覆盖状态统计、过期提醒、循环提醒、购物提醒、回收站样例等场景',
+                    'system/load-demo 改为复用统一展示数据函数，避免多处演示数据定义不一致'
+                ]
+            },
+            {
+                version: 'v1.3.0', date: '2026-02-11', title: '购物清单增强 + 备忘提醒重构 + 交互统一',
+                changes: [
+                    '新增购物清单模块（页面、弹窗、CRUD、预算与优先级），并支持提醒日期与提醒备注',
+                    '仪表盘「循环提醒」更名为「备忘提醒」，合并展示循环提醒与购物清单提醒',
+                    '备忘提醒中的购物清单项支持「查看清单」直达并自动打开对应编辑弹窗',
+                    '编辑清单弹窗新增左下角「已购买入库」按钮，可直接进入该条目的入库流程',
+                    '入库流程复用物品编辑表单，提交文案改为「保存入库」，保存成功后自动移除清单项',
+                    '购物清单新增状态字段（待购买/待收货），并按状态分组显示（待购买在上）',
+                    '编辑清单新增状态切换按钮（已购买/待购买），点击后自动保存并关闭弹窗',
+                    '待收货分组为空时不再显示“暂无待收货清单”占位文案',
+                    '循环提醒升级为实例化记录（item_reminder_instances），支持待完成/已完成/撤销',
+                    '点击「待完成」后状态变为「已完成」，并自动生成下一次提醒记录',
+                    '已完成状态新增「撤销」，可回滚为待完成并撤销对应生成的下一条提醒记录',
+                    '物品编辑支持手动修改下次提醒日期，循环提醒字段布局与顺序统一优化',
+                    '日期输入空值统一占位为 ____年/__月/__日，并修复空值/有值切换时输入框尺寸跳动',
+                    '优化位置管理描述显示、购物清单提醒备注单行截断、浅色模式中尺寸卡片操作区视觉',
+                    '修复浅色模式状态管理中图标下拉菜单背景过深问题，提升可读性',
+                    '优化浅色模式下“查看清单/待完成/已完成/撤销”按钮文字与边框对比',
+                    '优化仪表盘过期提醒与备忘提醒卡片在深浅色模式下的配色协调性',
+                    '仪表盘备忘提醒新增分项统计（过期/循环/购物），分类统计与状态统计统一单位“件”',
+                    '展示模式数据补充：新增购物清单演示数据、已完成循环提醒样例，并在重置时同步清理提醒实例与清单序列'
+                ]
+            },
             {
                 version: 'v1.2.0', date: '2026-02-09', title: '数据管理增强 + 批量导入完善 + 仪表盘优化',
                 changes: [
@@ -4428,25 +7180,6 @@ getDB(); // 确保数据库初始化
             renderView();
         }
 
-        async function loadDemoMode() {
-            if (!confirm('确定加载展示模式吗？这会覆盖当前物品、分类和位置数据，并将 uploads 中图片移动到 uploads/trash。')) return;
-            const res = await apiPost('system/load-demo', {});
-            if (!res.success) { toast(res.message || '加载失败', 'error'); return; }
-
-            saveStatuses(defaultStatuses.map(s => ({ ...s })));
-            savePurchaseChannels([...defaultPurchaseChannels]);
-
-            App.itemsFilter = { search: '', category: 0, location: 0, status: '', expiryOnly: false };
-            App.itemsPage = 1;
-            App.selectedItems.clear();
-            App._cachedItems = null;
-            App._cachedTotal = 0;
-            App._cachedPages = 0;
-
-            toast(res.message || '展示模式已加载');
-            switchView('dashboard');
-        }
-
         async function restoreDefaultEnvironment() {
             if (!confirm('确定恢复默认环境吗？此操作会清空所有数据并重置本地设置，且不可撤销。')) return;
             const res = await apiPost('system/reset-default', {});
@@ -4457,7 +7190,7 @@ getDB(); // 确保数据库初始化
             localStorage.removeItem(ITEM_ATTRS_KEY);
             localStorage.removeItem(STATUS_KEY);
             localStorage.removeItem(CHANNEL_KEY);
-            localStorage.removeItem('item_theme');
+            localStorage.removeItem(THEME_KEY);
 
             App.statuses = defaultStatuses.map(s => ({ ...s }));
             App.purchaseChannels = [...defaultPurchaseChannels];
@@ -4632,6 +7365,84 @@ getDB(); // 确保数据库初始化
             renderView();
         }
 
+        // ---------- 用户管理（管理员） ----------
+        function formatDateTimeText(v, empty = '未记录') {
+            if (!v) return empty;
+            const s = String(v).replace('T', ' ');
+            return s.length >= 19 ? s.slice(0, 19) : s;
+        }
+
+        async function adminResetUserPassword(userId, username) {
+            const newPassword = prompt(`为用户「${username}」设置新密码（至少 6 位）：`);
+            if (newPassword === null) return;
+            if (String(newPassword).length < 6) {
+                toast('密码至少 6 位', 'error');
+                return;
+            }
+            const res = await apiPost('auth/admin-reset-password', {
+                user_id: Number(userId || 0),
+                new_password: String(newPassword)
+            });
+            if (!res.success) {
+                toast(res.message || '重置失败', 'error');
+                return;
+            }
+            toast(res.message || '密码已重置');
+            renderView();
+        }
+
+        async function renderUserManagement(container) {
+            if (!CURRENT_USER || !CURRENT_USER.is_admin) {
+                container.innerHTML = '<div class="glass rounded-2xl p-8 text-center text-slate-400">仅管理员可访问用户管理</div>';
+                return;
+            }
+            const res = await api('auth/users');
+            if (!res.success) {
+                container.innerHTML = `<div class="glass rounded-2xl p-8 text-center text-red-400">${esc(res.message || '加载失败')}</div>`;
+                return;
+            }
+            const users = Array.isArray(res.data) ? res.data : [];
+            const totalKinds = users.reduce((sum, u) => sum + Number(u.item_kinds || 0), 0);
+            const totalQty = users.reduce((sum, u) => sum + Number(u.item_qty || 0), 0);
+
+            container.innerHTML = `
+        <div class="space-y-6">
+            <div class="glass rounded-2xl p-4 anim-up">
+                <div class="flex flex-wrap items-center gap-x-6 gap-y-2">
+                    <span class="text-sm text-slate-400"><i class="ri-team-line mr-1 text-sky-400"></i>用户数 ${users.length}</span>
+                    <span class="text-sm text-slate-400"><i class="ri-archive-line mr-1 text-violet-400"></i>总物品种类 ${totalKinds}</span>
+                    <span class="text-sm text-slate-400"><i class="ri-stack-line mr-1 text-emerald-400"></i>总物品件数 ${totalQty}</span>
+                </div>
+            </div>
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                ${users.map(u => `
+                    <div class="glass rounded-2xl p-5 anim-up">
+                        <div class="flex items-center justify-between gap-3 mb-3">
+                            <div class="min-w-0">
+                                <h3 class="text-white font-semibold truncate">${esc(u.display_name || u.username)}</h3>
+                                <p class="text-xs text-slate-500 truncate">@${esc(u.username)}</p>
+                            </div>
+                            <span class="badge ${u.is_admin ? 'badge-danger' : 'badge-lent'}">${u.is_admin ? '管理员' : '普通用户'}</span>
+                        </div>
+                        <div class="space-y-1.5 text-xs text-slate-400 mb-4">
+                            <p><i class="ri-archive-line mr-1 text-sky-400"></i>物品种类：${Number(u.item_kinds || 0)} 种</p>
+                            <p><i class="ri-stack-line mr-1 text-violet-400"></i>物品件数：${Number(u.item_qty || 0)} 件</p>
+                            <p><i class="ri-time-line mr-1 text-amber-400"></i>最近登录：${esc(formatDateTimeText(u.last_login_at, '从未登录'))}</p>
+                            <p><i class="ri-edit-2-line mr-1 text-slate-500"></i>最近物品变更：${esc(formatDateTimeText(u.last_item_at, '暂无记录'))}</p>
+                        </div>
+                        <div class="flex items-center justify-end gap-2">
+                            <button onclick='adminResetUserPassword(${Number(u.id || 0)}, ${JSON.stringify(String(u.username || ""))})' class="btn btn-ghost btn-sm text-cyan-300 border-cyan-400/30 hover:border-cyan-300/50">
+                                <i class="ri-lock-password-line"></i>重置密码
+                            </button>
+                        </div>
+                    </div>
+                `).join('')}
+            </div>
+            ${users.length === 0 ? '<div class="glass rounded-2xl p-8 text-center text-slate-500">暂无用户数据</div>' : ''}
+        </div>
+    `;
+        }
+
         // ---------- 购入渠道管理页面 ----------
         function renderChannelSettings(container) {
             container.innerHTML = `
@@ -4728,11 +7539,22 @@ getDB(); // 确保数据库初始化
         }
 
         // ---------- 过期日期工具 ----------
-        function daysUntilExpiry(dateStr) {
+        function daysUntilDate(dateStr) {
             if (!dateStr) return Infinity;
             const today = new Date(); today.setHours(0, 0, 0, 0);
-            const expiry = new Date(dateStr); expiry.setHours(0, 0, 0, 0);
-            return Math.ceil((expiry - today) / (1000 * 60 * 60 * 24));
+            const target = new Date(dateStr); target.setHours(0, 0, 0, 0);
+            return Math.ceil((target - today) / (1000 * 60 * 60 * 24));
+        }
+        function daysUntilExpiry(dateStr) {
+            return daysUntilDate(dateStr);
+        }
+        function daysUntilReminder(dateStr) {
+            return daysUntilDate(dateStr);
+        }
+        function reminderDisplayDate(item) {
+            if (!item) return '';
+            if (item.reminder_due_date) return item.reminder_due_date;
+            return item.reminder_next_date || item.reminder_date || '';
         }
         function expiryColor(dateStr) {
             const days = daysUntilExpiry(dateStr);
@@ -4755,11 +7577,27 @@ getDB(); // 确保数据库初始化
             if (days === 1) return '(明天过期)';
             return `(剩余 ${days} 天)`;
         }
+        function reminderCycleLabel(value, unit) {
+            const n = Math.max(1, Number(value || 1));
+            if (unit === 'day') return `每 ${n} 天`;
+            if (unit === 'week') return `每 ${n} 周`;
+            if (unit === 'year') return `每 ${n} 年`;
+            return '未设置周期';
+        }
+        function reminderDueLabel(dateStr) {
+            const days = daysUntilReminder(dateStr);
+            if (!Number.isFinite(days)) return '无提醒日期';
+            if (days < 0) return `已超期 ${Math.abs(days)} 天`;
+            if (days === 0) return '今天提醒';
+            if (days === 1) return '明天提醒';
+            return `${days} 天后提醒`;
+        }
 
         // ============================================================
         // 🎬 初始化
         // ============================================================
         initTheme();
+        setupDateInputPlaceholders();
         // 设置版本号
         document.getElementById('appVersion').textContent = APP_VERSION;
         // 应用默认排序设置
