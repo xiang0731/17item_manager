@@ -2,7 +2,7 @@
 
 > 目标：将实现说明拆分为数据库层、API 层、UI 层，方便按职责快速定位与修改。
 >
-> 行号基于当前版本：`index.php` 约 7704 行，`README.md` 约 222 行。后续行号漂移时请用本文提供的命令重新定位。
+> 行号基于当前版本：`index.php` 约 8589 行，`README.md` 约 228 行。后续行号漂移时请用本文提供的命令重新定位。
 
 ## 目录
 
@@ -46,8 +46,11 @@ rg -n "pending_purchase|pending_receipt|shopping-list/update-status|toggleCurren
 # 展示模式与演示数据
 rg -n "system/load-demo|demoItems|demoShoppingList|reminder_next_date|sqlite_sequence" index.php
 
-# 账号与权限（v1.4）
+# 账号与权限（v1.5）
 rg -n "getAuthDB|auth/init|auth/login|auth/demo-login|auth/users|auth/admin-reset-password|renderUserManagement" index.php
+
+# 公共频道（v1.5）
+rg -n "public-channel|public_shared_items|public_shared_comments|recommend_reason|comment-delete" index.php
 
 # 日期占位相关
 rg -n "DATE_PLACEHOLDER_TEXT|data-date-placeholder|refreshDateInputPlaceholderDisplay" index.php
@@ -108,7 +111,7 @@ php -l index.php
 
 ### 2. 功能条目（API 侧）
 
-### 2.0 账号体系与权限（v1.4）
+### 2.0 账号体系与权限（v1.5）
 
 - 代码位置
 - `index.php:923-952`：`auth/init`（返回默认管理员、默认 demo、认证状态）
@@ -298,6 +301,25 @@ php -l index.php
 - 空值显示 `____年/__月/__日`。
 - 选择日期后输入框尺寸不变。
 
+### 2.7 公共频道共享、推荐理由与评论（v1.5）
+
+- 代码位置
+- `index.php:2428-2619`：`public-channel` 列表接口（含评论列表与权限标记）
+- `index.php:2622-2684`：`public-channel/update`（仅发布者可编辑共享属性）
+- `index.php:2686-2735`：`public-channel/comment`（所有用户可评论）
+- `index.php:2737-2762`：`public-channel/comment-delete`（仅评论者或管理员可删除）
+- `index.php:6277-6388`：公共频道前端交互（编辑弹窗、评论发布、评论删除）
+
+- 修改步骤
+1. 调整共享字段时，先改 `getItemShareSnapshot()` 与 `upsertPublicSharedItem()`。
+2. 涉及评论权限时，后端接口和前端按钮显示必须同时校验，避免仅前端限制。
+3. 若共享记录清理策略变更，需同步处理评论级联清理，避免孤儿评论。
+
+- 验证
+- 发布者可编辑共享物品；非发布者不可编辑。
+- 任意登录用户可评论；仅评论者本人或管理员可删除评论。
+- 共享物品加入购物清单后，备注中带有推荐理由。
+
 ### 3. 购物清单页面与弹窗
 
 - `index.php:3193-3261`：购物清单弹窗 DOM
@@ -305,7 +327,7 @@ php -l index.php
 - `index.php:4798-4916`：新增/编辑/保存/状态切换
 - `index.php:4932-4975`：已购买入库流程
 
-### 3.0 登录页与用户管理页（v1.4）
+### 3.0 登录页与用户管理页（v1.5）
 
 - `index.php:2387-2770`：登录/注册/忘记密码 UI（含 Demo 按钮）
 - `index.php:2676-2684`：`loginAsDemo()`
@@ -472,10 +494,10 @@ php -l index.php
 
 ## <a id="sec-release"></a>发布与文档同步
 
-- 页面内置更新记录：`index.php:6755-6850`
-- 当前版本号来源：`index.php:6852`
-- README `v1.4.0`：`README.md:138-147`
-- README 功能总览：`README.md:10-83`
+- 页面内置更新记录：`index.php` 中 `const CHANGELOG = [...]`
+- 当前版本号来源：`index.php` 中 `const APP_VERSION = CHANGELOG[0].version`
+- README 版本记录：`README.md` 的“更新记录”章节（当前置顶 `v1.5.0`）
+- README 功能总览：`README.md` 的“功能概览”章节（含公共频道）
 
 发布新功能建议同步顺序：
 1. 先改 `index.php` 的 `CHANGELOG`。

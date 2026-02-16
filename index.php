@@ -104,6 +104,35 @@ function getAuthDB()
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             last_login_at DATETIME DEFAULT NULL
         )");
+        $authDb->exec("CREATE TABLE IF NOT EXISTS public_shared_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_user_id INTEGER NOT NULL,
+            owner_item_id INTEGER NOT NULL,
+            item_name TEXT NOT NULL,
+            category_name TEXT DEFAULT '',
+            purchase_price REAL DEFAULT 0,
+            purchase_from TEXT DEFAULT '',
+            recommend_reason TEXT DEFAULT '',
+            owner_item_updated_at TEXT DEFAULT '',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(owner_user_id, owner_item_id)
+        )");
+        $authDb->exec("CREATE INDEX IF NOT EXISTS idx_public_shared_items_updated_at ON public_shared_items(updated_at)");
+        $authDb->exec("CREATE TABLE IF NOT EXISTS public_shared_comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            shared_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )");
+        $authDb->exec("CREATE INDEX IF NOT EXISTS idx_public_shared_comments_shared_id ON public_shared_comments(shared_id)");
+        $authDb->exec("CREATE INDEX IF NOT EXISTS idx_public_shared_comments_created_at ON public_shared_comments(created_at)");
+        try {
+            $authDb->exec("ALTER TABLE public_shared_items ADD COLUMN recommend_reason TEXT DEFAULT ''");
+        } catch (Exception $e) {
+        }
         try {
             $authDb->exec("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'user'");
         } catch (Exception $e) {
@@ -181,6 +210,23 @@ function getSecurityQuestions()
     return SECURITY_QUESTIONS;
 }
 
+function isDemoUsername($username)
+{
+    $u = strtolower(trim((string) $username));
+    if ($u === '') {
+        return false;
+    }
+    if ($u === strtolower(DEFAULT_DEMO_USERNAME)) {
+        return true;
+    }
+    return preg_match('/^demo_peer_\d+_channel$/', $u) === 1;
+}
+
+function isDemoUser($user)
+{
+    return is_array($user) && isDemoUsername($user['username'] ?? '');
+}
+
 function getUserItemStats($userId)
 {
     $uid = intval($userId);
@@ -198,11 +244,141 @@ function getUserItemStats($userId)
     }
 }
 
+function getItemShareSnapshot($db, $itemId)
+{
+    $id = intval($itemId);
+    if ($id <= 0) {
+        return null;
+    }
+    $stmt = $db->prepare("SELECT
+            i.id,
+            i.category_id,
+            i.name,
+            i.is_public_shared,
+            i.purchase_price,
+            i.purchase_from,
+            COALESCE(i.public_recommend_reason, '') AS recommend_reason,
+            i.updated_at,
+            COALESCE(c.name, '') AS category_name
+        FROM items i
+        LEFT JOIN categories c ON i.category_id=c.id
+        WHERE i.id=? AND i.deleted_at IS NULL
+        LIMIT 1");
+    $stmt->execute([$id]);
+    $row = $stmt->fetch();
+    return $row ?: null;
+}
+
+function upsertPublicSharedItem($authDb, $ownerUserId, $snapshot)
+{
+    if (!is_array($snapshot)) {
+        return;
+    }
+    $stmt = $authDb->prepare("INSERT INTO public_shared_items
+        (owner_user_id, owner_item_id, item_name, category_name, purchase_price, purchase_from, recommend_reason, owner_item_updated_at, created_at, updated_at)
+        VALUES (?,?,?,?,?,?,?, ?, datetime('now','localtime'), datetime('now','localtime'))
+        ON CONFLICT(owner_user_id, owner_item_id) DO UPDATE SET
+            item_name=excluded.item_name,
+            category_name=excluded.category_name,
+            purchase_price=excluded.purchase_price,
+            purchase_from=excluded.purchase_from,
+            recommend_reason=excluded.recommend_reason,
+            owner_item_updated_at=excluded.owner_item_updated_at,
+            updated_at=datetime('now','localtime')");
+    $stmt->execute([
+        intval($ownerUserId),
+        intval($snapshot['id'] ?? 0),
+        trim((string) ($snapshot['name'] ?? '')),
+        trim((string) ($snapshot['category_name'] ?? '')),
+        max(0, floatval($snapshot['purchase_price'] ?? 0)),
+        trim((string) ($snapshot['purchase_from'] ?? '')),
+        trim((string) ($snapshot['recommend_reason'] ?? '')),
+        trim((string) ($snapshot['updated_at'] ?? ''))
+    ]);
+}
+
+function removePublicSharedCommentsByShareIds($authDb, $shareIds = [])
+{
+    $ids = array_values(array_filter(array_map('intval', is_array($shareIds) ? $shareIds : []), function ($v) {
+        return $v > 0;
+    }));
+    if (count($ids) === 0) {
+        return;
+    }
+    $placeholders = implode(',', array_fill(0, count($ids), '?'));
+    $stmt = $authDb->prepare("DELETE FROM public_shared_comments WHERE shared_id IN ($placeholders)");
+    $stmt->execute($ids);
+}
+
+function removePublicSharedItem($authDb, $ownerUserId, $ownerItemId)
+{
+    $uid = intval($ownerUserId);
+    $itemId = intval($ownerItemId);
+    if ($uid <= 0 || $itemId <= 0) {
+        return;
+    }
+    $idStmt = $authDb->prepare("SELECT id FROM public_shared_items WHERE owner_user_id=? AND owner_item_id=?");
+    $idStmt->execute([$uid, $itemId]);
+    $shareIds = array_map('intval', $idStmt->fetchAll(PDO::FETCH_COLUMN));
+    $stmt = $authDb->prepare("DELETE FROM public_shared_items WHERE owner_user_id=? AND owner_item_id=?");
+    $stmt->execute([$uid, $itemId]);
+    removePublicSharedCommentsByShareIds($authDb, $shareIds);
+}
+
+function removePublicSharedItemsByOwner($authDb, $ownerUserId, $itemIds = [])
+{
+    $uid = intval($ownerUserId);
+    if ($uid <= 0) {
+        return;
+    }
+    $ids = array_values(array_filter(array_map('intval', is_array($itemIds) ? $itemIds : []), function ($v) {
+        return $v > 0;
+    }));
+    $shareIds = [];
+    if (count($ids) === 0) {
+        $idStmt = $authDb->prepare("SELECT id FROM public_shared_items WHERE owner_user_id=?");
+        $idStmt->execute([$uid]);
+        $shareIds = array_map('intval', $idStmt->fetchAll(PDO::FETCH_COLUMN));
+        $stmt = $authDb->prepare("DELETE FROM public_shared_items WHERE owner_user_id=?");
+        $stmt->execute([$uid]);
+        removePublicSharedCommentsByShareIds($authDb, $shareIds);
+        return;
+    }
+    $placeholders = implode(',', array_fill(0, count($ids), '?'));
+    $params = array_merge([$uid], $ids);
+    $idStmt = $authDb->prepare("SELECT id FROM public_shared_items WHERE owner_user_id=? AND owner_item_id IN ($placeholders)");
+    $idStmt->execute($params);
+    $shareIds = array_map('intval', $idStmt->fetchAll(PDO::FETCH_COLUMN));
+    $stmt = $authDb->prepare("DELETE FROM public_shared_items WHERE owner_user_id=? AND owner_item_id IN ($placeholders)");
+    $stmt->execute($params);
+    removePublicSharedCommentsByShareIds($authDb, $shareIds);
+}
+
+function syncPublicSharedItem($authDb, $db, $ownerUserId, $itemId, $isShared)
+{
+    $uid = intval($ownerUserId);
+    $id = intval($itemId);
+    if ($uid <= 0 || $id <= 0) {
+        return;
+    }
+    if (intval($isShared) !== 1) {
+        removePublicSharedItem($authDb, $uid, $id);
+        return;
+    }
+    $snapshot = getItemShareSnapshot($db, $id);
+    if (!$snapshot || intval($snapshot['is_public_shared'] ?? 0) !== 1) {
+        removePublicSharedItem($authDb, $uid, $id);
+        return;
+    }
+    upsertPublicSharedItem($authDb, $uid, $snapshot);
+}
+
 function initSchema($db)
 {
     $db->exec("CREATE TABLE IF NOT EXISTS categories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL UNIQUE,
+        parent_id INTEGER DEFAULT 0,
         icon TEXT DEFAULT '📦',
         color TEXT DEFAULT '#3b82f6',
         sort_order INTEGER DEFAULT 0,
@@ -226,6 +402,7 @@ function initSchema($db)
         category_id INTEGER DEFAULT 0,
         priority TEXT DEFAULT 'normal',
         planned_price REAL DEFAULT 0,
+        source_shared_id INTEGER DEFAULT 0,
         notes TEXT DEFAULT '',
         reminder_date TEXT DEFAULT '',
         reminder_note TEXT DEFAULT '',
@@ -237,6 +414,7 @@ function initSchema($db)
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
         category_id INTEGER DEFAULT 0,
+        subcategory_id INTEGER DEFAULT 0,
         location_id INTEGER DEFAULT 0,
         quantity INTEGER DEFAULT 1,
         description TEXT DEFAULT '',
@@ -291,6 +469,18 @@ function initSchema($db)
     } catch (Exception $e) {
     }
     try {
+        $db->exec("ALTER TABLE items ADD COLUMN subcategory_id INTEGER DEFAULT 0");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("ALTER TABLE items ADD COLUMN is_public_shared INTEGER DEFAULT 0");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("ALTER TABLE items ADD COLUMN public_recommend_reason TEXT DEFAULT ''");
+    } catch (Exception $e) {
+    }
+    try {
         $db->exec("ALTER TABLE items ADD COLUMN reminder_date TEXT DEFAULT ''");
     } catch (Exception $e) {
     }
@@ -308,6 +498,14 @@ function initSchema($db)
     }
     try {
         $db->exec("ALTER TABLE items ADD COLUMN reminder_note TEXT DEFAULT ''");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("ALTER TABLE categories ADD COLUMN parent_id INTEGER DEFAULT 0");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("UPDATE categories SET parent_id=0 WHERE parent_id IS NULL");
     } catch (Exception $e) {
     }
     try {
@@ -331,6 +529,10 @@ function initSchema($db)
     } catch (Exception $e) {
     }
     try {
+        $db->exec("ALTER TABLE shopping_list ADD COLUMN source_shared_id INTEGER DEFAULT 0");
+    } catch (Exception $e) {
+    }
+    try {
         $db->exec("ALTER TABLE shopping_list ADD COLUMN notes TEXT DEFAULT ''");
     } catch (Exception $e) {
     }
@@ -348,6 +550,35 @@ function initSchema($db)
     }
     try {
         $db->exec("ALTER TABLE shopping_list ADD COLUMN updated_at DATETIME DEFAULT CURRENT_TIMESTAMP");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("CREATE INDEX IF NOT EXISTS idx_shopping_list_source_shared_id ON shopping_list(source_shared_id)");
+    } catch (Exception $e) {
+    }
+    try {
+        $legacyRows = $db->query("SELECT id, notes FROM shopping_list WHERE source_shared_id=0 AND notes LIKE '%[public-share:%'")->fetchAll();
+        if (is_array($legacyRows) && count($legacyRows) > 0) {
+            $legacyUpdate = $db->prepare("UPDATE shopping_list SET source_shared_id=?, notes=?, updated_at=datetime('now','localtime') WHERE id=?");
+            foreach ($legacyRows as $legacy) {
+                $notes = strval($legacy['notes'] ?? '');
+                if (!preg_match('/\[public-share:(\d+)\]/', $notes, $m)) {
+                    continue;
+                }
+                $sharedId = intval($m[1] ?? 0);
+                if ($sharedId <= 0) {
+                    continue;
+                }
+                $clean = preg_replace('/\s*\[public-share:\d+\]\s*/', '', $notes);
+                $clean = preg_replace('/[；;]{2,}/u', '；', strval($clean));
+                $clean = str_replace('数量: 1件', '1件', $clean);
+                $clean = trim(strval($clean), " \t\n\r\0\x0B；;");
+                if (strpos($clean, '来自公共频道') !== false && strpos($clean, '1件') === false) {
+                    $clean .= ($clean === '' ? '' : '；') . '1件';
+                }
+                $legacyUpdate->execute([$sharedId, $clean, intval($legacy['id'] ?? 0)]);
+            }
+        }
     } catch (Exception $e) {
     }
     try {
@@ -375,31 +606,123 @@ function initSchema($db)
     } catch (Exception $e) {
     }
 
-    // 插入默认分类（仅在表为空时）
-    $count = $db->query("SELECT COUNT(*) FROM categories")->fetchColumn();
-    if ($count == 0) {
-        $defaults = [
-            ['电子设备', '💻', '#3b82f6'],
-            ['家具家居', '🛋️', '#8b5cf6'],
-            ['厨房用品', '🍳', '#f59e0b'],
-            ['衣物鞋帽', '👔', '#ec4899'],
-            ['书籍文档', '📚', '#10b981'],
-            ['工具五金', '🔧', '#6366f1'],
-            ['运动户外', '⚽', '#14b8a6'],
-            ['虚拟产品', '🧩', '#06b6d4'],
-            ['其他', '📦', '#64748b'],
-        ];
-        $stmt = $db->prepare("INSERT INTO categories (name, icon, color) VALUES (?, ?, ?)");
-        foreach ($defaults as $cat)
-            $stmt->execute($cat);
-    }
-    // 数据库迁移：补充默认分类“虚拟产品”
-    try {
-        $virtualExists = $db->query("SELECT id FROM categories WHERE name='虚拟产品' LIMIT 1")->fetchColumn();
-        if (!$virtualExists) {
-            $stmt = $db->prepare("INSERT INTO categories (name, icon, color) VALUES (?,?,?)");
-            $stmt->execute(['虚拟产品', '🧩', '#06b6d4']);
+    // 默认分类（一级）与预设二级分类
+    $defaultTopCategories = [
+        ['电子设备', '💻', '#3b82f6'],
+        ['家具家居', '🛋️', '#8b5cf6'],
+        ['厨房用品', '🍳', '#f59e0b'],
+        ['衣物鞋帽', '👔', '#ec4899'],
+        ['书籍文档', '📚', '#10b981'],
+        ['工具五金', '🔧', '#6366f1'],
+        ['运动户外', '⚽', '#14b8a6'],
+        ['虚拟产品', '🧩', '#06b6d4'],
+        ['食物', '🍱', '#f97316'],
+        ['其他', '📦', '#64748b'],
+    ];
+    $defaultSubCategories = [
+        '电子设备' => [['手机平板', '📱'], ['电脑外设', '🖥️'], ['音频设备', '🎧']],
+        '家具家居' => [['清洁收纳', '🧹'], ['家纺寝具', '🛏️'], ['家居装饰', '🪴']],
+        '厨房用品' => [['炊具锅具', '🍲'], ['餐具器皿', '🍽️'], ['厨房小电', '🔌']],
+        '衣物鞋帽' => [['上装', '👕'], ['下装', '👖'], ['鞋靴配饰', '👟']],
+        '书籍文档' => [['纸质书', '📖'], ['电子资料', '💾'], ['证件合同', '🧾']],
+        '工具五金' => [['手动工具', '🪛'], ['电动工具', '🧰'], ['紧固耗材', '🪙']],
+        '运动户外' => [['球类器材', '🏀'], ['健身训练', '🏋️'], ['露营徒步', '⛺']],
+        '虚拟产品' => [['软件订阅', '💻'], ['会员服务', '🎟️'], ['数字资产', '🧠']],
+        '食物' => [['主食粮油', '🍚'], ['生鲜冷藏', '🥬'], ['零食饮料', '🥤']],
+        '其他' => [['日用杂项', '🧺'], ['礼品收藏', '🎁'], ['临时分类', '🗂️']],
+    ];
+    $findCategoryStmt = $db->prepare("SELECT id FROM categories WHERE name=? LIMIT 1");
+    $insertCategoryStmt = $db->prepare("INSERT INTO categories (name, parent_id, icon, color) VALUES (?,?,?,?)");
+    $countCategories = intval($db->query("SELECT COUNT(*) FROM categories")->fetchColumn() ?: 0);
+    $hasAnySubCategory = intval($db->query("SELECT COUNT(*) FROM categories WHERE parent_id>0")->fetchColumn() ?: 0) > 0;
+    $seedAllTop = ($countCategories === 0);
+    $foodInserted = false;
+    $topCategoryIds = [];
+    if ($seedAllTop) {
+        foreach ($defaultTopCategories as $cat) {
+            [$name, $icon, $color] = $cat;
+            $insertCategoryStmt->execute([$name, 0, $icon, $color]);
+            $cid = intval($db->lastInsertId());
+            if ($cid > 0) {
+                $topCategoryIds[$name] = $cid;
+            }
         }
+    } else {
+        // 兼容历史版本：保底补充“虚拟产品”“食物”一级分类
+        foreach ($defaultTopCategories as $cat) {
+            [$name, $icon, $color] = $cat;
+            if (!in_array($name, ['虚拟产品', '食物'], true)) {
+                continue;
+            }
+            $findCategoryStmt->execute([$name]);
+            $cid = intval($findCategoryStmt->fetchColumn() ?: 0);
+            if ($cid <= 0) {
+                $insertCategoryStmt->execute([$name, 0, $icon, $color]);
+                $cid = intval($db->lastInsertId());
+                if ($name === '食物') {
+                    $foodInserted = true;
+                }
+            }
+            if ($cid > 0) {
+                $topCategoryIds[$name] = $cid;
+            }
+        }
+        // 读取已存在的一级分类 ID（用于后续二级分类补充）
+        foreach ($defaultTopCategories as $cat) {
+            [$name] = $cat;
+            if (isset($topCategoryIds[$name])) {
+                continue;
+            }
+            $stmtTop = $db->prepare("SELECT id FROM categories WHERE name=? AND parent_id=0 LIMIT 1");
+            $stmtTop->execute([$name]);
+            $cid = intval($stmtTop->fetchColumn() ?: 0);
+            if ($cid > 0) {
+                $topCategoryIds[$name] = $cid;
+            }
+        }
+    }
+
+    // 补充二级分类：新库初始化 / 历史库首次升级 / 新增“食物”时自动补齐
+    $needSeedSubCategories = $seedAllTop || !$hasAnySubCategory || $foodInserted;
+    if ($needSeedSubCategories) {
+        foreach ($defaultSubCategories as $parentName => $subs) {
+            $parentId = intval($topCategoryIds[$parentName] ?? 0);
+            if ($parentId <= 0) {
+                continue;
+            }
+            foreach ($subs as $subMeta) {
+                [$subName, $subIcon] = $subMeta;
+                $findCategoryStmt->execute([$subName]);
+                $sid = intval($findCategoryStmt->fetchColumn() ?: 0);
+                if ($sid <= 0) {
+                    $insertCategoryStmt->execute([$subName, $parentId, $subIcon, '#64748b']);
+                }
+            }
+        }
+    }
+
+    // 历史兼容：旧版本把二级分类写在 category_id 中，迁移到 subcategory_id
+    try {
+        $db->exec("UPDATE items
+            SET subcategory_id = category_id,
+                category_id = (SELECT parent_id FROM categories WHERE categories.id = items.category_id LIMIT 1)
+            WHERE category_id IN (SELECT id FROM categories WHERE parent_id > 0)
+              AND COALESCE(subcategory_id, 0) = 0");
+    } catch (Exception $e) {
+    }
+    // 保底清理：二级分类与一级分类不匹配时清空二级分类
+    try {
+        $db->exec("UPDATE items
+            SET subcategory_id = 0
+            WHERE subcategory_id > 0
+              AND (
+                category_id <= 0
+                OR NOT EXISTS (
+                    SELECT 1 FROM categories sc
+                    WHERE sc.id = items.subcategory_id
+                      AND sc.parent_id = items.category_id
+                )
+              )");
     } catch (Exception $e) {
     }
 
@@ -561,6 +884,51 @@ function normalizeStatusValue($status)
     return $v;
 }
 
+function normalizeItemCategorySelection($db, $categoryId, $subcategoryId)
+{
+    $categoryId = max(0, intval($categoryId));
+    $subcategoryId = max(0, intval($subcategoryId));
+    if ($categoryId <= 0) {
+        return [0, 0, null];
+    }
+    $stmt = $db->prepare("SELECT id, parent_id FROM categories WHERE id=? LIMIT 1");
+    $stmt->execute([$categoryId]);
+    $catRow = $stmt->fetch();
+    if (!$catRow) {
+        return [0, 0, '一级分类不存在'];
+    }
+    $catParentId = intval($catRow['parent_id'] ?? 0);
+    if ($catParentId > 0) {
+        if ($subcategoryId <= 0) {
+            $subcategoryId = $categoryId;
+        }
+        $categoryId = $catParentId;
+    }
+
+    $topStmt = $db->prepare("SELECT id, parent_id FROM categories WHERE id=? LIMIT 1");
+    $topStmt->execute([$categoryId]);
+    $topRow = $topStmt->fetch();
+    if (!$topRow) {
+        return [0, 0, '一级分类不存在'];
+    }
+    if (intval($topRow['parent_id'] ?? 0) > 0) {
+        return [0, 0, '一级分类选择无效'];
+    }
+
+    if ($subcategoryId > 0) {
+        $subStmt = $db->prepare("SELECT id, parent_id FROM categories WHERE id=? LIMIT 1");
+        $subStmt->execute([$subcategoryId]);
+        $subRow = $subStmt->fetch();
+        if (!$subRow) {
+            return [$categoryId, 0, '二级分类不存在'];
+        }
+        if (intval($subRow['parent_id'] ?? 0) !== $categoryId) {
+            return [$categoryId, 0, '二级分类只可选择当前一级分类下的选项'];
+        }
+    }
+    return [$categoryId, $subcategoryId, null];
+}
+
 function normalizeShoppingPriority($priority)
 {
     $p = strtolower(trim((string) $priority));
@@ -701,9 +1069,125 @@ function seedReminderInstancesFromItems($db)
           )");
 }
 
+function seedDemoPeerPublicShare($authDb, $viewerUserId)
+{
+    $viewerId = intval($viewerUserId);
+    if (!($authDb instanceof PDO) || $viewerId <= 0) {
+        return ['shared_created' => 0, 'comment_created' => 0];
+    }
+
+    $viewerStmt = $authDb->prepare("SELECT username FROM users WHERE id=? LIMIT 1");
+    $viewerStmt->execute([$viewerId]);
+    $viewerUsername = strtolower(trim((string) $viewerStmt->fetchColumn()));
+    if ($viewerUsername !== strtolower(DEFAULT_DEMO_USERNAME)) {
+        return ['shared_created' => 0, 'comment_created' => 0];
+    }
+
+    $peerUsername = 'demo_peer_' . $viewerId . '_channel';
+    $peerDisplayName = '演示成员（公共频道）';
+    $questions = getSecurityQuestions();
+    $qKeys = array_keys($questions);
+    $defaultQuestionKey = count($qKeys) > 0 ? $qKeys[0] : '';
+
+    $peerStmt = $authDb->prepare("SELECT id FROM users WHERE username=? LIMIT 1");
+    $peerStmt->execute([$peerUsername]);
+    $peerId = intval($peerStmt->fetchColumn() ?: 0);
+    if ($peerId <= 0) {
+        $insertPeer = $authDb->prepare("INSERT INTO users (username, password_hash, display_name, role, security_question_key, security_answer_hash, created_at, updated_at)
+            VALUES (?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
+        $insertPeer->execute([
+            $peerUsername,
+            password_hash('demo_peer_123456', PASSWORD_DEFAULT),
+            $peerDisplayName,
+            'user',
+            $defaultQuestionKey,
+            $defaultQuestionKey !== '' ? password_hash(normalizeSecurityAnswer('demo_peer'), PASSWORD_DEFAULT) : ''
+        ]);
+        $peerId = intval($authDb->lastInsertId());
+    }
+    if ($peerId <= 0 || $peerId === $viewerId) {
+        return ['shared_created' => 0, 'comment_created' => 0];
+    }
+
+    $peerDb = getUserDB($peerId);
+    $demoPeerBarcode = 'DEMO-PEER-SHARE-01';
+
+    $oldItemStmt = $peerDb->prepare("SELECT id FROM items WHERE barcode=?");
+    $oldItemStmt->execute([$demoPeerBarcode]);
+    $oldItemIds = array_map('intval', $oldItemStmt->fetchAll(PDO::FETCH_COLUMN));
+    $oldItemIds = array_values(array_filter($oldItemIds, function ($v) {
+        return $v > 0;
+    }));
+    if (count($oldItemIds) > 0) {
+        removePublicSharedItemsByOwner($authDb, $peerId, $oldItemIds);
+        $placeholders = implode(',', array_fill(0, count($oldItemIds), '?'));
+        $delStmt = $peerDb->prepare("DELETE FROM items WHERE id IN ($placeholders)");
+        $delStmt->execute($oldItemIds);
+    }
+
+    $catStmt = $peerDb->prepare("SELECT id FROM categories WHERE name=? LIMIT 1");
+    $catStmt->execute(['电子设备']);
+    $categoryId = intval($catStmt->fetchColumn() ?: 0);
+    $subCatStmt = $peerDb->prepare("SELECT id FROM categories WHERE name=? AND parent_id=? LIMIT 1");
+    $subCatStmt->execute(['音频设备', $categoryId]);
+    $subcategoryId = intval($subCatStmt->fetchColumn() ?: 0);
+    $locStmt = $peerDb->prepare("SELECT id FROM locations WHERE name=? LIMIT 1");
+    $locStmt->execute(['客厅']);
+    $locationId = intval($locStmt->fetchColumn() ?: 0);
+
+    $insertPeerItem = $peerDb->prepare("INSERT INTO items
+        (name, category_id, subcategory_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, is_public_shared, public_recommend_reason, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+    $insertPeerItem->execute([
+        '降噪蓝牙耳机（演示成员）',
+        $categoryId,
+        $subcategoryId,
+        $locationId,
+        1,
+        '公共频道权限演示：由其他成员发布',
+        '',
+        $demoPeerBarcode,
+        date('Y-m-d', strtotime('-45 days')),
+        699,
+        '耳机,降噪,演示',
+        'active',
+        '',
+        '京东',
+        '用于演示：测试用户可查看并加入购物清单，但不可编辑',
+        1,
+        '我自己长期通勤使用，降噪稳定，佩戴也比较舒适',
+        '',
+        '',
+        0,
+        '',
+        ''
+    ]);
+    $peerItemId = intval($peerDb->lastInsertId());
+    if ($peerItemId <= 0) {
+        return ['shared_created' => 0, 'comment_created' => 0];
+    }
+
+    syncPublicSharedItem($authDb, $peerDb, $peerId, $peerItemId, 1);
+
+    $shareIdStmt = $authDb->prepare("SELECT id FROM public_shared_items WHERE owner_user_id=? AND owner_item_id=? LIMIT 1");
+    $shareIdStmt->execute([$peerId, $peerItemId]);
+    $shareId = intval($shareIdStmt->fetchColumn() ?: 0);
+    if ($shareId > 0) {
+        removePublicSharedCommentsByShareIds($authDb, [$shareId]);
+        $insertCommentStmt = $authDb->prepare("INSERT INTO public_shared_comments (shared_id, user_id, content, created_at, updated_at)
+            VALUES (?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
+        $insertCommentStmt->execute([$shareId, $peerId, '这是我最近复购的一款耳机，通勤和居家都很实用。']);
+        return ['shared_created' => 1, 'comment_created' => 1];
+    }
+
+    return ['shared_created' => 1, 'comment_created' => 0];
+}
+
 function loadDemoDataIntoDb($db, $options = [])
 {
     $moveImages = !empty($options['move_images']);
+    $authDb = (isset($options['auth_db']) && $options['auth_db'] instanceof PDO) ? $options['auth_db'] : null;
+    $ownerUserId = intval($options['owner_user_id'] ?? 0);
     $moved = $moveImages ? moveUploadFilesToTrash($db) : 0;
 
     $db->beginTransaction();
@@ -754,36 +1238,51 @@ function loadDemoDataIntoDb($db, $options = [])
 
         $today = date('Y-m-d');
         $demoItems = [
-            ['name' => 'MacBook Air M2', 'category' => '电子设备', 'location' => '书房', 'quantity' => 1, 'description' => '日常办公主力设备', 'barcode' => 'SN-MBA-2026', 'purchase_date' => date('Y-m-d', strtotime('-420 days')), 'purchase_price' => 7999, 'tags' => '电脑,办公', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '附带保护壳与扩展坞'],
-            ['name' => 'AirPods Pro', 'category' => '电子设备', 'location' => '卧室', 'quantity' => 1, 'description' => '蓝牙耳机', 'barcode' => 'SN-AIRPODS-02', 'purchase_date' => date('Y-m-d', strtotime('-260 days')), 'purchase_price' => 1499, 'tags' => '耳机,音频', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '淘宝', 'notes' => '配件齐全'],
-            ['name' => '机械键盘', 'category' => '电子设备', 'location' => '书桌抽屉', 'quantity' => 1, 'description' => '备用键盘', 'barcode' => 'KB-RED-87', 'purchase_date' => date('Y-m-d', strtotime('-540 days')), 'purchase_price' => 399, 'tags' => '键盘,外设', 'status' => 'archived', 'expiry_date' => '', 'purchase_from' => '拼多多', 'notes' => '近期未使用，已归档保存'],
-            ['name' => '二手显示器', 'category' => '电子设备', 'location' => '储物间', 'quantity' => 1, 'description' => '已转卖物品', 'barcode' => 'MON-USED-24', 'purchase_date' => date('Y-m-d', strtotime('-800 days')), 'purchase_price' => 1200, 'tags' => '显示器,转卖', 'status' => 'sold', 'expiry_date' => '', 'purchase_from' => '闲鱼', 'notes' => '已完成交易，保留记录'],
-            ['name' => '胶囊咖啡机', 'category' => '厨房用品', 'location' => '厨房', 'quantity' => 1, 'description' => '家用咖啡机', 'barcode' => 'COFFEE-01', 'purchase_date' => date('Y-m-d', strtotime('-320 days')), 'purchase_price' => 899, 'tags' => '咖啡,厨房', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '线下', 'notes' => '常用设备', 'reminder_date' => date('Y-m-d', strtotime('-28 days')), 'reminder_next_date' => date('Y-m-d', strtotime('+2 days')), 'reminder_cycle_value' => 30, 'reminder_cycle_unit' => 'day', 'reminder_note' => '需要清洗水箱并补充咖啡胶囊'],
-            ['name' => '维生素 D3', 'category' => '其他', 'location' => '厨房', 'quantity' => 2, 'description' => '保健品', 'barcode' => 'HEALTH-D3-01', 'purchase_date' => date('Y-m-d', strtotime('-60 days')), 'purchase_price' => 128, 'tags' => '保健,补剂', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+5 days')), 'purchase_from' => '线下', 'notes' => '还有约一周到期，优先使用'],
+            ['name' => 'MacBook Air M2', 'category' => '电子设备', 'subcategory' => '电脑外设', 'location' => '书房', 'quantity' => 1, 'description' => '日常办公主力设备', 'barcode' => 'SN-MBA-2026', 'purchase_date' => date('Y-m-d', strtotime('-420 days')), 'purchase_price' => 7999, 'tags' => '电脑,办公', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '附带保护壳与扩展坞'],
+            ['name' => 'AirPods Pro', 'category' => '电子设备', 'subcategory' => '音频设备', 'location' => '卧室', 'quantity' => 1, 'description' => '蓝牙耳机', 'barcode' => 'SN-AIRPODS-02', 'purchase_date' => date('Y-m-d', strtotime('-260 days')), 'purchase_price' => 1499, 'tags' => '耳机,音频', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '淘宝', 'notes' => '配件齐全'],
+            ['name' => '机械键盘', 'category' => '电子设备', 'subcategory' => '电脑外设', 'location' => '书桌抽屉', 'quantity' => 1, 'description' => '备用键盘', 'barcode' => 'KB-RED-87', 'purchase_date' => date('Y-m-d', strtotime('-540 days')), 'purchase_price' => 399, 'tags' => '键盘,外设', 'status' => 'archived', 'expiry_date' => '', 'purchase_from' => '拼多多', 'notes' => '近期未使用，已归档保存'],
+            ['name' => '二手显示器', 'category' => '电子设备', 'subcategory' => '电脑外设', 'location' => '储物间', 'quantity' => 1, 'description' => '已转卖物品', 'barcode' => 'MON-USED-24', 'purchase_date' => date('Y-m-d', strtotime('-800 days')), 'purchase_price' => 1200, 'tags' => '显示器,转卖', 'status' => 'sold', 'expiry_date' => '', 'purchase_from' => '闲鱼', 'notes' => '已完成交易，保留记录'],
+            ['name' => '胶囊咖啡机', 'category' => '厨房用品', 'subcategory' => '厨房小电', 'location' => '厨房', 'quantity' => 1, 'description' => '家用咖啡机', 'barcode' => 'COFFEE-01', 'purchase_date' => date('Y-m-d', strtotime('-320 days')), 'purchase_price' => 899, 'tags' => '咖啡,厨房', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '线下', 'notes' => '常用设备', 'is_public_shared' => 1, 'public_recommend_reason' => '稳定耐用，家用入门友好，维护成本低', 'reminder_date' => date('Y-m-d', strtotime('-28 days')), 'reminder_next_date' => date('Y-m-d', strtotime('+2 days')), 'reminder_cycle_value' => 30, 'reminder_cycle_unit' => 'day', 'reminder_note' => '需要清洗水箱并补充咖啡胶囊'],
+            ['name' => '维生素 D3', 'category' => '其他', 'subcategory' => '日用杂项', 'location' => '厨房', 'quantity' => 2, 'description' => '保健品', 'barcode' => 'HEALTH-D3-01', 'purchase_date' => date('Y-m-d', strtotime('-60 days')), 'purchase_price' => 128, 'tags' => '保健,补剂', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+5 days')), 'purchase_from' => '线下', 'notes' => '还有约一周到期，优先使用'],
             ['name' => '车载灭火器', 'category' => '工具五金', 'location' => '阳台', 'quantity' => 1, 'description' => '安全应急用品', 'barcode' => 'SAFE-FIRE-01', 'purchase_date' => date('Y-m-d', strtotime('-480 days')), 'purchase_price' => 89, 'tags' => '安全,应急', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('-12 days')), 'purchase_from' => '京东', 'notes' => '已超过有效期，需尽快更换'],
-            ['name' => '沐浴露补充装', 'category' => '其他', 'location' => '储物间', 'quantity' => 3, 'description' => '家庭日用品', 'barcode' => 'HOME-BATH-03', 'purchase_date' => date('Y-m-d', strtotime('-30 days')), 'purchase_price' => 75, 'tags' => '日用品,家居', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+25 days')), 'purchase_from' => '拼多多', 'notes' => '本月内到期，先用旧库存'],
-            ['name' => '训练足球', 'category' => '运动户外', 'location' => '阳台', 'quantity' => 1, 'description' => '周末运动使用', 'barcode' => 'SPORT-BALL-01', 'purchase_date' => date('Y-m-d', strtotime('-210 days')), 'purchase_price' => 199, 'tags' => '运动,户外', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '淘宝', 'notes' => '周末固定训练用球', 'reminder_date' => date('Y-m-d', strtotime('-13 days')), 'reminder_next_date' => date('Y-m-d', strtotime('+1 day')), 'reminder_cycle_value' => 1, 'reminder_cycle_unit' => 'week', 'reminder_note' => '周末出门前检查气压'],
-            ['name' => '空气净化器滤芯', 'category' => '家具家居', 'location' => '客厅', 'quantity' => 1, 'description' => '客厅净化器维护项目', 'barcode' => 'AIR-FILTER-01', 'purchase_date' => date('Y-m-d', strtotime('-200 days')), 'purchase_price' => 169, 'tags' => '家居,维护', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '上次维护后需持续追踪更换周期', 'reminder_date' => date('Y-m-d', strtotime('-1 day')), 'reminder_next_date' => $today, 'reminder_cycle_value' => 1, 'reminder_cycle_unit' => 'day', 'reminder_note' => '每日检查滤芯状态并记录'],
-            ['name' => '空气净化器滤芯（原厂）', 'category' => '家具家居', 'location' => '储物间', 'quantity' => 1, 'description' => '上一批次原厂滤芯采购记录', 'barcode' => 'AIR-FILTER-OEM-02', 'purchase_date' => date('Y-m-d', strtotime('-35 days')), 'purchase_price' => 199, 'tags' => '滤芯,原厂', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '价格较高但安装更稳'],
-            ['name' => '空气净化器滤芯（兼容款）', 'category' => '家具家居', 'location' => '储物间', 'quantity' => 2, 'description' => '兼容款滤芯采购记录', 'barcode' => 'AIR-FILTER-COMP-03', 'purchase_date' => date('Y-m-d', strtotime('-120 days')), 'purchase_price' => 129, 'tags' => '滤芯,兼容', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '拼多多', 'notes' => '单价更低，适合备货'],
-            ['name' => '维生素D3滴剂', 'category' => '其他', 'location' => '厨房', 'quantity' => 1, 'description' => '儿童可用滴剂版本', 'barcode' => 'HEALTH-D3-DROP-02', 'purchase_date' => date('Y-m-d', strtotime('-22 days')), 'purchase_price' => 139, 'tags' => '保健,滴剂', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+320 days')), 'purchase_from' => '淘宝', 'notes' => '最近一次补货'],
+            ['name' => '沐浴露补充装', 'category' => '其他', 'subcategory' => '日用杂项', 'location' => '储物间', 'quantity' => 3, 'description' => '家庭日用品', 'barcode' => 'HOME-BATH-03', 'purchase_date' => date('Y-m-d', strtotime('-30 days')), 'purchase_price' => 75, 'tags' => '日用品,家居', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+25 days')), 'purchase_from' => '拼多多', 'notes' => '本月内到期，先用旧库存'],
+            ['name' => '训练足球', 'category' => '运动户外', 'subcategory' => '球类器材', 'location' => '阳台', 'quantity' => 1, 'description' => '周末运动使用', 'barcode' => 'SPORT-BALL-01', 'purchase_date' => date('Y-m-d', strtotime('-210 days')), 'purchase_price' => 199, 'tags' => '运动,户外', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '淘宝', 'notes' => '周末固定训练用球', 'reminder_date' => date('Y-m-d', strtotime('-13 days')), 'reminder_next_date' => date('Y-m-d', strtotime('+1 day')), 'reminder_cycle_value' => 1, 'reminder_cycle_unit' => 'week', 'reminder_note' => '周末出门前检查气压'],
+            ['name' => '空气净化器滤芯', 'category' => '家具家居', 'subcategory' => '清洁收纳', 'location' => '客厅', 'quantity' => 1, 'description' => '客厅净化器维护项目', 'barcode' => 'AIR-FILTER-01', 'purchase_date' => date('Y-m-d', strtotime('-200 days')), 'purchase_price' => 169, 'tags' => '家居,维护', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '上次维护后需持续追踪更换周期', 'is_public_shared' => 1, 'public_recommend_reason' => '价格和性能平衡，适合作为常备耗材', 'reminder_date' => date('Y-m-d', strtotime('-1 day')), 'reminder_next_date' => $today, 'reminder_cycle_value' => 1, 'reminder_cycle_unit' => 'day', 'reminder_note' => '每日检查滤芯状态并记录'],
+            ['name' => '空气净化器滤芯（原厂）', 'category' => '家具家居', 'subcategory' => '清洁收纳', 'location' => '储物间', 'quantity' => 1, 'description' => '上一批次原厂滤芯采购记录', 'barcode' => 'AIR-FILTER-OEM-02', 'purchase_date' => date('Y-m-d', strtotime('-35 days')), 'purchase_price' => 199, 'tags' => '滤芯,原厂', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '价格较高但安装更稳', 'is_public_shared' => 1, 'public_recommend_reason' => '安装契合度高，追求稳定可优先考虑'],
+            ['name' => '空气净化器滤芯（兼容款）', 'category' => '家具家居', 'subcategory' => '清洁收纳', 'location' => '储物间', 'quantity' => 2, 'description' => '兼容款滤芯采购记录', 'barcode' => 'AIR-FILTER-COMP-03', 'purchase_date' => date('Y-m-d', strtotime('-120 days')), 'purchase_price' => 129, 'tags' => '滤芯,兼容', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '拼多多', 'notes' => '单价更低，适合备货'],
+            ['name' => '维生素D3滴剂', 'category' => '其他', 'subcategory' => '日用杂项', 'location' => '厨房', 'quantity' => 1, 'description' => '儿童可用滴剂版本', 'barcode' => 'HEALTH-D3-DROP-02', 'purchase_date' => date('Y-m-d', strtotime('-22 days')), 'purchase_price' => 139, 'tags' => '保健,滴剂', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+320 days')), 'purchase_from' => '淘宝', 'notes' => '最近一次补货'],
             ['name' => '维生素 D3 软胶囊', 'category' => '其他', 'location' => '厨房', 'quantity' => 1, 'description' => '成人常规补充版本', 'barcode' => 'HEALTH-D3-CAPS-03', 'purchase_date' => date('Y-m-d', strtotime('-180 days')), 'purchase_price' => 109, 'tags' => '保健,胶囊', 'status' => 'archived', 'expiry_date' => date('Y-m-d', strtotime('+120 days')), 'purchase_from' => '京东', 'notes' => '旧批次价格较低'],
             ['name' => '车载灭火器（标准版）', 'category' => '工具五金', 'location' => '阳台', 'quantity' => 1, 'description' => '上一代标准版灭火器', 'barcode' => 'SAFE-FIRE-STD-02', 'purchase_date' => date('Y-m-d', strtotime('-90 days')), 'purchase_price' => 109, 'tags' => '安全,应急', 'status' => 'archived', 'expiry_date' => date('Y-m-d', strtotime('+280 days')), 'purchase_from' => '线下', 'notes' => '作为价格对比记录'],
             ['name' => '车载灭火器（便携款）', 'category' => '工具五金', 'location' => '储物间', 'quantity' => 1, 'description' => '便携款采购记录', 'barcode' => 'SAFE-FIRE-MINI-03', 'purchase_date' => date('Y-m-d', strtotime('-300 days')), 'purchase_price' => 79, 'tags' => '安全,便携', 'status' => 'archived', 'expiry_date' => date('Y-m-d', strtotime('+60 days')), 'purchase_from' => '淘宝', 'notes' => '历史最低购入价记录'],
-            ['name' => '设计模式（第2版）', 'category' => '书籍文档', 'location' => '书房', 'quantity' => 1, 'description' => '技术书籍', 'barcode' => 'BOOK-DESIGN-02', 'purchase_date' => date('Y-m-d', strtotime('-700 days')), 'purchase_price' => 88, 'tags' => '书籍,学习', 'status' => 'archived', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '已读完，暂存书架'],
+            ['name' => '设计模式（第2版）', 'category' => '书籍文档', 'subcategory' => '纸质书', 'location' => '书房', 'quantity' => 1, 'description' => '技术书籍', 'barcode' => 'BOOK-DESIGN-02', 'purchase_date' => date('Y-m-d', strtotime('-700 days')), 'purchase_price' => 88, 'tags' => '书籍,学习', 'status' => 'archived', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '已读完，暂存书架'],
             ['name' => '纪念手表', 'category' => '电子设备', 'location' => '卧室', 'quantity' => 1, 'description' => '礼品来源物品', 'barcode' => 'GIFT-WATCH-01', 'purchase_date' => date('Y-m-d', strtotime('-95 days')), 'purchase_price' => 0, 'tags' => '礼物,收藏', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '礼品', 'notes' => '生日礼物，定期保养'],
-            ['name' => '在线课程年度会员', 'category' => '虚拟产品', 'location' => '书房', 'quantity' => 1, 'description' => '在线学习会员服务', 'barcode' => 'VIP-COURSE-2026', 'purchase_date' => date('Y-m-d', strtotime('-20 days')), 'purchase_price' => 399, 'tags' => '会员,学习', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+340 days')), 'purchase_from' => '线下', 'notes' => '到期前一个月提醒续费'],
+            ['name' => '在线课程年度会员', 'category' => '虚拟产品', 'subcategory' => '会员服务', 'location' => '书房', 'quantity' => 1, 'description' => '在线学习会员服务', 'barcode' => 'VIP-COURSE-2026', 'purchase_date' => date('Y-m-d', strtotime('-20 days')), 'purchase_price' => 399, 'tags' => '会员,学习', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+340 days')), 'purchase_from' => '线下', 'notes' => '到期前一个月提醒续费', 'is_public_shared' => 1, 'public_recommend_reason' => '内容更新频率高，长期学习性价比高'],
+            ['name' => '有机燕麦片', 'category' => '食物', 'subcategory' => '主食粮油', 'location' => '厨房', 'quantity' => 2, 'description' => '早餐常备食材', 'barcode' => 'FOOD-OAT-01', 'purchase_date' => date('Y-m-d', strtotime('-18 days')), 'purchase_price' => 45, 'tags' => '食物,早餐', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+120 days')), 'purchase_from' => '京东', 'notes' => '用于覆盖食物分类与二级分类示例'],
             ['name' => '未分类收纳箱', 'category' => '', 'location' => '', 'quantity' => 2, 'description' => '暂未归类，等待整理', 'barcode' => 'BOX-UNCAT-01', 'purchase_date' => date('Y-m-d', strtotime('-15 days')), 'purchase_price' => 59, 'tags' => '收纳,未分类', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '线下', 'notes' => '暂放玄关，待统一收纳'],
         ];
 
-        $insertItem = $db->prepare("INSERT INTO items (name, category_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        $insertItem = $db->prepare("INSERT INTO items (name, category_id, subcategory_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, is_public_shared, public_recommend_reason, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
         $created = 0;
+        $subcategoryBoundCount = 0;
+        $sharedCount = 0;
+        $publicCommentCreated = 0;
+        if ($authDb && $ownerUserId > 0) {
+            removePublicSharedItemsByOwner($authDb, $ownerUserId);
+        }
         foreach ($demoItems as $item) {
             $categoryId = isset($catIdByName[$item['category'] ?? '']) ? intval($catIdByName[$item['category']]) : 0;
+            $subcategoryId = isset($catIdByName[$item['subcategory'] ?? '']) ? intval($catIdByName[$item['subcategory']]) : 0;
+            [$categoryId, $subcategoryId, $categoryError] = normalizeItemCategorySelection($db, $categoryId, $subcategoryId);
+            if ($categoryError) {
+                $categoryId = 0;
+                $subcategoryId = 0;
+            }
             $locationId = isset($locMap[$item['location'] ?? '']) ? intval($locMap[$item['location']]) : 0;
+            $isPublicShared = intval($item['is_public_shared'] ?? 0) === 1 ? 1 : 0;
             $insertItem->execute([
                 $item['name'],
                 $categoryId,
+                $subcategoryId,
                 $locationId,
                 max(0, intval($item['quantity'] ?? 1)),
                 $item['description'] ?? '',
@@ -796,6 +1295,8 @@ function loadDemoDataIntoDb($db, $options = [])
                 normalizeDateYmd($item['expiry_date'] ?? '') ?? '',
                 $item['purchase_from'] ?? '',
                 $item['notes'] ?? '',
+                $isPublicShared,
+                trim((string) ($item['public_recommend_reason'] ?? '')),
                 normalizeReminderDateValue($item['reminder_date'] ?? ''),
                 normalizeReminderDateValue($item['reminder_next_date'] ?? ''),
                 normalizeReminderCycleValue($item['reminder_cycle_value'] ?? 0, $item['reminder_cycle_unit'] ?? ''),
@@ -803,13 +1304,60 @@ function loadDemoDataIntoDb($db, $options = [])
                 trim((string) ($item['reminder_note'] ?? ''))
             ]);
             $created++;
+            if ($subcategoryId > 0) {
+                $subcategoryBoundCount++;
+            }
+            if ($authDb && $ownerUserId > 0 && $isPublicShared === 1) {
+                $newItemId = intval($db->lastInsertId());
+                syncPublicSharedItem($authDb, $db, $ownerUserId, $newItemId, 1);
+                $sharedCount++;
+            }
+        }
+        if ($authDb && $ownerUserId > 0 && $sharedCount > 0) {
+            $shareRowsStmt = $authDb->prepare("SELECT id, item_name FROM public_shared_items WHERE owner_user_id=? ORDER BY id ASC");
+            $shareRowsStmt->execute([$ownerUserId]);
+            $shareRows = $shareRowsStmt->fetchAll();
+            if (is_array($shareRows) && count($shareRows) > 0) {
+                $shareIds = array_values(array_filter(array_map(function ($row) {
+                    return intval($row['id'] ?? 0);
+                }, $shareRows), function ($v) {
+                    return $v > 0;
+                }));
+                removePublicSharedCommentsByShareIds($authDb, $shareIds);
+
+                $adminUserId = intval($authDb->query("SELECT id FROM users WHERE role='admin' ORDER BY id ASC LIMIT 1")->fetchColumn() ?: 0);
+                if ($adminUserId === $ownerUserId) {
+                    $adminUserId = 0;
+                }
+                $insertCommentStmt = $authDb->prepare("INSERT INTO public_shared_comments (shared_id, user_id, content, created_at, updated_at)
+                    VALUES (?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
+                foreach ($shareRows as $idx => $shareRow) {
+                    $shareId = intval($shareRow['id'] ?? 0);
+                    if ($shareId <= 0) {
+                        continue;
+                    }
+                    $itemName = trim((string) ($shareRow['item_name'] ?? '该物品'));
+                    if ($idx === 0) {
+                        $insertCommentStmt->execute([$shareId, $ownerUserId, '这款我长期在用，稳定耐用，推荐先加入购物清单。']);
+                        $publicCommentCreated++;
+                        if ($adminUserId > 0) {
+                            $insertCommentStmt->execute([$shareId, $adminUserId, '管理员建议：可先比价再下单，通常活动期更划算。']);
+                            $publicCommentCreated++;
+                        }
+                    } elseif ($idx === 1) {
+                        $insertCommentStmt->execute([$shareId, $ownerUserId, '我最近复购过「' . $itemName . '」，整体性价比不错。']);
+                        $publicCommentCreated++;
+                    }
+                }
+            }
         }
 
         // 回收站预置记录（用于验证恢复与彻底删除流程）
-        $insertTrash = $db->prepare("INSERT INTO items (name, category_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        $insertTrash = $db->prepare("INSERT INTO items (name, category_id, subcategory_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
         $insertTrash->execute([
             '旧数据线（待清理）',
             isset($catIdByName['电子设备']) ? intval($catIdByName['电子设备']) : 0,
+            0,
             isset($locMap['电视柜']) ? intval($locMap['电视柜']) : 0,
             1,
             '已损坏，待确认是否恢复',
@@ -890,8 +1438,35 @@ function loadDemoDataIntoDb($db, $options = [])
             $shoppingCreated++;
         }
 
+        $peerSharedCount = 0;
+        $peerCommentCreated = 0;
+        if ($authDb && $ownerUserId > 0) {
+            try {
+                $peerShareSeed = seedDemoPeerPublicShare($authDb, $ownerUserId);
+                $peerSharedCount = max(0, intval($peerShareSeed['shared_created'] ?? 0));
+                $peerCommentCreated = max(0, intval($peerShareSeed['comment_created'] ?? 0));
+            } catch (Exception $e) {
+                $peerSharedCount = 0;
+                $peerCommentCreated = 0;
+            }
+        }
+
         $db->commit();
+        $totalSharedCount = $sharedCount + $peerSharedCount;
+        $totalPublicCommentCreated = $publicCommentCreated + $peerCommentCreated;
         $message = "体验数据已初始化：$created 件物品、$shoppingCreated 条购物清单已就绪";
+        if ($subcategoryBoundCount > 0) {
+            $message .= "，其中 $subcategoryBoundCount 件已绑定二级分类";
+        }
+        if ($totalSharedCount > 0) {
+            $message .= "，含 $totalSharedCount 条公共频道共享物品";
+        }
+        if ($totalPublicCommentCreated > 0) {
+            $message .= "，含 $totalPublicCommentCreated 条公共频道评论";
+        }
+        if ($peerSharedCount > 0) {
+            $message .= '（含 1 条其他成员共享物品，用于权限演示）';
+        }
         if ($completedReminderDemoPrepared) {
             $message .= '，含 1 条已完成提醒记录';
         }
@@ -901,7 +1476,12 @@ function loadDemoDataIntoDb($db, $options = [])
         return [
             'message' => $message,
             'created' => $created,
+            'subcategory_bound' => $subcategoryBoundCount,
             'shopping_created' => $shoppingCreated,
+            'shared_created' => $totalSharedCount,
+            'public_comment_created' => $totalPublicCommentCreated,
+            'owner_shared_created' => $sharedCount,
+            'peer_shared_created' => $peerSharedCount,
             'completed_reminder_demo' => $completedReminderDemoPrepared,
             'trash_demo' => ($trashId > 0),
             'moved_images' => $moved
@@ -1105,7 +1685,7 @@ if (isset($_GET['api'])) {
             }
 
             $demoDb = getUserDB($demoId);
-            $demoLoad = loadDemoDataIntoDb($demoDb, ['move_images' => true]);
+            $demoLoad = loadDemoDataIntoDb($demoDb, ['move_images' => true, 'auth_db' => $authDb, 'owner_user_id' => $demoId]);
 
             $_SESSION['user_id'] = $demoId;
             session_regenerate_id(true);
@@ -1225,6 +1805,7 @@ if (isset($_GET['api'])) {
             echo json_encode(['success' => false, 'message' => '请先登录', 'code' => 'AUTH_REQUIRED'], JSON_UNESCAPED_UNICODE);
             exit;
         }
+        $currentUserIsDemoScope = isDemoUser($currentUser);
 
         if ($api === 'auth/users') {
             if (!isAdminUser($currentUser)) {
@@ -1298,13 +1879,13 @@ if (isset($_GET['api'])) {
                 $totalCategories = $db->query("SELECT COUNT(*) FROM categories")->fetchColumn();
                 $totalLocations = $db->query("SELECT COUNT(*) FROM locations")->fetchColumn();
                 $totalValue = $db->query("SELECT COALESCE(SUM(purchase_price * quantity),0) FROM items WHERE deleted_at IS NULL")->fetchColumn();
-                $recentItems = $db->query("SELECT i.*, c.name as category_name, c.icon as category_icon, l.name as location_name FROM items i LEFT JOIN categories c ON i.category_id=c.id LEFT JOIN locations l ON i.location_id=l.id WHERE i.deleted_at IS NULL ORDER BY i.updated_at DESC LIMIT 8")->fetchAll();
+                $recentItems = $db->query("SELECT i.*, c.name as category_name, c.icon as category_icon, sc.name as subcategory_name, sc.icon as subcategory_icon, l.name as location_name FROM items i LEFT JOIN categories c ON i.category_id=c.id LEFT JOIN categories sc ON i.subcategory_id=sc.id LEFT JOIN locations l ON i.location_id=l.id WHERE i.deleted_at IS NULL ORDER BY i.updated_at DESC LIMIT 8")->fetchAll();
                 $categoryStats = $db->query("SELECT c.name, c.icon, c.color, COUNT(i.id) as count, COALESCE(SUM(i.quantity),0) as total_qty FROM categories c LEFT JOIN items i ON c.id=i.category_id AND i.deleted_at IS NULL AND i.status='active' GROUP BY c.id ORDER BY count DESC")->fetchAll();
                 $statusStats = $db->query("SELECT status, COUNT(*) as count, COALESCE(SUM(quantity),0) as total_qty FROM items WHERE deleted_at IS NULL GROUP BY status ORDER BY total_qty DESC")->fetchAll();
                 $uncategorizedQty = $db->query("SELECT COALESCE(SUM(i.quantity),0) FROM items i LEFT JOIN categories c ON i.category_id=c.id WHERE i.deleted_at IS NULL AND i.status='active' AND (i.category_id=0 OR c.id IS NULL)")->fetchColumn();
-                $expiringItems = $db->query("SELECT i.*, c.name as category_name, c.icon as category_icon, l.name as location_name FROM items i LEFT JOIN categories c ON i.category_id=c.id LEFT JOIN locations l ON i.location_id=l.id WHERE i.deleted_at IS NULL AND i.expiry_date != '' AND i.expiry_date IS NOT NULL ORDER BY i.expiry_date ASC LIMIT 10")->fetchAll();
+                $expiringItems = $db->query("SELECT i.*, c.name as category_name, c.icon as category_icon, sc.name as subcategory_name, sc.icon as subcategory_icon, l.name as location_name FROM items i LEFT JOIN categories c ON i.category_id=c.id LEFT JOIN categories sc ON i.subcategory_id=sc.id LEFT JOIN locations l ON i.location_id=l.id WHERE i.deleted_at IS NULL AND i.expiry_date != '' AND i.expiry_date IS NOT NULL ORDER BY i.expiry_date ASC LIMIT 10")->fetchAll();
                 seedReminderInstancesFromItems($db);
-                $reminderItems = $db->query("SELECT
+                    $reminderItems = $db->query("SELECT
                         r.id as reminder_instance_id,
                         r.due_date as reminder_due_date,
                         COALESCE(r.is_completed,0) as reminder_completed,
@@ -1312,10 +1893,13 @@ if (isset($_GET['api'])) {
                         i.*,
                         c.name as category_name,
                         c.icon as category_icon,
+                        sc.name as subcategory_name,
+                        sc.icon as subcategory_icon,
                         l.name as location_name
                     FROM item_reminder_instances r
                     INNER JOIN items i ON i.id=r.item_id
                     LEFT JOIN categories c ON i.category_id=c.id
+                    LEFT JOIN categories sc ON i.subcategory_id=sc.id
                     LEFT JOIN locations l ON i.location_id=l.id
                     WHERE i.deleted_at IS NULL
                       AND r.due_date != ''
@@ -1363,19 +1947,28 @@ if (isset($_GET['api'])) {
                             OR CAST(i.quantity AS TEXT) LIKE ?
                             OR CAST(i.purchase_price AS TEXT) LIKE ?
                             OR c.name LIKE ?
+                            OR sc.name LIKE ?
                             OR l.name LIKE ?
                             OR i.status LIKE ?
                             OR (CASE i.status WHEN 'active' THEN '使用中' WHEN 'archived' THEN '已归档' WHEN 'sold' THEN '已转卖' ELSE i.status END) LIKE ?
                         )";
                         $s = "%$search%";
-                        $params = array_merge($params, [$s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s]);
+                        $params = array_merge($params, [$s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s]);
                     }
                     if ($category !== 0) {
                         if ($category === -1) {
                             $where[] = "(i.category_id=0 OR c.id IS NULL)";
                         } else {
-                            $where[] = "i.category_id = ?";
-                            $params[] = $category;
+                            $catTypeStmt = $db->prepare("SELECT parent_id FROM categories WHERE id=? LIMIT 1");
+                            $catTypeStmt->execute([$category]);
+                            $catParentId = intval($catTypeStmt->fetchColumn() ?: 0);
+                            if ($catParentId > 0) {
+                                $where[] = "i.subcategory_id = ?";
+                                $params[] = $category;
+                            } else {
+                                $where[] = "i.category_id = ?";
+                                $params[] = $category;
+                            }
                         }
                     }
                     if ($location !== 0) {
@@ -1398,7 +1991,12 @@ if (isset($_GET['api'])) {
                     $allowedSort = ['name', 'quantity', 'purchase_price', 'created_at', 'updated_at', 'expiry_date'];
                     $sortCol = in_array($sort, $allowedSort) ? $sort : 'updated_at';
 
-                    $countStmt = $db->prepare("SELECT COUNT(*) FROM items i LEFT JOIN categories c ON i.category_id=c.id LEFT JOIN locations l ON i.location_id=l.id $whereSQL");
+                    $countStmt = $db->prepare("SELECT COUNT(*)
+                        FROM items i
+                        LEFT JOIN categories c ON i.category_id=c.id
+                        LEFT JOIN categories sc ON i.subcategory_id=sc.id
+                        LEFT JOIN locations l ON i.location_id=l.id
+                        $whereSQL");
                     $countStmt->execute($params);
                     $total = $countStmt->fetchColumn();
 
@@ -1408,7 +2006,20 @@ if (isset($_GET['api'])) {
                         $orderBy = "(i.expiry_date='' OR i.expiry_date IS NULL) ASC, i.expiry_date $order";
                     }
 
-                    $stmt = $db->prepare("SELECT i.*, c.name as category_name, c.icon as category_icon, c.color as category_color, l.name as location_name FROM items i LEFT JOIN categories c ON i.category_id=c.id LEFT JOIN locations l ON i.location_id=l.id $whereSQL ORDER BY $orderBy LIMIT $limit OFFSET $offset");
+                    $stmt = $db->prepare("SELECT
+                            i.*,
+                            c.name as category_name,
+                            c.icon as category_icon,
+                            c.color as category_color,
+                            sc.name as subcategory_name,
+                            sc.icon as subcategory_icon,
+                            l.name as location_name
+                        FROM items i
+                        LEFT JOIN categories c ON i.category_id=c.id
+                        LEFT JOIN categories sc ON i.subcategory_id=sc.id
+                        LEFT JOIN locations l ON i.location_id=l.id
+                        $whereSQL
+                        ORDER BY $orderBy LIMIT $limit OFFSET $offset");
                     $stmt->execute($params);
                     $items = $stmt->fetchAll();
 
@@ -1432,10 +2043,17 @@ if (isset($_GET['api'])) {
                         $reminderNextDate = $reminderDate;
                     }
                     $reminderNote = trim((string) ($data['reminder_note'] ?? ''));
-                    $stmt = $db->prepare("INSERT INTO items (name, category_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+                    $shareFlag = intval($data['is_public_shared'] ?? 0) === 1 ? 1 : 0;
+                    [$categoryId, $subcategoryId, $categoryError] = normalizeItemCategorySelection($db, intval($data['category_id'] ?? 0), intval($data['subcategory_id'] ?? 0));
+                    if ($categoryError) {
+                        $result = ['success' => false, 'message' => $categoryError];
+                        break;
+                    }
+                    $stmt = $db->prepare("INSERT INTO items (name, category_id, subcategory_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, is_public_shared, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
                     $stmt->execute([
                         $data['name'],
-                        intval($data['category_id'] ?? 0),
+                        $categoryId,
+                        $subcategoryId,
                         intval($data['location_id'] ?? 0),
                         max(0, intval($data['quantity'] ?? 1)),
                         $data['description'] ?? '',
@@ -1448,6 +2066,7 @@ if (isset($_GET['api'])) {
                         $data['expiry_date'] ?? '',
                         $data['purchase_from'] ?? '',
                         $data['notes'] ?? '',
+                        $shareFlag,
                         $reminderDate,
                         $reminderNextDate,
                         $reminderValue,
@@ -1456,6 +2075,7 @@ if (isset($_GET['api'])) {
                     ]);
                     $newItemId = intval($db->lastInsertId());
                     syncItemReminderInstances($db, $newItemId, $reminderDate, $reminderNextDate, $reminderValue, $reminderUnit);
+                    syncPublicSharedItem($authDb, $db, intval($currentUser['id']), $newItemId, $shareFlag);
                     $result = ['success' => true, 'message' => '添加成功', 'id' => $newItemId];
                 }
                 break;
@@ -1480,10 +2100,17 @@ if (isset($_GET['api'])) {
                         $reminderNextDate = $reminderDate;
                     }
                     $reminderNote = trim((string) ($data['reminder_note'] ?? ''));
-                    $stmt = $db->prepare("UPDATE items SET name=?, category_id=?, location_id=?, quantity=?, description=?, image=?, barcode=?, purchase_date=?, purchase_price=?, tags=?, status=?, expiry_date=?, purchase_from=?, notes=?, reminder_date=?, reminder_next_date=?, reminder_cycle_value=?, reminder_cycle_unit=?, reminder_note=?, updated_at=CURRENT_TIMESTAMP WHERE id=?");
+                    $shareFlag = intval($data['is_public_shared'] ?? 0) === 1 ? 1 : 0;
+                    [$categoryId, $subcategoryId, $categoryError] = normalizeItemCategorySelection($db, intval($data['category_id'] ?? 0), intval($data['subcategory_id'] ?? 0));
+                    if ($categoryError) {
+                        $result = ['success' => false, 'message' => $categoryError];
+                        break;
+                    }
+                    $stmt = $db->prepare("UPDATE items SET name=?, category_id=?, subcategory_id=?, location_id=?, quantity=?, description=?, image=?, barcode=?, purchase_date=?, purchase_price=?, tags=?, status=?, expiry_date=?, purchase_from=?, notes=?, is_public_shared=?, reminder_date=?, reminder_next_date=?, reminder_cycle_value=?, reminder_cycle_unit=?, reminder_note=?, updated_at=CURRENT_TIMESTAMP WHERE id=?");
                     $stmt->execute([
                         $data['name'],
-                        intval($data['category_id'] ?? 0),
+                        $categoryId,
+                        $subcategoryId,
                         intval($data['location_id'] ?? 0),
                         max(0, intval($data['quantity'] ?? 1)),
                         $data['description'] ?? '',
@@ -1496,6 +2123,7 @@ if (isset($_GET['api'])) {
                         $data['expiry_date'] ?? '',
                         $data['purchase_from'] ?? '',
                         $data['notes'] ?? '',
+                        $shareFlag,
                         $reminderDate,
                         $reminderNextDate,
                         $reminderValue,
@@ -1504,6 +2132,7 @@ if (isset($_GET['api'])) {
                         intval($data['id'])
                     ]);
                     syncItemReminderInstances($db, intval($data['id']), $reminderDate, $reminderNextDate, $reminderValue, $reminderUnit);
+                    syncPublicSharedItem($authDb, $db, intval($currentUser['id']), intval($data['id']), $shareFlag);
                     $result = ['success' => true, 'message' => '更新成功'];
                 }
                 break;
@@ -1663,6 +2292,7 @@ if (isset($_GET['api'])) {
                     if ($img && file_exists(UPLOAD_DIR . $img))
                         @rename(UPLOAD_DIR . $img, TRASH_DIR . $img);
                     $db->exec("UPDATE items SET deleted_at=datetime('now','localtime') WHERE id=$id");
+                    removePublicSharedItem($authDb, intval($currentUser['id']), $id);
                     $result = ['success' => true, 'message' => '已移入回收站'];
                 }
                 break;
@@ -1679,6 +2309,7 @@ if (isset($_GET['api'])) {
                                 @rename(UPLOAD_DIR . $img, TRASH_DIR . $img);
                         }
                         $db->exec("UPDATE items SET deleted_at=datetime('now','localtime') WHERE id IN ($placeholders)");
+                        removePublicSharedItemsByOwner($authDb, intval($currentUser['id']), $ids);
                     }
                     $result = ['success' => true, 'message' => '已移入回收站'];
                 }
@@ -1702,6 +2333,7 @@ if (isset($_GET['api'])) {
                         }
                     }
                     $deleted = $db->exec("DELETE FROM items");
+                    removePublicSharedItemsByOwner($authDb, intval($currentUser['id']));
                     try {
                         $db->exec("DELETE FROM sqlite_sequence WHERE name='items'");
                     } catch (Exception $e) { /* 某些 SQLite 版本可能无该表 */ }
@@ -1720,7 +2352,7 @@ if (isset($_GET['api'])) {
 
                     $db->beginTransaction();
                     try {
-                        $stmt = $db->prepare("INSERT INTO items (name, category_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, reminder_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+                        $stmt = $db->prepare("INSERT INTO items (name, category_id, subcategory_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, reminder_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
                         $created = 0;
                         $skipped = 0;
                         $errors = [];
@@ -1748,10 +2380,23 @@ if (isset($_GET['api'])) {
                                 continue;
                             }
 
+                            [$categoryId, $subcategoryId, $categoryError] = normalizeItemCategorySelection(
+                                $db,
+                                intval($row['category_id'] ?? 0),
+                                intval($row['subcategory_id'] ?? 0)
+                            );
+                            if ($categoryError) {
+                                $skipped++;
+                                if (count($errors) < 20)
+                                    $errors[] = '第 ' . ($idx + 2) . ' 行：' . $categoryError;
+                                continue;
+                            }
+
                             try {
                                 $stmt->execute([
                                     $name,
-                                    intval($row['category_id'] ?? 0),
+                                    $categoryId,
+                                    $subcategoryId,
                                     intval($row['location_id'] ?? 0),
                                     max(0, intval($row['quantity'] ?? 1)),
                                     trim((string) ($row['description'] ?? '')),
@@ -1801,6 +2446,7 @@ if (isset($_GET['api'])) {
                         $db->exec("DELETE FROM categories");
                         $db->exec("DELETE FROM locations");
                         $db->exec("DELETE FROM shopping_list");
+                        removePublicSharedItemsByOwner($authDb, intval($currentUser['id']));
                         try {
                             $db->exec("DELETE FROM sqlite_sequence WHERE name IN ('items','categories','locations','shopping_list')");
                         } catch (Exception $e) { /* 某些 SQLite 版本可能无该表 */ }
@@ -1819,7 +2465,7 @@ if (isset($_GET['api'])) {
 
             case 'system/load-demo':
                 if ($method === 'POST') {
-                    $demoLoad = loadDemoDataIntoDb($db, ['move_images' => true]);
+                    $demoLoad = loadDemoDataIntoDb($db, ['move_images' => true, 'auth_db' => $authDb, 'owner_user_id' => intval($currentUser['id'])]);
                     $result = array_merge(['success' => true], $demoLoad);
                 }
                 break;
@@ -1827,7 +2473,7 @@ if (isset($_GET['api'])) {
             // ---------- 回收站 ----------
             case 'trash':
                 if ($method === 'GET') {
-                    $trashItems = $db->query("SELECT i.*, c.name as category_name, c.icon as category_icon, c.color as category_color, l.name as location_name FROM items i LEFT JOIN categories c ON i.category_id=c.id LEFT JOIN locations l ON i.location_id=l.id WHERE i.deleted_at IS NOT NULL ORDER BY i.deleted_at DESC")->fetchAll();
+                    $trashItems = $db->query("SELECT i.*, c.name as category_name, c.icon as category_icon, c.color as category_color, sc.name as subcategory_name, sc.icon as subcategory_icon, l.name as location_name FROM items i LEFT JOIN categories c ON i.category_id=c.id LEFT JOIN categories sc ON i.subcategory_id=sc.id LEFT JOIN locations l ON i.location_id=l.id WHERE i.deleted_at IS NOT NULL ORDER BY i.deleted_at DESC")->fetchAll();
                     $result = ['success' => true, 'data' => $trashItems];
                 }
                 break;
@@ -1840,6 +2486,10 @@ if (isset($_GET['api'])) {
                     if ($img && file_exists(TRASH_DIR . $img))
                         @rename(TRASH_DIR . $img, UPLOAD_DIR . $img);
                     $db->exec("UPDATE items SET deleted_at=NULL, updated_at=datetime('now','localtime') WHERE id=$id");
+                    $shareRow = getItemShareSnapshot($db, $id);
+                    if ($shareRow) {
+                        syncPublicSharedItem($authDb, $db, intval($currentUser['id']), $id, intval($shareRow['is_public_shared'] ?? 0));
+                    }
                     $result = ['success' => true, 'message' => '已恢复'];
                 }
                 break;
@@ -1856,6 +2506,12 @@ if (isset($_GET['api'])) {
                                 @rename(TRASH_DIR . $img, UPLOAD_DIR . $img);
                         }
                         $db->exec("UPDATE items SET deleted_at=NULL, updated_at=datetime('now','localtime') WHERE id IN ($placeholders)");
+                        foreach ($ids as $rid) {
+                            $shareRow = getItemShareSnapshot($db, $rid);
+                            if ($shareRow) {
+                                syncPublicSharedItem($authDb, $db, intval($currentUser['id']), $rid, intval($shareRow['is_public_shared'] ?? 0));
+                            }
+                        }
                     }
                     $result = ['success' => true, 'message' => '已全部恢复'];
                 }
@@ -1888,16 +2544,47 @@ if (isset($_GET['api'])) {
             // ---------- 分类 CRUD ----------
             case 'categories':
                 if ($method === 'GET') {
-                    $cats = $db->query("SELECT c.*, (SELECT COUNT(*) FROM items WHERE category_id=c.id AND deleted_at IS NULL) as item_count FROM categories c ORDER BY c.sort_order, c.name")->fetchAll();
+                    $cats = $db->query("SELECT
+                            c.*,
+                            COALESCE(p.name, '') AS parent_name,
+                            (SELECT COUNT(*) FROM items i WHERE i.deleted_at IS NULL AND ((c.parent_id>0 AND i.subcategory_id=c.id) OR (c.parent_id=0 AND i.category_id=c.id))) AS direct_item_count,
+                            (SELECT COUNT(*) FROM items i WHERE i.deleted_at IS NULL AND ((c.parent_id>0 AND i.subcategory_id=c.id) OR (c.parent_id=0 AND i.category_id=c.id))) AS item_count,
+                            (SELECT COUNT(*) FROM categories sc WHERE sc.parent_id=c.id) AS child_count
+                        FROM categories c
+                        LEFT JOIN categories p ON p.id=c.parent_id
+                        ORDER BY c.parent_id ASC, c.sort_order, c.name")->fetchAll();
                     $result = ['success' => true, 'data' => $cats];
                 } elseif ($method === 'POST') {
                     $data = json_decode(file_get_contents('php://input'), true);
-                    if (empty($data['name'])) {
+                    $name = trim((string) ($data['name'] ?? ''));
+                    $icon = trim((string) ($data['icon'] ?? '📦'));
+                    $color = trim((string) ($data['color'] ?? '#3b82f6'));
+                    $parentId = max(0, intval($data['parent_id'] ?? 0));
+                    if ($name === '') {
                         $result = ['success' => false, 'message' => '分类名称不能为空'];
                         break;
                     }
-                    $stmt = $db->prepare("INSERT INTO categories (name, icon, color) VALUES (?,?,?)");
-                    $stmt->execute([$data['name'], $data['icon'] ?? '📦', $data['color'] ?? '#3b82f6']);
+                    if ($parentId > 0) {
+                        $parentStmt = $db->prepare("SELECT id, parent_id FROM categories WHERE id=? LIMIT 1");
+                        $parentStmt->execute([$parentId]);
+                        $parentRow = $parentStmt->fetch();
+                        if (!$parentRow) {
+                            $result = ['success' => false, 'message' => '上级分类不存在'];
+                            break;
+                        }
+                        if (intval($parentRow['parent_id'] ?? 0) > 0) {
+                            $result = ['success' => false, 'message' => '仅支持两级分类，二级分类不能再作为上级'];
+                            break;
+                        }
+                    }
+                    $dupStmt = $db->prepare("SELECT id FROM categories WHERE name=? LIMIT 1");
+                    $dupStmt->execute([$name]);
+                    if ($dupStmt->fetchColumn()) {
+                        $result = ['success' => false, 'message' => '分类名称已存在'];
+                        break;
+                    }
+                    $stmt = $db->prepare("INSERT INTO categories (name, parent_id, icon, color) VALUES (?,?,?,?)");
+                    $stmt->execute([$name, $parentId, ($icon !== '' ? $icon : '📦'), ($color !== '' ? $color : '#3b82f6')]);
                     $result = ['success' => true, 'message' => '分类添加成功', 'id' => $db->lastInsertId()];
                 }
                 break;
@@ -1905,8 +2592,57 @@ if (isset($_GET['api'])) {
             case 'categories/update':
                 if ($method === 'POST') {
                     $data = json_decode(file_get_contents('php://input'), true);
-                    $stmt = $db->prepare("UPDATE categories SET name=?, icon=?, color=? WHERE id=?");
-                    $stmt->execute([$data['name'], $data['icon'] ?? '📦', $data['color'] ?? '#3b82f6', intval($data['id'])]);
+                    $id = intval($data['id'] ?? 0);
+                    $name = trim((string) ($data['name'] ?? ''));
+                    $icon = trim((string) ($data['icon'] ?? '📦'));
+                    $color = trim((string) ($data['color'] ?? '#3b82f6'));
+                    $parentId = max(0, intval($data['parent_id'] ?? 0));
+                    if ($id <= 0) {
+                        $result = ['success' => false, 'message' => '缺少分类ID'];
+                        break;
+                    }
+                    if ($name === '') {
+                        $result = ['success' => false, 'message' => '分类名称不能为空'];
+                        break;
+                    }
+                    if ($parentId === $id) {
+                        $result = ['success' => false, 'message' => '分类不能设置自己为上级'];
+                        break;
+                    }
+                    $currentStmt = $db->prepare("SELECT id, parent_id FROM categories WHERE id=? LIMIT 1");
+                    $currentStmt->execute([$id]);
+                    $currentCat = $currentStmt->fetch();
+                    if (!$currentCat) {
+                        $result = ['success' => false, 'message' => '分类不存在'];
+                        break;
+                    }
+                    if ($parentId > 0) {
+                        $parentStmt = $db->prepare("SELECT id, parent_id FROM categories WHERE id=? LIMIT 1");
+                        $parentStmt->execute([$parentId]);
+                        $parentRow = $parentStmt->fetch();
+                        if (!$parentRow) {
+                            $result = ['success' => false, 'message' => '上级分类不存在'];
+                            break;
+                        }
+                        if (intval($parentRow['parent_id'] ?? 0) > 0) {
+                            $result = ['success' => false, 'message' => '仅支持两级分类，二级分类不能再作为上级'];
+                            break;
+                        }
+                        $childCntStmt = $db->prepare("SELECT COUNT(*) FROM categories WHERE parent_id=?");
+                        $childCntStmt->execute([$id]);
+                        if (intval($childCntStmt->fetchColumn() ?: 0) > 0) {
+                            $result = ['success' => false, 'message' => '该分类下已有二级分类，无法直接设置为二级分类'];
+                            break;
+                        }
+                    }
+                    $dupStmt = $db->prepare("SELECT id FROM categories WHERE name=? AND id<>? LIMIT 1");
+                    $dupStmt->execute([$name, $id]);
+                    if ($dupStmt->fetchColumn()) {
+                        $result = ['success' => false, 'message' => '分类名称已存在'];
+                        break;
+                    }
+                    $stmt = $db->prepare("UPDATE categories SET name=?, parent_id=?, icon=?, color=? WHERE id=?");
+                    $stmt->execute([$name, $parentId, ($icon !== '' ? $icon : '📦'), ($color !== '' ? $color : '#3b82f6'), $id]);
                     $result = ['success' => true, 'message' => '分类更新成功'];
                 }
                 break;
@@ -1915,8 +2651,42 @@ if (isset($_GET['api'])) {
                 if ($method === 'POST') {
                     $data = json_decode(file_get_contents('php://input'), true);
                     $id = intval($data['id'] ?? 0);
-                    $db->exec("UPDATE items SET category_id=0 WHERE category_id=$id");
-                    $db->exec("DELETE FROM categories WHERE id=$id");
+                    if ($id <= 0) {
+                        $result = ['success' => false, 'message' => '缺少分类ID'];
+                        break;
+                    }
+                    $currentStmt = $db->prepare("SELECT id, parent_id FROM categories WHERE id=? LIMIT 1");
+                    $currentStmt->execute([$id]);
+                    $currentCat = $currentStmt->fetch();
+                    if (!$currentCat) {
+                        $result = ['success' => false, 'message' => '分类不存在'];
+                        break;
+                    }
+                    $isTopLevel = intval($currentCat['parent_id'] ?? 0) <= 0;
+                    $childStmt = $db->prepare("SELECT id FROM categories WHERE parent_id=?");
+                    $childStmt->execute([$id]);
+                    $childIds = array_map('intval', $childStmt->fetchAll(PDO::FETCH_COLUMN));
+                    $allIds = array_merge([$id], $childIds);
+                    $allIds = array_values(array_filter(array_unique($allIds), function ($v) {
+                        return intval($v) > 0;
+                    }));
+                    if (count($allIds) > 0) {
+                        if ($isTopLevel) {
+                            $clearTop = $db->prepare("UPDATE items SET category_id=0, subcategory_id=0 WHERE category_id=?");
+                            $clearTop->execute([$id]);
+                            if (count($childIds) > 0) {
+                                $childPlaceholders = implode(',', array_fill(0, count($childIds), '?'));
+                                $clearSubs = $db->prepare("UPDATE items SET subcategory_id=0 WHERE subcategory_id IN ($childPlaceholders)");
+                                $clearSubs->execute($childIds);
+                            }
+                        } else {
+                            $clearSub = $db->prepare("UPDATE items SET subcategory_id=0 WHERE subcategory_id=?");
+                            $clearSub->execute([$id]);
+                        }
+                        $placeholders = implode(',', array_fill(0, count($allIds), '?'));
+                        $deleteStmt = $db->prepare("DELETE FROM categories WHERE id IN ($placeholders)");
+                        $deleteStmt->execute($allIds);
+                    }
                     $result = ['success' => true, 'message' => '分类删除成功'];
                 }
                 break;
@@ -2144,17 +2914,23 @@ if (isset($_GET['api'])) {
                         break;
                     }
                     $qty = max(1, intval($row['quantity'] ?? 1));
-                    $categoryId = max(0, intval($row['category_id'] ?? 0));
+                    $categoryIdRaw = max(0, intval($row['category_id'] ?? 0));
+                    [$categoryId, $subcategoryId, $categoryError] = normalizeItemCategorySelection($db, $categoryIdRaw, 0);
+                    if ($categoryError) {
+                        $categoryId = 0;
+                        $subcategoryId = 0;
+                    }
                     $price = max(0, floatval($row['planned_price'] ?? 0));
                     $notes = trim((string) ($row['notes'] ?? ''));
 
                     $db->beginTransaction();
                     try {
-                        $insert = $db->prepare("INSERT INTO items (name, category_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note)
-                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+                        $insert = $db->prepare("INSERT INTO items (name, category_id, subcategory_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
                         $insert->execute([
                             $row['name'],
                             $categoryId,
+                            $subcategoryId,
                             0,
                             $qty,
                             '',
@@ -2183,6 +2959,458 @@ if (isset($_GET['api'])) {
                             $db->rollBack();
                         throw $e;
                     }
+                }
+                break;
+
+            // ---------- 公共频道 ----------
+            case 'public-channel':
+                if ($method === 'GET') {
+                    $rows = $authDb->query("SELECT
+                            p.id,
+                            p.owner_user_id,
+                            p.owner_item_id,
+                            p.item_name,
+                            p.category_name,
+                            p.purchase_price,
+                            p.purchase_from,
+                            p.recommend_reason,
+                            p.owner_item_updated_at,
+                            p.created_at,
+                            p.updated_at,
+                            u.username,
+                            u.display_name
+                        FROM public_shared_items p
+                        LEFT JOIN users u ON u.id=p.owner_user_id
+                        ORDER BY p.updated_at DESC, p.id DESC")->fetchAll();
+                    $staleIds = [];
+                    $sharedList = [];
+                    foreach ($rows as $row) {
+                        $shareId = intval($row['id'] ?? 0);
+                        $ownerId = intval($row['owner_user_id'] ?? 0);
+                        $ownerItemId = intval($row['owner_item_id'] ?? 0);
+                        $ownerUsername = trim((string) ($row['username'] ?? ''));
+                        if ($shareId <= 0 || $ownerId <= 0 || $ownerItemId <= 0) {
+                            if ($shareId > 0) {
+                                $staleIds[] = $shareId;
+                            }
+                            continue;
+                        }
+                        if (isDemoUsername($ownerUsername) !== $currentUserIsDemoScope) {
+                            continue;
+                        }
+                        try {
+                            $ownerDb = getUserDB($ownerId);
+                        } catch (Exception $e) {
+                            $staleIds[] = $shareId;
+                            continue;
+                        }
+                        $live = getItemShareSnapshot($ownerDb, $ownerItemId);
+                        if (!$live || intval($live['is_public_shared'] ?? 0) !== 1) {
+                            $staleIds[] = $shareId;
+                            continue;
+                        }
+                        $isChanged = trim((string) ($row['item_name'] ?? '')) !== trim((string) ($live['name'] ?? ''))
+                            || trim((string) ($row['category_name'] ?? '')) !== trim((string) ($live['category_name'] ?? ''))
+                            || floatval($row['purchase_price'] ?? 0) != floatval($live['purchase_price'] ?? 0)
+                            || trim((string) ($row['purchase_from'] ?? '')) !== trim((string) ($live['purchase_from'] ?? ''))
+                            || trim((string) ($row['recommend_reason'] ?? '')) !== trim((string) ($live['recommend_reason'] ?? ''))
+                            || trim((string) ($row['owner_item_updated_at'] ?? '')) !== trim((string) ($live['updated_at'] ?? ''));
+                        if ($isChanged) {
+                            upsertPublicSharedItem($authDb, $ownerId, $live);
+                        }
+                        $ownerName = trim((string) ($row['display_name'] ?? ''));
+                        if ($ownerName === '') {
+                            $ownerName = trim((string) ($row['username'] ?? ''));
+                        }
+                        if ($ownerName === '') {
+                            $ownerName = '用户#' . $ownerId;
+                        }
+                        $sharedList[] = [
+                            'id' => $shareId,
+                            'owner_user_id' => $ownerId,
+                            'owner_item_id' => $ownerItemId,
+                            'category_id' => intval($live['category_id'] ?? 0),
+                            'owner_name' => $ownerName,
+                            'item_name' => trim((string) ($live['name'] ?? '')),
+                            'category_name' => trim((string) ($live['category_name'] ?? '')),
+                            'purchase_price' => max(0, floatval($live['purchase_price'] ?? 0)),
+                            'purchase_from' => trim((string) ($live['purchase_from'] ?? '')),
+                            'recommend_reason' => trim((string) ($live['recommend_reason'] ?? '')),
+                            'owner_item_updated_at' => trim((string) ($live['updated_at'] ?? '')),
+                            'created_at' => $row['created_at'] ?? '',
+                            'updated_at' => $row['updated_at'] ?? '',
+                            'can_edit' => ($ownerId === intval($currentUser['id']))
+                        ];
+                    }
+                    if (count($staleIds) > 0) {
+                        $staleIds = array_values(array_unique(array_map('intval', $staleIds)));
+                        $staleIds = array_values(array_filter($staleIds, function ($v) {
+                            return $v > 0;
+                        }));
+                        if (count($staleIds) > 0) {
+                            $placeholders = implode(',', array_fill(0, count($staleIds), '?'));
+                            $cleanStmt = $authDb->prepare("DELETE FROM public_shared_items WHERE id IN ($placeholders)");
+                            $cleanStmt->execute($staleIds);
+                            removePublicSharedCommentsByShareIds($authDb, $staleIds);
+                        }
+                    }
+                    if (count($sharedList) > 0) {
+                        $shareIds = array_values(array_filter(array_map(function ($v) {
+                            return intval($v['id'] ?? 0);
+                        }, $sharedList), function ($v) {
+                            return $v > 0;
+                        }));
+                        if (count($shareIds) > 0) {
+                            $placeholders = implode(',', array_fill(0, count($shareIds), '?'));
+                            $commentStmt = $authDb->prepare("SELECT
+                                    c.id,
+                                    c.shared_id,
+                                    c.user_id,
+                                    c.content,
+                                    c.created_at,
+                                    u.username,
+                                    u.display_name
+                                FROM public_shared_comments c
+                                LEFT JOIN users u ON u.id=c.user_id
+                                WHERE c.shared_id IN ($placeholders)
+                                ORDER BY c.created_at ASC, c.id ASC");
+                            $commentStmt->execute($shareIds);
+                            $commentRows = $commentStmt->fetchAll();
+                            $commentMap = [];
+                            foreach ($commentRows as $commentRow) {
+                                $sid = intval($commentRow['shared_id'] ?? 0);
+                                if ($sid <= 0) {
+                                    continue;
+                                }
+                                $commentUserName = trim((string) ($commentRow['display_name'] ?? ''));
+                                if ($commentUserName === '') {
+                                    $commentUserName = trim((string) ($commentRow['username'] ?? ''));
+                                }
+                                if ($commentUserName === '') {
+                                    $commentUserName = '用户#' . intval($commentRow['user_id'] ?? 0);
+                                }
+                                if (!isset($commentMap[$sid])) {
+                                    $commentMap[$sid] = [];
+                                }
+                                $commentMap[$sid][] = [
+                                    'id' => intval($commentRow['id'] ?? 0),
+                                    'shared_id' => $sid,
+                                    'user_id' => intval($commentRow['user_id'] ?? 0),
+                                    'user_name' => $commentUserName,
+                                    'content' => trim((string) ($commentRow['content'] ?? '')),
+                                    'created_at' => trim((string) ($commentRow['created_at'] ?? '')),
+                                    'can_delete' => (
+                                        intval($commentRow['user_id'] ?? 0) === intval($currentUser['id'])
+                                        || isAdminUser($currentUser)
+                                    )
+                                ];
+                            }
+                            foreach ($sharedList as &$sharedItem) {
+                                $sid = intval($sharedItem['id'] ?? 0);
+                                $comments = $commentMap[$sid] ?? [];
+                                $sharedItem['comments'] = $comments;
+                                $sharedItem['comment_count'] = count($comments);
+                            }
+                            unset($sharedItem);
+                        }
+                    }
+                    $result = ['success' => true, 'data' => $sharedList];
+                }
+                break;
+
+            case 'public-channel/update':
+                if ($method === 'POST') {
+                    $data = json_decode(file_get_contents('php://input'), true);
+                    $sharedId = intval($data['shared_id'] ?? 0);
+                    if ($sharedId <= 0) {
+                        $result = ['success' => false, 'message' => '缺少共享物品ID'];
+                        break;
+                    }
+                    $shareStmt = $authDb->prepare("SELECT
+                            p.id,
+                            p.owner_user_id,
+                            p.owner_item_id,
+                            u.username AS owner_username
+                        FROM public_shared_items p
+                        LEFT JOIN users u ON u.id=p.owner_user_id
+                        WHERE p.id=?
+                        LIMIT 1");
+                    $shareStmt->execute([$sharedId]);
+                    $shareRow = $shareStmt->fetch();
+                    if (!$shareRow) {
+                        $result = ['success' => false, 'message' => '共享记录不存在或已失效'];
+                        break;
+                    }
+                    if (isDemoUsername($shareRow['owner_username'] ?? '') !== $currentUserIsDemoScope) {
+                        $result = ['success' => false, 'message' => '共享记录不存在或已失效'];
+                        break;
+                    }
+                    $ownerId = intval($shareRow['owner_user_id'] ?? 0);
+                    $ownerItemId = intval($shareRow['owner_item_id'] ?? 0);
+                    if ($ownerId !== intval($currentUser['id'])) {
+                        $result = ['success' => false, 'message' => '仅发布者可以编辑该共享物品'];
+                        break;
+                    }
+                    if ($ownerItemId <= 0) {
+                        $result = ['success' => false, 'message' => '共享记录无效'];
+                        break;
+                    }
+                    $itemName = trim((string) ($data['item_name'] ?? ''));
+                    if ($itemName === '') {
+                        $result = ['success' => false, 'message' => '物品名称不能为空'];
+                        break;
+                    }
+                    $categoryId = max(0, intval($data['category_id'] ?? 0));
+                    if ($categoryId > 0) {
+                        $catExistsStmt = $db->prepare("SELECT id FROM categories WHERE id=? LIMIT 1");
+                        $catExistsStmt->execute([$categoryId]);
+                        if (!$catExistsStmt->fetchColumn()) {
+                            $result = ['success' => false, 'message' => '分类不存在'];
+                            break;
+                        }
+                    }
+                    $purchasePrice = max(0, floatval($data['purchase_price'] ?? 0));
+                    $purchaseFrom = trim((string) ($data['purchase_from'] ?? ''));
+                    $recommendReason = trim((string) ($data['recommend_reason'] ?? ''));
+                    if (function_exists('mb_substr')) {
+                        $recommendReason = mb_substr($recommendReason, 0, 300, 'UTF-8');
+                    } else {
+                        $recommendReason = substr($recommendReason, 0, 300);
+                    }
+                    $existsStmt = $db->prepare("SELECT is_public_shared FROM items WHERE id=? AND deleted_at IS NULL LIMIT 1");
+                    $existsStmt->execute([$ownerItemId]);
+                    $existsRow = $existsStmt->fetch();
+                    if (!$existsRow || intval($existsRow['is_public_shared'] ?? 0) !== 1) {
+                        removePublicSharedItem($authDb, intval($currentUser['id']), $ownerItemId);
+                        $result = ['success' => false, 'message' => '该共享物品已取消共享或不存在'];
+                        break;
+                    }
+                    $updateStmt = $db->prepare("UPDATE items
+                        SET name=?, category_id=?, purchase_price=?, purchase_from=?, public_recommend_reason=?, updated_at=datetime('now','localtime')
+                        WHERE id=? AND deleted_at IS NULL");
+                    $updateStmt->execute([$itemName, $categoryId, $purchasePrice, $purchaseFrom, $recommendReason, $ownerItemId]);
+                    syncPublicSharedItem($authDb, $db, intval($currentUser['id']), $ownerItemId, 1);
+                    $result = ['success' => true, 'message' => '共享物品已更新'];
+                }
+                break;
+
+            case 'public-channel/comment':
+                if ($method === 'POST') {
+                    $data = json_decode(file_get_contents('php://input'), true);
+                    $sharedId = intval($data['shared_id'] ?? 0);
+                    $content = trim((string) ($data['content'] ?? ''));
+                    if ($sharedId <= 0) {
+                        $result = ['success' => false, 'message' => '缺少共享物品ID'];
+                        break;
+                    }
+                    if ($content === '') {
+                        $result = ['success' => false, 'message' => '评论内容不能为空'];
+                        break;
+                    }
+                    if (function_exists('mb_substr')) {
+                        $content = mb_substr($content, 0, 300, 'UTF-8');
+                    } else {
+                        $content = substr($content, 0, 300);
+                    }
+                    $shareStmt = $authDb->prepare("SELECT
+                            p.owner_user_id,
+                            p.owner_item_id,
+                            u.username AS owner_username
+                        FROM public_shared_items p
+                        LEFT JOIN users u ON u.id=p.owner_user_id
+                        WHERE p.id=?
+                        LIMIT 1");
+                    $shareStmt->execute([$sharedId]);
+                    $shareRow = $shareStmt->fetch();
+                    if (!$shareRow) {
+                        $result = ['success' => false, 'message' => '共享记录不存在或已失效'];
+                        break;
+                    }
+                    if (isDemoUsername($shareRow['owner_username'] ?? '') !== $currentUserIsDemoScope) {
+                        $result = ['success' => false, 'message' => '共享记录不存在或已失效'];
+                        break;
+                    }
+                    $ownerId = intval($shareRow['owner_user_id'] ?? 0);
+                    $ownerItemId = intval($shareRow['owner_item_id'] ?? 0);
+                    try {
+                        $ownerDb = getUserDB($ownerId);
+                    } catch (Exception $e) {
+                        removePublicSharedCommentsByShareIds($authDb, [$sharedId]);
+                        $cleanStmt = $authDb->prepare("DELETE FROM public_shared_items WHERE id=?");
+                        $cleanStmt->execute([$sharedId]);
+                        $result = ['success' => false, 'message' => '共享记录已失效'];
+                        break;
+                    }
+                    $live = getItemShareSnapshot($ownerDb, $ownerItemId);
+                    if (!$live || intval($live['is_public_shared'] ?? 0) !== 1) {
+                        removePublicSharedCommentsByShareIds($authDb, [$sharedId]);
+                        $cleanStmt = $authDb->prepare("DELETE FROM public_shared_items WHERE id=?");
+                        $cleanStmt->execute([$sharedId]);
+                        $result = ['success' => false, 'message' => '该共享物品已取消共享或不存在'];
+                        break;
+                    }
+                    $insertStmt = $authDb->prepare("INSERT INTO public_shared_comments (shared_id, user_id, content, created_at, updated_at)
+                        VALUES (?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
+                    $insertStmt->execute([$sharedId, intval($currentUser['id']), $content]);
+                    $result = ['success' => true, 'message' => '评论已发布'];
+                }
+                break;
+
+            case 'public-channel/comment-delete':
+                if ($method === 'POST') {
+                    $data = json_decode(file_get_contents('php://input'), true);
+                    $commentId = intval($data['comment_id'] ?? 0);
+                    if ($commentId <= 0) {
+                        $result = ['success' => false, 'message' => '缺少评论ID'];
+                        break;
+                    }
+                    $stmt = $authDb->prepare("SELECT
+                            c.id,
+                            c.user_id,
+                            c.shared_id,
+                            u.username AS owner_username
+                        FROM public_shared_comments c
+                        LEFT JOIN public_shared_items p ON p.id=c.shared_id
+                        LEFT JOIN users u ON u.id=p.owner_user_id
+                        WHERE c.id=?
+                        LIMIT 1");
+                    $stmt->execute([$commentId]);
+                    $comment = $stmt->fetch();
+                    if (!$comment) {
+                        $result = ['success' => false, 'message' => '评论不存在或已删除'];
+                        break;
+                    }
+                    if (isDemoUsername($comment['owner_username'] ?? '') !== $currentUserIsDemoScope) {
+                        $result = ['success' => false, 'message' => '评论不存在或已删除'];
+                        break;
+                    }
+                    $commentUserId = intval($comment['user_id'] ?? 0);
+                    $canDelete = ($commentUserId === intval($currentUser['id'])) || isAdminUser($currentUser);
+                    if (!$canDelete) {
+                        $result = ['success' => false, 'message' => '仅评论者或管理员可删除评论'];
+                        break;
+                    }
+                    $delStmt = $authDb->prepare("DELETE FROM public_shared_comments WHERE id=?");
+                    $delStmt->execute([$commentId]);
+                    $result = ['success' => true, 'message' => '评论已删除'];
+                }
+                break;
+
+            case 'public-channel/add-to-shopping':
+                if ($method === 'POST') {
+                    $data = json_decode(file_get_contents('php://input'), true);
+                    $sharedId = intval($data['shared_id'] ?? 0);
+                    if ($sharedId <= 0) {
+                        $result = ['success' => false, 'message' => '缺少共享物品ID'];
+                        break;
+                    }
+                    $shareStmt = $authDb->prepare("SELECT
+                            p.id,
+                            p.owner_user_id,
+                            p.owner_item_id,
+                            p.recommend_reason,
+                            u.username,
+                            u.display_name
+                        FROM public_shared_items p
+                        LEFT JOIN users u ON u.id=p.owner_user_id
+                        WHERE p.id=?
+                        LIMIT 1");
+                    $shareStmt->execute([$sharedId]);
+                    $shareRow = $shareStmt->fetch();
+                    if (!$shareRow) {
+                        $result = ['success' => false, 'message' => '共享记录不存在或已失效'];
+                        break;
+                    }
+                    if (isDemoUsername($shareRow['username'] ?? '') !== $currentUserIsDemoScope) {
+                        $result = ['success' => false, 'message' => '共享记录不存在或已失效'];
+                        break;
+                    }
+                    $ownerId = intval($shareRow['owner_user_id'] ?? 0);
+                    $ownerItemId = intval($shareRow['owner_item_id'] ?? 0);
+                    if ($ownerId <= 0 || $ownerItemId <= 0) {
+                        $result = ['success' => false, 'message' => '共享记录无效'];
+                        break;
+                    }
+                    try {
+                        $ownerDb = getUserDB($ownerId);
+                    } catch (Exception $e) {
+                        removePublicSharedCommentsByShareIds($authDb, [$sharedId]);
+                        $cleanStmt = $authDb->prepare("DELETE FROM public_shared_items WHERE id=?");
+                        $cleanStmt->execute([$sharedId]);
+                        $result = ['success' => false, 'message' => '共享记录已失效'];
+                        break;
+                    }
+                    $live = getItemShareSnapshot($ownerDb, $ownerItemId);
+                    if (!$live || intval($live['is_public_shared'] ?? 0) !== 1) {
+                        removePublicSharedCommentsByShareIds($authDb, [$sharedId]);
+                        $cleanStmt = $authDb->prepare("DELETE FROM public_shared_items WHERE id=?");
+                        $cleanStmt->execute([$sharedId]);
+                        $result = ['success' => false, 'message' => '该共享物品已取消共享或不存在'];
+                        break;
+                    }
+                    $itemName = trim((string) ($live['name'] ?? ''));
+                    if ($itemName === '') {
+                        $result = ['success' => false, 'message' => '共享物品名称无效'];
+                        break;
+                    }
+                    $ownerName = trim((string) ($shareRow['display_name'] ?? ''));
+                    if ($ownerName === '') {
+                        $ownerName = trim((string) ($shareRow['username'] ?? ''));
+                    }
+                    if ($ownerName === '') {
+                        $ownerName = '用户#' . $ownerId;
+                    }
+                    $categoryName = trim((string) ($live['category_name'] ?? ''));
+                    $categoryId = 0;
+                    if ($categoryName !== '') {
+                        $catStmt = $db->prepare("SELECT id FROM categories WHERE name=? LIMIT 1");
+                        $catStmt->execute([$categoryName]);
+                        $categoryId = intval($catStmt->fetchColumn() ?: 0);
+                    }
+                    $plannedPrice = max(0, floatval($live['purchase_price'] ?? 0));
+                    $purchaseFrom = trim((string) ($live['purchase_from'] ?? ''));
+                    $dupStmt = $db->prepare("SELECT id FROM shopping_list WHERE source_shared_id=? LIMIT 1");
+                    $dupStmt->execute([$sharedId]);
+                    $existId = intval($dupStmt->fetchColumn() ?: 0);
+                    if ($existId <= 0) {
+                        // 兼容历史数据：旧版本通过 notes 中的 [public-share:id] 做去重标记
+                        $legacyMarker = "[public-share:$sharedId]";
+                        $legacyDupStmt = $db->prepare("SELECT id FROM shopping_list WHERE name=? AND notes LIKE ? LIMIT 1");
+                        $legacyDupStmt->execute([$itemName, '%' . $legacyMarker . '%']);
+                        $existId = intval($legacyDupStmt->fetchColumn() ?: 0);
+                    }
+                    if ($existId > 0) {
+                        $result = ['success' => true, 'message' => '该共享物品已在你的购物清单中', 'id' => $existId];
+                        break;
+                    }
+                    $noteParts = ['来自公共频道', '1件', '发布者: ' . $ownerName];
+                    if ($purchaseFrom !== '') {
+                        $noteParts[] = '购入渠道: ' . $purchaseFrom;
+                    }
+                    if ($categoryName !== '') {
+                        $noteParts[] = '分类: ' . $categoryName;
+                    }
+                    $recommendReason = trim((string) ($live['recommend_reason'] ?? $shareRow['recommend_reason'] ?? ''));
+                    if ($recommendReason !== '') {
+                        $noteParts[] = '推荐理由: ' . $recommendReason;
+                    }
+                    $notes = implode('；', $noteParts);
+                    $insertStmt = $db->prepare("INSERT INTO shopping_list
+                        (name, quantity, status, category_id, priority, planned_price, source_shared_id, notes, reminder_date, reminder_note, created_at, updated_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
+                    $insertStmt->execute([
+                        $itemName,
+                        1,
+                        'pending_purchase',
+                        $categoryId,
+                        'normal',
+                        $plannedPrice,
+                        $sharedId,
+                        $notes,
+                        '',
+                        ''
+                    ]);
+                    $result = ['success' => true, 'message' => '已加入你的购物清单', 'id' => intval($db->lastInsertId())];
                 }
                 break;
 
@@ -2282,11 +3510,11 @@ if (isset($_GET['api'])) {
 
             // ---------- 数据导出 ----------
             case 'export':
-                $items = $db->query("SELECT i.*, c.name as category_name, l.name as location_name FROM items i LEFT JOIN categories c ON i.category_id=c.id LEFT JOIN locations l ON i.location_id=l.id WHERE i.deleted_at IS NULL ORDER BY i.id")->fetchAll();
+                $items = $db->query("SELECT i.*, c.name as category_name, sc.name as subcategory_name, l.name as location_name FROM items i LEFT JOIN categories c ON i.category_id=c.id LEFT JOIN categories sc ON i.subcategory_id=sc.id LEFT JOIN locations l ON i.location_id=l.id WHERE i.deleted_at IS NULL ORDER BY i.id")->fetchAll();
                 $categories = $db->query("SELECT * FROM categories ORDER BY id")->fetchAll();
                 $locations = $db->query("SELECT * FROM locations ORDER BY id")->fetchAll();
                 $shoppingList = $db->query("SELECT s.*, c.name as category_name FROM shopping_list s LEFT JOIN categories c ON s.category_id=c.id ORDER BY s.id")->fetchAll();
-                $result = ['success' => true, 'data' => ['items' => $items, 'categories' => $categories, 'locations' => $locations, 'shopping_list' => $shoppingList, 'exported_at' => date('Y-m-d H:i:s'), 'version' => '1.3.0']];
+                $result = ['success' => true, 'data' => ['items' => $items, 'categories' => $categories, 'locations' => $locations, 'shopping_list' => $shoppingList, 'exported_at' => date('Y-m-d H:i:s'), 'version' => '1.5.0']];
                 break;
 
             // ---------- 数据导入 ----------
@@ -2339,13 +3567,30 @@ if (isset($_GET['api'])) {
                         }
 
                         $imported = 0;
-                        $stmtItem = $db->prepare("INSERT INTO items (name, category_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+                        $stmtItem = $db->prepare("INSERT INTO items (name, category_id, subcategory_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
                         foreach ($data['items'] as $item) {
-                            $catId = 0;
+                            $categoryCandidate = 0;
+                            $subcategoryCandidate = 0;
                             $locId = 0;
                             if (!empty($item['category_name'])) {
                                 $cat = $db->query("SELECT id FROM categories WHERE name=" . $db->quote($item['category_name']))->fetchColumn();
-                                $catId = $cat ?: 0;
+                                $categoryCandidate = $cat ?: 0;
+                            } elseif (intval($item['category_id'] ?? 0) > 0) {
+                                $categoryCandidate = intval($item['category_id']);
+                            }
+                            if (!empty($item['subcategory_name'])) {
+                                $sub = $db->query("SELECT id FROM categories WHERE name=" . $db->quote($item['subcategory_name']) . " AND parent_id>0 LIMIT 1")->fetchColumn();
+                                $subcategoryCandidate = $sub ?: 0;
+                            } elseif (intval($item['subcategory_id'] ?? 0) > 0) {
+                                $subcategoryCandidate = intval($item['subcategory_id']);
+                            }
+                            [$catId, $subcatId, $catErr] = normalizeItemCategorySelection($db, $categoryCandidate, $subcategoryCandidate);
+                            if ($catErr) {
+                                [$catId, $subcatId, $catErrFallback] = normalizeItemCategorySelection($db, $categoryCandidate, 0);
+                                if ($catErrFallback) {
+                                    $catId = 0;
+                                    $subcatId = 0;
+                                }
                             }
                             if (!empty($item['location_name'])) {
                                 $loc = $db->query("SELECT id FROM locations WHERE name=" . $db->quote($item['location_name']))->fetchColumn();
@@ -2376,6 +3621,7 @@ if (isset($_GET['api'])) {
                             $stmtItem->execute([
                                 $item['name'] ?? '未命名',
                                 $catId,
+                                $subcatId,
                                 $locId,
                                 intval($item['quantity'] ?? 1),
                                 $item['description'] ?? '',
@@ -3373,6 +4619,125 @@ $currentUserJson = json_encode([
             color: #334155;
         }
 
+        /* 分类管理思维导图视图 */
+        .category-mindmap {
+            position: relative;
+        }
+
+        .category-branch {
+            border: 1px solid rgba(255, 255, 255, 0.06);
+        }
+
+        .category-branch-grid {
+            display: grid;
+            grid-template-columns: minmax(250px, 310px) 18px minmax(0, 1fr);
+            gap: 12px;
+            align-items: start;
+        }
+
+        .category-node {
+            border: 1px solid rgba(148, 163, 184, 0.24);
+            border-radius: 14px;
+            background: rgba(15, 23, 42, 0.45);
+            padding: 12px;
+            min-width: 0;
+        }
+
+        .category-node-root {
+            border-left: 3px solid var(--node-color, #64748b);
+            position: relative;
+        }
+
+        .category-node-root::after {
+            content: '';
+            position: absolute;
+            right: -10px;
+            top: 27px;
+            width: 10px;
+            height: 2px;
+            background: rgba(148, 163, 184, 0.4);
+        }
+
+        .category-node-head {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 10px;
+        }
+
+        .category-node-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 999px;
+            flex-shrink: 0;
+            margin-top: 3px;
+        }
+
+        .category-node-actions {
+            margin-top: 10px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+
+        .category-node-actions .btn {
+            flex: 1;
+            min-width: 78px;
+        }
+
+        .category-branch-line {
+            position: relative;
+            min-height: 64px;
+        }
+
+        .category-branch-line::before {
+            content: '';
+            position: absolute;
+            left: 7px;
+            top: 28px;
+            bottom: 20px;
+            width: 2px;
+            background: rgba(148, 163, 184, 0.4);
+            border-radius: 999px;
+        }
+
+        .category-branch-line.is-empty::before {
+            display: none;
+        }
+
+        .category-children {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 10px;
+            min-width: 0;
+            padding-left: 4px;
+        }
+
+        .category-node-child {
+            position: relative;
+        }
+
+        .category-node-child::before {
+            content: '';
+            position: absolute;
+            left: -14px;
+            top: 24px;
+            width: 14px;
+            height: 2px;
+            background: rgba(148, 163, 184, 0.4);
+        }
+
+        .category-children.is-empty .category-node-child::before {
+            display: none;
+        }
+
+        .category-node-empty {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+        }
+
         /* 空状态 */
         .empty-state {
             text-align: center;
@@ -3573,6 +4938,21 @@ $currentUserJson = json_encode([
             color: #cbd5e1;
         }
 
+        body.light .category-branch {
+            border-color: rgba(15, 23, 42, 0.08);
+        }
+
+        body.light .category-node {
+            background: rgba(255, 255, 255, 0.88);
+            border-color: rgba(15, 23, 42, 0.12);
+        }
+
+        body.light .category-node-root::after,
+        body.light .category-branch-line::before,
+        body.light .category-node-child::before {
+            background: rgba(100, 116, 139, 0.5);
+        }
+
         body.light .item-card-medium-actions {
             border-top-color: rgba(15, 23, 42, 0.08);
             background: rgba(148, 163, 184, 0.05);
@@ -3763,6 +5143,31 @@ $currentUserJson = json_encode([
             }
         }
 
+        @media (max-width: 1024px) {
+            .category-branch-grid {
+                grid-template-columns: 1fr;
+                gap: 10px;
+            }
+
+            .category-branch-line {
+                display: none;
+            }
+
+            .category-node-root::after {
+                display: none;
+            }
+
+            .category-children {
+                padding-left: 0;
+                border-top: 1px dashed rgba(148, 163, 184, 0.24);
+                padding-top: 10px;
+            }
+
+            .category-node-child::before {
+                display: none;
+            }
+        }
+
         @media (min-width: 769px) {
             .mobile-overlay {
                 display: none !important;
@@ -3800,15 +5205,18 @@ $currentUserJson = json_encode([
             <div class="sidebar-link" data-view="shopping-list" onclick="switchView('shopping-list')">
                 <i class="ri-shopping-cart-2-line"></i><span class="sidebar-text">购物清单</span>
             </div>
+            <div class="sidebar-link" data-view="public-channel" onclick="switchView('public-channel')">
+                <i class="ri-broadcast-line"></i><span class="sidebar-text">公共频道</span>
+            </div>
+
+            <div class="mt-6 mb-2 px-4">
+                <div class="border-t border-white/5"></div>
+            </div>
             <div class="sidebar-link" data-view="locations" onclick="switchView('locations')">
                 <i class="ri-map-pin-line"></i><span class="sidebar-text">位置管理</span>
             </div>
             <div class="sidebar-link" data-view="categories" onclick="switchView('categories')">
                 <i class="ri-price-tag-3-line"></i><span class="sidebar-text">分类管理</span>
-            </div>
-
-            <div class="mt-6 mb-2 px-4">
-                <div class="border-t border-white/5"></div>
             </div>
             <div class="sidebar-group">
                 <div class="sidebar-link sidebar-parent" onclick="toggleSubMenu(this)">
@@ -3890,8 +5298,14 @@ $currentUserJson = json_encode([
         <div class="modal-box p-6">
             <div class="flex items-center justify-between mb-6">
                 <h3 id="itemModalTitle" class="text-xl font-bold text-white">添加物品</h3>
-                <button onclick="closeItemModal()" class="text-slate-400 hover:text-white transition"><i
-                        class="ri-close-line text-2xl"></i></button>
+                <div class="flex items-center gap-4">
+                    <label class="inline-flex items-center gap-2 cursor-pointer select-none">
+                        <input type="checkbox" id="itemSharePublic" class="accent-sky-500 w-4 h-4">
+                        <span class="text-sm text-slate-300">共享到公共频道</span>
+                    </label>
+                    <button onclick="closeItemModal()" class="text-slate-400 hover:text-white transition"><i
+                            class="ri-close-line text-2xl"></i></button>
+                </div>
             </div>
             <form id="itemForm" onsubmit="return saveItem(event)">
                 <input type="hidden" id="itemId">
@@ -3907,6 +5321,12 @@ $currentUserJson = json_encode([
                         <label class="block text-sm text-slate-400 mb-1.5">分类</label>
                         <select id="itemCategory" class="input">
                             <option value="0">选择分类</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-sm text-slate-400 mb-1.5">二级分类</label>
+                        <select id="itemSubcategory" class="input" disabled>
+                            <option value="0">请先选择一级分类</option>
                         </select>
                     </div>
                     <div>
@@ -4110,6 +5530,13 @@ $currentUserJson = json_encode([
                     <div><label class="block text-sm text-slate-400 mb-1.5">分类名称 <span
                                 class="text-red-400">*</span></label><input type="text" id="catName" class="input"
                             required></div>
+                    <div>
+                        <label class="block text-sm text-slate-400 mb-1.5">上级分类</label>
+                        <select id="catParentId" class="input">
+                            <option value="0">无（一级分类）</option>
+                        </select>
+                        <p class="text-[11px] text-slate-500 mt-1">选择上级后将作为二级分类展示；仅支持两级分类。</p>
+                    </div>
                     <div><label class="block text-sm text-slate-400 mb-1.5">图标 (Emoji)</label><input type="text"
                             id="catIcon" class="input" value="📦" placeholder="📦"></div>
                     <div><label class="block text-sm text-slate-400 mb-1.5">颜色</label><input type="color" id="catColor"
@@ -4152,6 +5579,48 @@ $currentUserJson = json_encode([
     <div id="detailModal" class="modal-overlay" onclick="if(event.target===this)closeDetailModal()">
         <div class="modal-box" style="max-width:560px">
             <div id="detailContent"></div>
+        </div>
+    </div>
+
+    <!-- 公共频道编辑弹窗 -->
+    <div id="publicSharedEditModal" class="modal-overlay" onclick="if(event.target===this)closePublicSharedEditModal()">
+        <div class="modal-box p-6" style="max-width:560px">
+            <div class="flex items-center justify-between mb-6">
+                <h3 class="text-xl font-bold text-white">编辑共享物品</h3>
+                <button onclick="closePublicSharedEditModal()" class="text-slate-400 hover:text-white transition"><i
+                        class="ri-close-line text-2xl"></i></button>
+            </div>
+            <form id="publicSharedEditForm" onsubmit="return savePublicSharedEdit(event)">
+                <input type="hidden" id="publicSharedEditId">
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div class="sm:col-span-2">
+                        <label class="block text-sm text-slate-400 mb-1.5">物品名称 <span class="text-red-400">*</span></label>
+                        <input type="text" id="publicSharedEditName" class="input" required>
+                    </div>
+                    <div>
+                        <label class="block text-sm text-slate-400 mb-1.5">分类</label>
+                        <select id="publicSharedEditCategory" class="input">
+                            <option value="0">未分类</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-sm text-slate-400 mb-1.5">购入价格 (¥)</label>
+                        <input type="number" id="publicSharedEditPrice" class="input" min="0" step="0.01" value="0">
+                    </div>
+                    <div class="sm:col-span-2">
+                        <label class="block text-sm text-slate-400 mb-1.5">购入渠道</label>
+                        <input type="text" id="publicSharedEditPurchaseFrom" class="input" placeholder="例如：京东、淘宝、线下">
+                    </div>
+                    <div class="sm:col-span-2">
+                        <label class="block text-sm text-slate-400 mb-1.5">推荐理由</label>
+                        <textarea id="publicSharedEditReason" class="input" rows="3" maxlength="300" placeholder="告诉其他用户你推荐这个物品的原因..."></textarea>
+                    </div>
+                </div>
+                <div class="flex justify-end gap-3 mt-6 pt-4 border-t border-white/5">
+                    <button type="button" onclick="closePublicSharedEditModal()" class="btn btn-ghost">取消</button>
+                    <button type="submit" class="btn btn-primary"><i class="ri-save-line"></i>保存</button>
+                </div>
+            </form>
         </div>
     </div>
 
@@ -4374,11 +5843,17 @@ $currentUserJson = json_encode([
 
         let itemFormInitialState = '';
         function getItemFormState() {
-            const ids = ['itemId', 'itemName', 'itemCategory', 'itemLocation', 'itemStatus', 'itemQuantity', 'itemPrice', 'itemPurchaseFrom', 'itemDate', 'itemExpiry', 'itemBarcode', 'itemReminderDate', 'itemReminderEvery', 'itemReminderUnit', 'itemReminderNext', 'itemReminderNote', 'itemTags', 'itemNotes', 'itemImage', 'itemSourceShoppingId'];
+            const ids = ['itemId', 'itemName', 'itemCategory', 'itemSubcategory', 'itemLocation', 'itemStatus', 'itemQuantity', 'itemPrice', 'itemPurchaseFrom', 'itemSharePublic', 'itemDate', 'itemExpiry', 'itemBarcode', 'itemReminderDate', 'itemReminderEvery', 'itemReminderUnit', 'itemReminderNext', 'itemReminderNote', 'itemTags', 'itemNotes', 'itemImage', 'itemSourceShoppingId'];
             const state = {};
             ids.forEach(id => {
                 const el = document.getElementById(id);
-                state[id] = el ? el.value : '';
+                if (!el) {
+                    state[id] = '';
+                } else if (el.type === 'checkbox') {
+                    state[id] = !!el.checked;
+                } else {
+                    state[id] = el.value;
+                }
             });
             return JSON.stringify(state);
         }
@@ -4419,6 +5894,7 @@ $currentUserJson = json_encode([
             purchaseChannels: loadPurchaseChannels(),
             currentView: 'dashboard',
             categories: [],
+            publicChannelItems: [],
             shoppingList: [],
             pendingShoppingEditId: 0,
             itemsSize: loadItemsSize(),
@@ -4577,7 +6053,7 @@ $currentUserJson = json_encode([
             document.querySelectorAll('.sidebar-link[data-view]').forEach(el => {
                 el.classList.toggle('active', el.dataset.view === view);
             });
-            const titles = { dashboard: '仪表盘', items: '物品管理', 'shopping-list': '购物清单', categories: '分类管理', locations: '位置管理', trash: '物品管理', 'import-export': '数据管理', settings: '排序设置', 'status-settings': '状态管理', 'channel-settings': '购入渠道管理', 'user-management': '用户管理', changelog: '更新记录' };
+            const titles = { dashboard: '仪表盘', items: '物品管理', 'shopping-list': '购物清单', 'public-channel': '公共频道', categories: '分类管理', locations: '位置管理', trash: '物品管理', 'import-export': '数据管理', settings: '排序设置', 'status-settings': '状态管理', 'channel-settings': '购入渠道管理', 'user-management': '用户管理', changelog: '更新记录' };
             document.getElementById('viewTitle').textContent = titles[view] || '';
             // 回收站视图高亮物品管理侧边栏
             if (view === 'trash') document.querySelector('.sidebar-link[data-view="items"]')?.classList.add('active');
@@ -4604,6 +6080,7 @@ $currentUserJson = json_encode([
                 case 'dashboard': await renderDashboard(c); break;
                 case 'items': await renderItems(c); break;
                 case 'shopping-list': await renderShoppingList(c); break;
+                case 'public-channel': await renderPublicChannel(c); break;
                 case 'categories': await renderCategories(c); break;
                 case 'locations': await renderLocations(c); break;
                 case 'trash': await renderTrash(c); break;
@@ -4621,6 +6098,130 @@ $currentUserJson = json_encode([
             const [catRes, locRes] = await Promise.all([api('categories'), api('locations')]);
             if (catRes.success) App.categories = catRes.data;
             if (locRes.success) App.locations = locRes.data;
+        }
+
+        function getCategoryById(categoryId) {
+            const id = Number(categoryId || 0);
+            if (id <= 0) return null;
+            return (Array.isArray(App.categories) ? App.categories : []).find(c => Number(c.id || 0) === id) || null;
+        }
+
+        function getCategoryGroups(sortMode = 'name_asc') {
+            const list = Array.isArray(App.categories) ? App.categories : [];
+            const idSet = new Set(list.map(c => Number(c.id || 0)));
+            const roots = list.filter(c => Number(c.parent_id || 0) <= 0);
+            const subs = list
+                .filter(c => Number(c.parent_id || 0) > 0 && idSet.has(Number(c.parent_id || 0)))
+                .map(c => ({ ...c, _parent: getCategoryById(c.parent_id) }));
+            const orphans = list
+                .filter(c => Number(c.parent_id || 0) > 0 && !idSet.has(Number(c.parent_id || 0)))
+                .map(c => ({ ...c, _parent: null }));
+            const sortedRoots = sortListData(roots, sortMode, 'item_count');
+            const sortedSubs = [...subs].sort((a, b) => {
+                const pa = String(a._parent?.name || '').localeCompare(String(b._parent?.name || ''), 'zh');
+                if (pa !== 0) return pa;
+                if (sortMode === 'count_desc') return Number(b.item_count || 0) - Number(a.item_count || 0);
+                return String(a.name || '').localeCompare(String(b.name || ''), 'zh');
+            });
+            const sortedOrphans = sortListData(orphans, 'name_asc', 'item_count');
+            return { roots: sortedRoots, subs: sortedSubs, orphans: sortedOrphans };
+        }
+
+        function getCategoryOptionLabel(cat) {
+            const name = String(cat?.name || '').trim() || '未命名分类';
+            const icon = String(cat?.icon || '📦').trim() || '📦';
+            const parentId = Number(cat?.parent_id || 0);
+            if (parentId > 0) {
+                const parent = getCategoryById(parentId);
+                const parentName = String(parent?.name || cat?.parent_name || '').trim();
+                return `${icon} ${parentName ? `${parentName} / ` : ''}${name}`;
+            }
+            return `${icon} ${name}`;
+        }
+
+        function buildTopCategorySelectOptions(selectedId = 0, options = {}) {
+            const selected = Number(selectedId || 0);
+            const placeholder = String(options?.placeholder || '选择分类');
+            const roots = getCategoryGroups('name_asc').roots;
+            const optionRows = [`<option value="0" ${selected === 0 ? 'selected' : ''}>${esc(placeholder)}</option>`];
+            roots.forEach(cat => {
+                const id = Number(cat.id || 0);
+                optionRows.push(`<option value="${id}" ${selected === id ? 'selected' : ''}>${esc(`${String(cat.icon || '📦').trim() || '📦'} ${String(cat.name || '').trim() || '未命名分类'}`)}</option>`);
+            });
+            return optionRows.join('');
+        }
+
+        function refreshItemSubcategorySelect(categoryId = 0, selectedSubcategoryId = 0) {
+            const subSelect = document.getElementById('itemSubcategory');
+            if (!subSelect) return;
+            const topId = Number(categoryId || 0);
+            const selected = Number(selectedSubcategoryId || 0);
+            if (topId <= 0) {
+                subSelect.innerHTML = '<option value="0">请先选择一级分类</option>';
+                subSelect.value = '0';
+                subSelect.disabled = true;
+                return;
+            }
+            const subs = (Array.isArray(App.categories) ? App.categories : [])
+                .filter(c => Number(c.parent_id || 0) === topId)
+                .sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'zh'));
+            if (subs.length === 0) {
+                subSelect.innerHTML = '<option value="0">当前一级分类暂无二级分类</option>';
+                subSelect.value = '0';
+                subSelect.disabled = true;
+                return;
+            }
+            const optionRows = ['<option value="0">不设置二级分类</option>'];
+            subs.forEach(cat => {
+                const id = Number(cat.id || 0);
+                const icon = String(cat.icon || '📦').trim() || '📦';
+                const name = String(cat.name || '').trim() || '未命名分类';
+                optionRows.push(`<option value="${id}" ${selected === id ? 'selected' : ''}>${esc(`${icon} ${name}`)}</option>`);
+            });
+            subSelect.innerHTML = optionRows.join('');
+            subSelect.value = String(subs.some(c => Number(c.id || 0) === selected) ? selected : 0);
+            subSelect.disabled = false;
+        }
+
+        function buildCategorySelectOptions(selectedId = 0, options = {}) {
+            const selected = Number(selectedId || 0);
+            const {
+                includeAll = false,
+                includeUncategorized = false,
+                allLabel = '所有分类',
+                uncategorizedLabel = '未分类',
+                placeholder = ''
+            } = options || {};
+            const g = getCategoryGroups('name_asc');
+            const optionRows = [];
+            if (includeAll) optionRows.push(`<option value="0" ${selected === 0 ? 'selected' : ''}>${allLabel}</option>`);
+            if (includeUncategorized) optionRows.push(`<option value="-1" ${selected === -1 ? 'selected' : ''}>${uncategorizedLabel}</option>`);
+            if (placeholder && !includeAll) optionRows.push(`<option value="0" ${selected === 0 ? 'selected' : ''}>${placeholder}</option>`);
+            if (g.roots.length > 0) {
+                optionRows.push('<optgroup label="一级分类">');
+                g.roots.forEach(cat => {
+                    const id = Number(cat.id || 0);
+                    optionRows.push(`<option value="${id}" ${selected === id ? 'selected' : ''}>${esc(getCategoryOptionLabel(cat))}</option>`);
+                });
+                optionRows.push('</optgroup>');
+            }
+            if (g.subs.length > 0) {
+                optionRows.push('<optgroup label="二级分类">');
+                g.subs.forEach(cat => {
+                    const id = Number(cat.id || 0);
+                    optionRows.push(`<option value="${id}" ${selected === id ? 'selected' : ''}>${esc(getCategoryOptionLabel(cat))}</option>`);
+                });
+                optionRows.push('</optgroup>');
+            }
+            if (g.orphans.length > 0) {
+                optionRows.push('<optgroup label="二级分类（待整理）">');
+                g.orphans.forEach(cat => {
+                    const id = Number(cat.id || 0);
+                    optionRows.push(`<option value="${id}" ${selected === id ? 'selected' : ''}>${esc(getCategoryOptionLabel(cat))}</option>`);
+                });
+                optionRows.push('</optgroup>');
+            }
+            return optionRows.join('');
         }
 
         // ============================================================
@@ -4875,9 +6476,7 @@ $currentUserJson = json_encode([
                     </button>
                 </div>
                 <select class="input !w-auto !py-2" onchange="App.itemsFilter.category=+this.value;App.itemsPage=1;renderView()">
-                    <option value="0">所有分类</option>
-                    <option value="-1" ${f.category === -1 ? 'selected' : ''}>未分类</option>
-                    ${App.categories.map(c => `<option value="${c.id}" ${f.category == c.id ? 'selected' : ''}>${c.icon} ${esc(c.name)}</option>`).join('')}
+                    ${buildCategorySelectOptions(f.category, { includeAll: true, includeUncategorized: true, allLabel: '所有分类', uncategorizedLabel: '未分类' })}
                 </select>
                 <select class="input !w-auto !py-2" onchange="App.itemsFilter.location=+this.value;App.itemsPage=1;renderView()">
                     <option value="0">所有位置</option>
@@ -5018,7 +6617,7 @@ $currentUserJson = json_encode([
             </div>
             <div class="flex items-center flex-wrap gap-x-2 gap-y-1 text-xs text-slate-500 mb-1">
                 ${hasAttr('quantity') ? `<span>x${item.quantity}</span>` : ''}
-                ${hasAttr('category') && item.category_icon ? `<span style="color:${item.category_color || '#64748b'}">${item.category_icon} ${esc(item.category_name || '')}</span>` : ''}
+                ${hasAttr('category') && item.category_icon ? `<span style="color:${item.category_color || '#64748b'}">${item.category_icon} ${esc(item.category_name || '')}${item.subcategory_name ? ` / ${esc(item.subcategory_name)}` : ''}</span>` : ''}
                 ${hasAttr('location') && item.location_name ? `<span><i class="ri-map-pin-2-line"></i> ${esc(item.location_name)}</span>` : ''}
                 ${hasAttr('price') && item.purchase_price > 0 ? `<span class="text-amber-400 font-medium">¥${Number(item.purchase_price).toLocaleString()}</span>` : ''}
                 ${hasAttr('purchase_from') && item.purchase_from ? `<span><i class="ri-shopping-bag-line"></i> ${esc(item.purchase_from)}</span>` : ''}
@@ -5112,7 +6711,7 @@ $currentUserJson = json_encode([
                 </div>
                 <div class="flex items-center flex-wrap gap-x-2 gap-y-0.5 text-[11px] text-slate-500 mt-0.5">
                     ${hasAttr('quantity') ? `<span>x${item.quantity}</span>` : ''}
-                    ${hasAttr('category') && item.category_icon ? `<span style="color:${item.category_color || '#64748b'}">${item.category_icon}${esc(item.category_name || '')}</span>` : ''}
+                    ${hasAttr('category') && item.category_icon ? `<span style="color:${item.category_color || '#64748b'}">${item.category_icon}${esc(item.category_name || '')}${item.subcategory_name ? `/${esc(item.subcategory_name)}` : ''}</span>` : ''}
                     ${hasAttr('location') && item.location_name ? `<span class="truncate"><i class="ri-map-pin-2-line"></i>${esc(item.location_name)}</span>` : ''}
                     ${hasAttr('price') && item.purchase_price > 0 ? `<span class="text-amber-400">¥${Number(item.purchase_price).toLocaleString()}</span>` : ''}
                     ${hasAttr('expiry') && item.expiry_date ? `<span class="${expiryColor(item.expiry_date)}"><i class="ri-alarm-warning-line"></i>${expiryLabel(item.expiry_date)}</span>` : ''}
@@ -5149,7 +6748,7 @@ $currentUserJson = json_encode([
         <div class="flex-1 min-w-0 flex items-center gap-3">
             <span class="text-sm text-white truncate flex-shrink min-w-0">${esc(item.name)}</span>
             ${hasAttr('quantity') ? `<span class="text-[11px] text-slate-500 flex-shrink-0">x${item.quantity}</span>` : ''}
-            ${hasAttr('category') ? `<span class="text-[11px] text-slate-500 flex-shrink-0">${item.category_icon || '📦'}${esc(item.category_name || '')}</span>` : ''}
+            ${hasAttr('category') ? `<span class="text-[11px] text-slate-500 flex-shrink-0">${item.category_icon || '📦'}${esc(item.category_name || '')}${item.subcategory_name ? `/${esc(item.subcategory_name)}` : ''}</span>` : ''}
             ${hasAttr('location') && item.location_name ? `<span class="text-[11px] text-slate-600 truncate hidden sm:inline"><i class="ri-map-pin-2-line"></i>${esc(item.location_name)}</span>` : ''}
             ${hasAttr('purchase_from') && item.purchase_from ? `<span class="text-[11px] text-slate-600 truncate hidden md:inline"><i class="ri-shopping-bag-line"></i>${esc(item.purchase_from)}</span>` : ''}
         </div>
@@ -5235,7 +6834,7 @@ $currentUserJson = json_encode([
                 <button onclick="closeDetailModal()" class="text-slate-400 hover:text-white transition"><i class="ri-close-line text-2xl"></i></button>
             </div>
             <div class="grid grid-cols-2 gap-4 mb-4">
-                <div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">分类</p><p class="text-sm text-white">${item.category_icon || '📦'} ${esc(item.category_name || '未分类')}</p></div>
+                <div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">分类</p><p class="text-sm text-white">${item.category_icon || '📦'} ${esc(item.category_name || '未分类')}${item.subcategory_name ? ` <span class="text-slate-500">/</span> <span class="text-cyan-300">${esc(item.subcategory_name)}</span>` : ''}</p></div>
                 <div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">位置</p><p class="text-sm text-white"><i class="ri-map-pin-2-line text-xs mr-1"></i>${esc(item.location_name || '未设定')}</p></div>
                 <div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">数量</p><p class="text-sm text-white">${item.quantity}</p></div>
                 <div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">价值</p><p class="text-sm text-amber-400 font-medium">¥${Number(item.purchase_price || 0).toLocaleString()}</p></div>
@@ -5269,6 +6868,7 @@ $currentUserJson = json_encode([
             document.getElementById('itemId').value = '';
             document.getElementById('itemImage').value = '';
             document.getElementById('itemSourceShoppingId').value = '';
+            document.getElementById('itemSharePublic').checked = false;
             document.getElementById('itemQuantity').value = '1';
             document.getElementById('itemPrice').value = '0';
             document.getElementById('itemExpiry').value = '';
@@ -5280,7 +6880,12 @@ $currentUserJson = json_encode([
             document.getElementById('itemNotes').value = '';
             syncReminderFields();
             resetUploadZone();
-            await populateSelects({ status: getDefaultStatusKey(), purchaseFrom: App.purchaseChannels[0] || '' });
+            await populateSelects({
+                status: getDefaultStatusKey(),
+                purchaseFrom: App.purchaseChannels[0] || '',
+                categoryId: 0,
+                subcategoryId: 0
+            });
             document.getElementById('itemModal').classList.add('show');
             setItemSubmitLabel('保存');
             refreshDateInputPlaceholderDisplay(document.getElementById('itemForm'));
@@ -5311,6 +6916,7 @@ $currentUserJson = json_encode([
             document.getElementById('itemTags').value = item.tags;
             document.getElementById('itemImage').value = item.image || '';
             document.getElementById('itemNotes').value = item.notes || '';
+            document.getElementById('itemSharePublic').checked = Number(item.is_public_shared || 0) === 1;
             syncReminderFields();
 
             resetUploadZone();
@@ -5322,8 +6928,12 @@ $currentUserJson = json_encode([
             }
 
             // 关键：await 等待下拉框填充完成后再设置值
-            await populateSelects({ status: item.status, purchaseFrom: item.purchase_from || '' });
-            document.getElementById('itemCategory').value = item.category_id;
+            await populateSelects({
+                status: item.status,
+                purchaseFrom: item.purchase_from || '',
+                categoryId: Number(item.category_id || 0),
+                subcategoryId: Number(item.subcategory_id || 0)
+            });
             document.getElementById('itemLocation').value = item.location_id;
             document.getElementById('itemModal').classList.add('show');
             setItemSubmitLabel('保存');
@@ -5335,7 +6945,27 @@ $currentUserJson = json_encode([
         async function populateSelects(options = {}) {
             await loadBaseData();
             const catSelect = document.getElementById('itemCategory');
-            catSelect.innerHTML = '<option value="0">选择分类</option>' + App.categories.map(c => `<option value="${c.id}">${c.icon} ${esc(c.name)}</option>`).join('');
+            const subSelect = document.getElementById('itemSubcategory');
+            let categoryId = Number(options.categoryId || 0);
+            let subcategoryId = Number(options.subcategoryId || 0);
+            if (categoryId > 0) {
+                const picked = getCategoryById(categoryId);
+                if (picked && Number(picked.parent_id || 0) > 0) {
+                    if (subcategoryId <= 0) subcategoryId = Number(picked.id || 0);
+                    categoryId = Number(picked.parent_id || 0);
+                }
+            }
+            catSelect.innerHTML = buildTopCategorySelectOptions(categoryId, { placeholder: '选择分类' });
+            catSelect.value = String(categoryId > 0 ? categoryId : 0);
+            if (subSelect) {
+                refreshItemSubcategorySelect(categoryId, subcategoryId);
+                if (!catSelect.dataset.boundSubcategoryChange) {
+                    catSelect.addEventListener('change', () => {
+                        refreshItemSubcategorySelect(Number(catSelect.value || 0), 0);
+                    });
+                    catSelect.dataset.boundSubcategoryChange = '1';
+                }
+            }
             const locSelect = document.getElementById('itemLocation');
             locSelect.innerHTML = '<option value="0">选择位置</option>' + App.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join('');
             const statusSelect = document.getElementById('itemStatus');
@@ -5360,6 +6990,7 @@ $currentUserJson = json_encode([
                 id: id ? +id : undefined,
                 name: document.getElementById('itemName').value.trim(),
                 category_id: +document.getElementById('itemCategory').value,
+                subcategory_id: +document.getElementById('itemSubcategory').value,
                 location_id: +document.getElementById('itemLocation').value,
                 quantity: +document.getElementById('itemQuantity').value,
                 purchase_price: +document.getElementById('itemPrice').value,
@@ -5371,6 +7002,7 @@ $currentUserJson = json_encode([
                 image: document.getElementById('itemImage').value,
                 purchase_from: document.getElementById('itemPurchaseFrom').value,
                 notes: document.getElementById('itemNotes').value.trim(),
+                is_public_shared: document.getElementById('itemSharePublic').checked ? 1 : 0,
                 reminder_note: document.getElementById('itemReminderNote').value.trim()
             };
             const reminderDate = document.getElementById('itemReminderDate').value;
@@ -5507,6 +7139,230 @@ $currentUserJson = json_encode([
         // ============================================================
         // 🛒 购物清单
         // ============================================================
+        async function addPublicSharedToShopping(sharedId, itemName = '') {
+            const id = Number(sharedId || 0);
+            if (id <= 0) {
+                toast('共享记录无效', 'error');
+                return;
+            }
+            const res = await apiPost('public-channel/add-to-shopping', { shared_id: id });
+            if (res && res.success) {
+                toast(res.message || `已将「${itemName || '该物品'}」加入购物清单`);
+                return;
+            }
+            toast((res && res.message) || '加入购物清单失败', 'error');
+        }
+
+        function getPublicSharedItemById(sharedId) {
+            const id = Number(sharedId || 0);
+            if (id <= 0) return null;
+            return (Array.isArray(App.publicChannelItems) ? App.publicChannelItems : []).find(x => Number(x.id || 0) === id) || null;
+        }
+
+        async function openPublicSharedEdit(sharedId) {
+            const item = getPublicSharedItemById(sharedId);
+            if (!item) {
+                toast('共享物品不存在', 'error');
+                return;
+            }
+            if (Number(item.owner_user_id || 0) !== Number(CURRENT_USER.id || 0)) {
+                toast('仅发布者可编辑该共享物品', 'error');
+                return;
+            }
+            await loadBaseData();
+            const categorySelect = document.getElementById('publicSharedEditCategory');
+            const categoryId = Number(item.category_id || 0);
+            let options = buildCategorySelectOptions(categoryId, { placeholder: '未分类' });
+            if (categoryId > 0 && !App.categories.find(c => Number(c.id || 0) === categoryId)) {
+                const fallbackName = String(item.category_name || '').trim() || `分类#${categoryId}`;
+                options += `<option value="${categoryId}" selected>${esc(fallbackName)}</option>`;
+            }
+            categorySelect.innerHTML = options;
+            categorySelect.value = String(categoryId > 0 ? categoryId : 0);
+
+            document.getElementById('publicSharedEditId').value = Number(item.id || 0);
+            document.getElementById('publicSharedEditName').value = String(item.item_name || '');
+            document.getElementById('publicSharedEditPrice').value = Number(item.purchase_price || 0);
+            document.getElementById('publicSharedEditPurchaseFrom').value = String(item.purchase_from || '');
+            document.getElementById('publicSharedEditReason').value = String(item.recommend_reason || '');
+            document.getElementById('publicSharedEditModal').classList.add('show');
+        }
+
+        function closePublicSharedEditModal() {
+            const modal = document.getElementById('publicSharedEditModal');
+            if (modal) modal.classList.remove('show');
+        }
+
+        async function savePublicSharedEdit(e) {
+            e.preventDefault();
+            const sharedId = Number(document.getElementById('publicSharedEditId').value || 0);
+            if (sharedId <= 0) {
+                toast('共享记录无效', 'error');
+                return false;
+            }
+            const payload = {
+                shared_id: sharedId,
+                item_name: document.getElementById('publicSharedEditName').value.trim(),
+                category_id: Number(document.getElementById('publicSharedEditCategory').value || 0),
+                purchase_price: Number(document.getElementById('publicSharedEditPrice').value || 0),
+                purchase_from: document.getElementById('publicSharedEditPurchaseFrom').value.trim(),
+                recommend_reason: document.getElementById('publicSharedEditReason').value.trim()
+            };
+            if (!payload.item_name) {
+                toast('物品名称不能为空', 'error');
+                return false;
+            }
+            const res = await apiPost('public-channel/update', payload);
+            if (res && res.success) {
+                toast(res.message || '共享物品已更新');
+                closePublicSharedEditModal();
+                renderView();
+            } else {
+                toast((res && res.message) || '更新失败', 'error');
+            }
+            return false;
+        }
+
+        async function addPublicSharedComment(sharedId) {
+            const id = Number(sharedId || 0);
+            if (id <= 0) {
+                toast('共享记录无效', 'error');
+                return;
+            }
+            const input = document.getElementById(`publicCommentInput-${id}`);
+            if (!input) {
+                toast('评论输入框不存在', 'error');
+                return;
+            }
+            const content = String(input.value || '').trim();
+            if (!content) {
+                toast('请输入评论内容', 'error');
+                input.focus();
+                return;
+            }
+            const res = await apiPost('public-channel/comment', { shared_id: id, content });
+            if (res && res.success) {
+                input.value = '';
+                toast(res.message || '评论已发布');
+                renderView();
+                return;
+            }
+            toast((res && res.message) || '评论发布失败', 'error');
+        }
+
+        async function deletePublicSharedComment(commentId) {
+            const id = Number(commentId || 0);
+            if (id <= 0) {
+                toast('评论无效', 'error');
+                return;
+            }
+            if (!confirm('确定删除这条评论吗？')) return;
+            const res = await apiPost('public-channel/comment-delete', { comment_id: id });
+            if (res && res.success) {
+                toast(res.message || '评论已删除');
+                renderView();
+                return;
+            }
+            toast((res && res.message) || '删除评论失败', 'error');
+        }
+
+        async function renderPublicChannel(container) {
+            const res = await api('public-channel');
+            if (!res.success) {
+                container.innerHTML = '<p class="text-red-400">公共频道加载失败</p>';
+                return;
+            }
+            const list = Array.isArray(res.data) ? res.data : [];
+            App.publicChannelItems = list;
+            const withPrice = list.filter(x => Number(x.purchase_price || 0) > 0).length;
+            const withFrom = list.filter(x => String(x.purchase_from || '').trim() !== '').length;
+            const withReason = list.filter(x => String(x.recommend_reason || '').trim() !== '').length;
+
+            container.innerHTML = `
+        <div class="glass rounded-2xl p-4 mb-6 anim-up">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+                <div class="flex flex-wrap items-center gap-x-5 gap-y-2">
+                    <span class="text-sm text-slate-400"><i class="ri-broadcast-line mr-1 text-cyan-400"></i>共享物品 ${list.length} 条</span>
+                    <span class="text-sm text-slate-400"><i class="ri-money-cny-circle-line mr-1 text-amber-400"></i>含价格 ${withPrice} 条</span>
+                    <span class="text-sm text-slate-400"><i class="ri-shopping-bag-line mr-1 text-emerald-400"></i>含渠道 ${withFrom} 条</span>
+                    <span class="text-sm text-slate-400"><i class="ri-thumb-up-line mr-1 text-violet-400"></i>含推荐理由 ${withReason} 条</span>
+                </div>
+                <span class="text-xs text-slate-500">可查看基础属性并一键加入购物清单</span>
+            </div>
+        </div>
+
+        ${list.length === 0 ? `
+            <div class="empty-state anim-up">
+                <i class="ri-broadcast-line"></i>
+                <h3 class="text-xl font-semibold text-slate-400 mb-2">公共频道暂时为空</h3>
+                <p class="text-slate-500 text-sm">当用户在物品编辑中勾选“共享到公共频道”后，这里会显示对应物品。</p>
+            </div>
+        ` : `
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                ${list.map((item, i) => {
+                    const categoryName = String(item.category_name || '').trim() || '未分类';
+                    const purchaseFrom = String(item.purchase_from || '').trim();
+                    const recommendReason = String(item.recommend_reason || '').trim();
+                    const ownerName = String(item.owner_name || '').trim() || '未知用户';
+                    const updatedDate = String(item.owner_item_updated_at || item.updated_at || '').slice(0, 10);
+                    const comments = Array.isArray(item.comments) ? item.comments : [];
+                    const canEdit = Number(item.owner_user_id || 0) === Number(CURRENT_USER.id || 0) || !!item.can_edit;
+                    const price = Number(item.purchase_price || 0);
+                    const priceHtml = price > 0
+                        ? `<span class="text-amber-400 font-medium">¥${price.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}</span>`
+                        : '<span class="text-slate-500">价格未记录</span>';
+                    return `
+                    <div class="glass glass-hover rounded-2xl p-4 anim-up" style="animation-delay:${i * 25}ms">
+                        <div class="flex items-start justify-between gap-3 mb-2">
+                            <h3 class="font-semibold text-white leading-tight">${esc(item.item_name || '未命名物品')}</h3>
+                            <div class="flex items-center gap-2">
+                                <span class="badge badge-lent"><i class="ri-user-3-line mr-1"></i>${esc(ownerName)}</span>
+                                ${canEdit ? `<button onclick="event.stopPropagation();openPublicSharedEdit(${Number(item.id || 0)})" class="btn btn-ghost btn-sm !py-1 !px-2 text-xs" title="编辑共享信息"><i class="ri-edit-line"></i></button>` : ''}
+                            </div>
+                        </div>
+                        <div class="space-y-1.5 text-xs text-slate-400 mb-4">
+                            <p><i class="ri-price-tag-3-line mr-1 text-sky-400"></i>分类：${esc(categoryName)}</p>
+                            <p><i class="ri-money-cny-circle-line mr-1 text-amber-400"></i>购入价格：${priceHtml}</p>
+                            <p><i class="ri-shopping-bag-line mr-1 text-emerald-400"></i>购入渠道：${purchaseFrom ? esc(purchaseFrom) : '<span class="text-slate-600">未记录</span>'}</p>
+                            <p><i class="ri-thumb-up-line mr-1 text-violet-400"></i>推荐理由：${recommendReason ? esc(recommendReason) : '<span class="text-slate-600">未填写</span>'}</p>
+                            <p><i class="ri-time-line mr-1 text-slate-500"></i>最近更新：${updatedDate || '未知'}</p>
+                        </div>
+                        <button onclick="addPublicSharedToShopping(${Number(item.id || 0)})" class="btn btn-primary btn-sm w-full">
+                            <i class="ri-add-circle-line"></i>加入我的购物清单
+                        </button>
+                        <div class="mt-4 pt-3 border-t border-white/10">
+                            <div class="flex items-center justify-between mb-2">
+                                <p class="text-xs text-slate-400"><i class="ri-chat-3-line mr-1 text-cyan-400"></i>评论</p>
+                                <span class="text-[11px] text-slate-500">${comments.length} 条</span>
+                            </div>
+                            <div class="space-y-2 max-h-28 overflow-auto pr-1">
+                                ${comments.length > 0 ? comments.map(comment => `
+                                    <div class="rounded-lg bg-white/5 px-2.5 py-2">
+                                        <div class="flex items-center justify-between gap-2">
+                                            <span class="text-[11px] text-sky-300">${esc(comment.user_name || '用户')}</span>
+                                            <div class="flex items-center gap-2">
+                                                <span class="text-[10px] text-slate-600">${esc(String(comment.created_at || '').slice(0, 16))}</span>
+                                                ${comment.can_delete ? `<button onclick="deletePublicSharedComment(${Number(comment.id || 0)})" class="text-[10px] text-rose-300 hover:text-rose-200 transition" title="删除评论"><i class="ri-delete-bin-6-line"></i></button>` : ''}
+                                            </div>
+                                        </div>
+                                        <p class="text-xs text-slate-300 mt-1 break-words">${esc(comment.content || '')}</p>
+                                    </div>
+                                `).join('') : '<p class="text-[11px] text-slate-600 py-1">暂无评论，来写第一条吧</p>'}
+                            </div>
+                            <div class="mt-2 flex items-center gap-2">
+                                <input id="publicCommentInput-${Number(item.id || 0)}" type="text" class="input !h-9 !py-1.5 !text-xs flex-1" maxlength="300" placeholder="写下你的评论...">
+                                <button onclick="addPublicSharedComment(${Number(item.id || 0)})" class="btn btn-ghost btn-sm !py-1.5 !px-3">
+                                    <i class="ri-send-plane-2-line"></i>发送
+                                </button>
+                            </div>
+                        </div>
+                    </div>`;
+                }).join('')}
+            </div>
+        `}
+    `;
+        }
+
         function shoppingStatusKey(status) {
             const s = String(status || '').trim().toLowerCase();
             if (s === 'pending_receipt' || s === '待收货') return 'pending_receipt';
@@ -5960,11 +7816,16 @@ $currentUserJson = json_encode([
             document.getElementById('itemBarcode').value = '';
             document.getElementById('itemTags').value = '';
             document.getElementById('itemNotes').value = item.notes || '';
+            document.getElementById('itemSharePublic').checked = false;
             syncReminderFields();
 
             resetUploadZone();
-            await populateSelects({ status: getDefaultStatusKey(), purchaseFrom: '' });
-            document.getElementById('itemCategory').value = Number(item.category_id || 0);
+            await populateSelects({
+                status: getDefaultStatusKey(),
+                purchaseFrom: '',
+                categoryId: Number(item.category_id || 0),
+                subcategoryId: Number(item.subcategory_id || 0)
+            });
             document.getElementById('itemLocation').value = 0;
             document.getElementById('itemModal').classList.add('show');
             setItemSubmitLabel('保存入库');
@@ -5992,10 +7853,27 @@ $currentUserJson = json_encode([
             const uncRes = await api('items&page=1&limit=1&search=&category=-1&location=0&status=');
             const uncategorizedCount = uncRes.success ? Number(uncRes.total || 0) : 0;
             const catSortMode = getEffectiveListSortMode('categories');
-            const sortedCats = sortListData(App.categories, catSortMode);
+            const g = getCategoryGroups(catSortMode);
+            const rootCats = g.roots;
+            const subCats = g.subs;
+            const orphanSubCats = g.orphans;
+            const subByParent = {};
+            subCats.forEach(cat => {
+                const pid = Number(cat.parent_id || 0);
+                if (!subByParent[pid]) subByParent[pid] = [];
+                subByParent[pid].push(cat);
+            });
+            Object.keys(subByParent).forEach(pid => {
+                if (catSortMode === 'count_desc') {
+                    subByParent[pid].sort((a, b) => Number(b.item_count || 0) - Number(a.item_count || 0));
+                } else {
+                    subByParent[pid].sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'zh'));
+                }
+            });
+            const totalCount = 1 + rootCats.length + subCats.length + orphanSubCats.length;
             container.innerHTML = `
         <div class="flex items-center justify-between mb-6 anim-up" style="position:relative;z-index:40;">
-            <p class="text-sm text-slate-500">共 ${App.categories.length + 1} 个分类</p>
+            <p class="text-sm text-slate-500">共 ${totalCount} 个分类（一级 ${rootCats.length} / 二级 ${subCats.length + orphanSubCats.length}）</p>
             <div class="flex items-center gap-2">
                 <div class="relative">
                     <button onclick="toggleListSortMenu('categoriesSortMenu', this)" class="btn btn-ghost btn-sm text-slate-400 hover:text-white transition">
@@ -6006,58 +7884,153 @@ $currentUserJson = json_encode([
                         <button onclick="setListSort('categories','name_asc')" class="w-full text-left px-2 py-1.5 rounded-lg text-xs transition ${catSortMode === 'name_asc' ? 'bg-sky-500/15 text-sky-300' : 'text-slate-300 hover:bg-white/[0.05]'}">按名称首字母 A→Z</button>
                     </div>
                 </div>
-                <button onclick="openAddCategory()" class="btn btn-primary btn-sm"><i class="ri-add-line"></i>添加分类</button>
+                <button onclick="openAddCategory(0)" class="btn btn-primary btn-sm"><i class="ri-add-line"></i>添加一级分类</button>
+                <button onclick="openAddCategory(-1)" class="btn btn-ghost btn-sm"><i class="ri-node-tree"></i>添加二级分类</button>
             </div>
         </div>
-        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4" style="position:relative;z-index:1;">
-            <div class="glass glass-hover rounded-2xl p-5 anim-up" style="animation-delay:0ms;border-left:3px solid #64748b">
-                <div class="flex items-center justify-between mb-3">
-                    <div class="flex items-center gap-3">
-                        <span class="text-3xl">📦</span>
-                        <div>
-                            <h3 class="font-semibold text-white">未分类</h3>
-                            <p class="text-xs text-slate-500">${uncategorizedCount} 件物品</p>
+        <div class="category-mindmap space-y-4" style="position:relative;z-index:1;">
+            <div class="glass rounded-2xl p-4 anim-up category-branch" style="animation-delay:0ms;">
+                <div class="category-branch-grid">
+                    <div class="category-node category-node-root" style="--node-color:#64748b;">
+                        <div class="category-node-head">
+                            <div class="flex items-center gap-2 min-w-0">
+                                <span class="text-2xl">📦</span>
+                                <div class="min-w-0">
+                                    <h3 class="font-semibold text-white truncate">未分类</h3>
+                                    <p class="text-xs text-slate-500">${uncategorizedCount} 件物品</p>
+                                </div>
+                            </div>
+                            <span class="category-node-dot" style="background:#64748b"></span>
+                        </div>
+                        <div class="category-node-actions">
+                            <button onclick="viewItemsByCategory(-1)" class="btn btn-ghost btn-sm" style="color:#38bdf8" title="查看物品"><i class="ri-archive-line"></i>物品</button>
                         </div>
                     </div>
-                    <div class="w-3 h-3 rounded-full bg-slate-500"></div>
-                </div>
-                <div class="flex gap-2">
-                    <button onclick="viewItemsByCategory(-1)" class="btn btn-ghost btn-sm flex-1" style="color:#38bdf8" title="查看物品"><i class="ri-archive-line"></i>物品</button>
-                    <button class="btn btn-ghost btn-sm flex-1 opacity-50 cursor-not-allowed" disabled title="系统固定项"><i class="ri-edit-line"></i>编辑</button>
-                    <button class="btn btn-danger btn-sm flex-1 opacity-50 cursor-not-allowed" disabled title="系统固定项"><i class="ri-delete-bin-line"></i>删除</button>
+                    <div class="category-branch-line is-empty"></div>
+                    <div class="category-children is-empty">
+                        <div class="category-node category-node-child category-node-empty">
+                            <span class="text-xs text-slate-500">系统固定分组，无二级分类</span>
+                        </div>
+                    </div>
                 </div>
             </div>
-            ${sortedCats.map((cat, i) => `
-                <div class="glass glass-hover rounded-2xl p-5 anim-up" style="animation-delay:${(i + 1) * 40}ms;border-left:3px solid ${cat.color}">
-                    <div class="flex items-center justify-between mb-3">
-                        <div class="flex items-center gap-3">
-                            <span class="text-3xl">${cat.icon}</span>
-                            <div>
-                                <h3 class="font-semibold text-white">${esc(cat.name)}</h3>
-                                <p class="text-xs text-slate-500">${cat.item_count} 件物品</p>
+            ${rootCats.map((cat, i) => {
+                const children = subByParent[Number(cat.id || 0)] || [];
+                return `
+                <div class="glass rounded-2xl p-4 anim-up category-branch" style="animation-delay:${(i + 1) * 35}ms;">
+                    <div class="category-branch-grid">
+                        <div class="category-node category-node-root" style="--node-color:${cat.color || '#64748b'};">
+                            <div class="category-node-head">
+                                <div class="flex items-center gap-2 min-w-0">
+                                    <span class="text-2xl">${cat.icon}</span>
+                                    <div class="min-w-0">
+                                        <h3 class="font-semibold text-white truncate">${esc(cat.name)}</h3>
+                                        <p class="text-xs text-slate-500">${cat.item_count} 件物品 · ${children.length} 个二级分类</p>
+                                    </div>
+                                </div>
+                                <span class="category-node-dot" style="background:${cat.color || '#64748b'}"></span>
+                            </div>
+                            <div class="category-node-actions">
+                                <button onclick="viewItemsByCategory(${cat.id})" class="btn btn-ghost btn-sm" style="color:#38bdf8" title="查看物品"><i class="ri-archive-line"></i>物品</button>
+                                <button onclick="openAddSubCategory(${cat.id})" class="btn btn-ghost btn-sm" title="添加二级分类"><i class="ri-node-tree"></i>添加二级</button>
+                                <button onclick="editCategory(${cat.id})" class="btn btn-ghost btn-sm"><i class="ri-edit-line"></i>编辑</button>
+                                <button onclick="deleteCategory(${cat.id},'${esc(cat.name)}',${cat.item_count},${cat.child_count || 0})" class="btn btn-danger btn-sm"><i class="ri-delete-bin-line"></i>删除</button>
                             </div>
                         </div>
-                        <div class="w-3 h-3 rounded-full" style="background:${cat.color}"></div>
+                        <div class="category-branch-line ${children.length === 0 ? 'is-empty' : ''}"></div>
+                        <div class="category-children ${children.length === 0 ? 'is-empty' : ''}">
+                            ${children.length > 0 ? children.map(sub => `
+                                <div class="category-node category-node-child" style="border-left:2px solid ${cat.color || '#64748b'}">
+                                    <div class="category-node-head">
+                                        <div class="flex items-center gap-2 min-w-0">
+                                            <span class="text-xl">${sub.icon}</span>
+                                            <div class="min-w-0">
+                                                <h4 class="text-sm font-medium text-white truncate">${esc(sub.name)}</h4>
+                                                <p class="text-xs text-slate-500">${sub.item_count} 件物品</p>
+                                            </div>
+                                        </div>
+                                        <span class="badge badge-lent">二级</span>
+                                    </div>
+                                    <div class="category-node-actions">
+                                        <button onclick="viewItemsByCategory(${sub.id})" class="btn btn-ghost btn-sm" style="color:#38bdf8" title="查看物品"><i class="ri-archive-line"></i>物品</button>
+                                        <button onclick="editCategory(${sub.id})" class="btn btn-ghost btn-sm"><i class="ri-edit-line"></i>编辑</button>
+                                        <button onclick="deleteCategory(${sub.id},'${esc(sub.name)}',${sub.item_count},0)" class="btn btn-danger btn-sm"><i class="ri-delete-bin-line"></i>删除</button>
+                                    </div>
+                                </div>
+                            `).join('') : `
+                                <div class="category-node category-node-child category-node-empty">
+                                    <span class="text-xs text-slate-500">暂无二级分类</span>
+                                    <button onclick="openAddSubCategory(${cat.id})" class="btn btn-ghost btn-sm"><i class="ri-add-line"></i>新增</button>
+                                </div>
+                            `}
+                        </div>
                     </div>
-                    <div class="flex gap-2">
-                        <button onclick="viewItemsByCategory(${cat.id})" class="btn btn-ghost btn-sm flex-1" style="color:#38bdf8" title="查看物品"><i class="ri-archive-line"></i>物品</button>
-                        <button onclick="editCategory(${cat.id})" class="btn btn-ghost btn-sm flex-1"><i class="ri-edit-line"></i>编辑</button>
-                        <button onclick="deleteCategory(${cat.id},'${esc(cat.name)}',${cat.item_count})" class="btn btn-danger btn-sm flex-1"><i class="ri-delete-bin-line"></i>删除</button>
-                    </div>
-                </div>
-            `).join('')}
+                </div>`;
+            }).join('')}
         </div>
-        ${App.categories.length === 0 ? '<div class="empty-state"><i class="ri-price-tag-3-line"></i><h3 class="text-xl font-semibold text-slate-400">暂无分类</h3></div>' : ''}
+        ${orphanSubCats.length > 0 ? `
+            <div class="flex items-center justify-between mt-6 mb-3">
+                <h4 class="text-sm font-semibold text-amber-300 flex items-center gap-2"><i class="ri-error-warning-line"></i>待整理二级分类</h4>
+                <span class="text-xs text-slate-500">${orphanSubCats.length} 个</span>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                ${orphanSubCats.map((cat, i) => `
+                    <div class="glass rounded-2xl p-5 anim-up border border-amber-500/30" style="animation-delay:${i * 30}ms;border-left:3px solid #f59e0b">
+                        <div class="flex items-center justify-between mb-3">
+                            <div class="flex items-center gap-3 min-w-0">
+                                <span class="text-3xl">${cat.icon}</span>
+                                <div class="min-w-0">
+                                    <h3 class="font-semibold text-white truncate">${esc(cat.name)}</h3>
+                                    <p class="text-xs text-amber-300">上级分类缺失（建议编辑后重新归类）</p>
+                                    <p class="text-xs text-slate-500">${cat.item_count} 件物品</p>
+                                </div>
+                            </div>
+                            <span class="badge" style="background:rgba(245,158,11,0.18);color:#f59e0b;">待整理</span>
+                        </div>
+                        <div class="flex gap-2">
+                            <button onclick="viewItemsByCategory(${cat.id})" class="btn btn-ghost btn-sm flex-1" style="color:#38bdf8" title="查看物品"><i class="ri-archive-line"></i>物品</button>
+                            <button onclick="editCategory(${cat.id})" class="btn btn-ghost btn-sm flex-1"><i class="ri-edit-line"></i>编辑</button>
+                            <button onclick="deleteCategory(${cat.id},'${esc(cat.name)}',${cat.item_count},0)" class="btn btn-danger btn-sm flex-1"><i class="ri-delete-bin-line"></i>删除</button>
+                        </div>
+                    </div>
+                `).join('')}
+            </div>
+        ` : ''}
+        ${(rootCats.length + subCats.length + orphanSubCats.length) === 0 ? '<div class="empty-state"><i class="ri-price-tag-3-line"></i><h3 class="text-xl font-semibold text-slate-400">暂无分类</h3></div>' : ''}
     `;
         }
 
-        function openAddCategory() {
-            document.getElementById('catModalTitle').textContent = '添加分类';
+        function populateCategoryParentSelect(selectedParentId = 0, editingId = 0) {
+            const select = document.getElementById('catParentId');
+            if (!select) return;
+            const roots = getCategoryGroups('name_asc').roots.filter(c => Number(c.id || 0) !== Number(editingId || 0));
+            let options = `<option value="0">无（一级分类）</option>`;
+            if (roots.length > 0) {
+                options += '<optgroup label="选择上级分类">';
+                options += roots.map(c => `<option value="${Number(c.id || 0)}">${esc(c.icon || '📦')} ${esc(c.name || '')}</option>`).join('');
+                options += '</optgroup>';
+            }
+            select.innerHTML = options;
+            const targetParent = Number(selectedParentId || 0);
+            select.value = String(roots.some(c => Number(c.id || 0) === targetParent) ? targetParent : 0);
+        }
+
+        function openAddCategory(defaultParentId = 0) {
+            let parentId = Number(defaultParentId || 0);
+            const forceSubMode = parentId < 0;
+            if (parentId < 0) parentId = 0;
+            document.getElementById('catModalTitle').textContent = (forceSubMode || parentId > 0) ? '添加二级分类' : '添加一级分类';
             document.getElementById('catId').value = '';
             document.getElementById('catName').value = '';
             document.getElementById('catIcon').value = '📦';
             document.getElementById('catColor').value = '#3b82f6';
+            populateCategoryParentSelect(parentId > 0 ? parentId : 0, 0);
+            document.getElementById('catParentId').disabled = false;
             document.getElementById('categoryModal').classList.add('show');
+        }
+
+        function openAddSubCategory(parentId) {
+            openAddCategory(Number(parentId || 0));
         }
 
         function editCategory(id) {
@@ -6068,13 +8041,22 @@ $currentUserJson = json_encode([
             document.getElementById('catName').value = cat.name;
             document.getElementById('catIcon').value = cat.icon;
             document.getElementById('catColor').value = cat.color;
+            populateCategoryParentSelect(Number(cat.parent_id || 0), Number(cat.id || 0));
+            const hasChildren = Number(cat.child_count || 0) > 0;
+            document.getElementById('catParentId').disabled = hasChildren;
             document.getElementById('categoryModal').classList.add('show');
         }
 
         async function saveCategory(e) {
             e.preventDefault();
             const id = document.getElementById('catId').value;
-            const data = { id: id ? +id : undefined, name: document.getElementById('catName').value.trim(), icon: document.getElementById('catIcon').value.trim() || '📦', color: document.getElementById('catColor').value };
+            const data = {
+                id: id ? +id : undefined,
+                name: document.getElementById('catName').value.trim(),
+                icon: document.getElementById('catIcon').value.trim() || '📦',
+                color: document.getElementById('catColor').value,
+                parent_id: Number(document.getElementById('catParentId').value || 0)
+            };
             if (!data.name) { toast('请输入分类名称', 'error'); return false; }
             const endpoint = id ? 'categories/update' : 'categories';
             const res = await apiPost(endpoint, data);
@@ -6082,8 +8064,10 @@ $currentUserJson = json_encode([
             return false;
         }
 
-        async function deleteCategory(id, name, count) {
-            if (!confirm(`确定删除分类「${name}」？${count > 0 ? `其下 ${count} 件物品将变为未分类。` : ''}`)) return;
+        async function deleteCategory(id, name, count, childCount = 0) {
+            const itemTip = count > 0 ? `其下 ${count} 件物品将变为未分类。` : '';
+            const childTip = Number(childCount || 0) > 0 ? `该分类下 ${childCount} 个二级分类也会被一并删除。` : '';
+            if (!confirm(`确定删除分类「${name}」？${itemTip}${childTip}`)) return;
             const res = await apiPost('categories/delete', { id });
             if (res.success) { toast('分类已删除'); renderView(); } else toast(res.message, 'error');
         }
@@ -6737,6 +8721,7 @@ $currentUserJson = json_encode([
             document.getElementById('itemTags').value = item.tags;
             document.getElementById('itemImage').value = item.image || '';
             document.getElementById('itemNotes').value = item.notes || '';
+            document.getElementById('itemSharePublic').checked = Number(item.is_public_shared || 0) === 1;
             syncReminderFields();
 
             resetUploadZone();
@@ -6747,8 +8732,12 @@ $currentUserJson = json_encode([
                 document.getElementById('uploadZone').classList.add('has-image');
             }
 
-            await populateSelects({ status: item.status, purchaseFrom: item.purchase_from || '' });
-            document.getElementById('itemCategory').value = item.category_id;
+            await populateSelects({
+                status: item.status,
+                purchaseFrom: item.purchase_from || '',
+                categoryId: Number(item.category_id || 0),
+                subcategoryId: Number(item.subcategory_id || 0)
+            });
             document.getElementById('itemLocation').value = item.location_id;
             document.getElementById('itemModal').classList.add('show');
             setItemSubmitLabel('保存');
@@ -6914,7 +8903,7 @@ $currentUserJson = json_encode([
                 <button onclick="closeDetailModal()" class="text-slate-400 hover:text-white transition"><i class="ri-close-line text-2xl"></i></button>
             </div>
             <div class="grid grid-cols-2 gap-4 mb-4">
-                <div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">分类</p><p class="text-sm text-white">${item.category_icon || '📦'} ${esc(item.category_name || '未分类')}</p></div>
+                <div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">分类</p><p class="text-sm text-white">${item.category_icon || '📦'} ${esc(item.category_name || '未分类')}${item.subcategory_name ? ` <span class="text-slate-500">/</span> <span class="text-cyan-300">${esc(item.subcategory_name)}</span>` : ''}</p></div>
                 <div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">位置</p><p class="text-sm text-white"><i class="ri-map-pin-2-line text-xs mr-1"></i>${esc(item.location_name || '未设定')}</p></div>
                 <div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">数量</p><p class="text-sm text-white">${item.quantity}</p></div>
                 <div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">价值</p><p class="text-sm text-amber-400 font-medium">¥${Number(item.purchase_price || 0).toLocaleString()}</p></div>
@@ -6968,31 +8957,46 @@ $currentUserJson = json_encode([
         // ---------- 更新记录数据 ----------
         const CHANGELOG = [
             {
+                version: 'v1.5.0', date: '2026-02-16', title: '公共频道升级：发布者编辑 + 推荐理由 + 评论协作',
+                changes: [
+                    '新增公共频道编辑能力：共享物品卡片支持“编辑”，仅发布者可修改名称、分类、购入价格、购入渠道与推荐理由',
+                    '公共频道新增“推荐理由”展示，帮助其他人更快判断是否值得购买',
+                    '新增公共频道评论能力：所有用户都可以发表评论，支持多人互动',
+                    '新增评论删除能力：仅评论者本人或管理员可删除评论，评论区更可控',
+                    '系统会根据身份自动显示可执行操作，减少误操作',
+                    '共享物品加入购物清单时会自动带上推荐理由，后续回看更直观',
+                    '共享物品下架后，相关评论会同步清理，公共频道保持整洁',
+                    '共享信息编辑流程更集中，维护公共频道内容更高效',
+                    '展示模式（Demo）数据升级：内置共享物品、推荐理由、公共频道评论示例（含发布者/管理员评论）',
+                    '侧边栏信息架构微调：公共频道、位置管理、分类管理与设置分组顺序优化'
+                ]
+            },
+            {
                 version: 'v1.4.0', date: '2026-02-12', title: '多用户登录与管理 + Demo 一键体验',
                 changes: [
-                    '新增账号体系：登录/注册/退出登录，按用户隔离物品数据（每用户独立 SQLite）',
+                    '新增账号体系：支持登录/注册/退出登录，每位用户只看到自己的物品数据',
                     '新增管理员角色与默认管理员账号（admin），支持历史账号自动升级为管理员',
                     '注册流程新增验证问题与答案，用于后续密码找回',
                     '新增“忘记密码”流程：先查询验证问题，再校验答案并重置密码',
                     '新增管理员“用户管理”页面：查看用户、角色、物品种类数/总件数、最近登录时间，并可重置用户密码',
                     '登录页新增 Demo 按钮，点击即可一键进入展示环境（无需预填账号密码）',
-                    '新增 auth/demo-login 接口：自动创建/同步测试账号并装载展示模式数据',
-                    '展示模式数据重构为统一函数 loadDemoDataIntoDb：覆盖状态统计、过期提醒、循环提醒、购物提醒、回收站样例等场景',
-                    'system/load-demo 改为复用统一展示数据函数，避免多处演示数据定义不一致'
+                    'Demo 登录体验优化：首次进入也能自动准备好演示账号和数据',
+                    '展示模式覆盖状态统计、过期提醒、循环提醒、购物提醒、回收站等完整场景',
+                    '展示模式数据来源统一，演示内容更稳定一致'
                 ]
             },
             {
                 version: 'v1.3.0', date: '2026-02-11', title: '购物清单增强 + 备忘提醒重构 + 交互统一',
                 changes: [
-                    '新增购物清单模块（页面、弹窗、CRUD、预算与优先级），并支持提醒日期与提醒备注',
+                    '新增购物清单模块，支持预算、优先级、提醒日期与提醒备注',
                     '仪表盘「循环提醒」更名为「备忘提醒」，合并展示循环提醒与购物清单提醒',
                     '备忘提醒中的购物清单项支持「查看清单」直达并自动打开对应编辑弹窗',
                     '编辑清单弹窗新增左下角「已购买入库」按钮，可直接进入该条目的入库流程',
-                    '入库流程复用物品编辑表单，提交文案改为「保存入库」，保存成功后自动移除清单项',
+                    '入库流程与物品编辑体验保持一致，提交后会自动移除对应清单项',
                     '购物清单新增状态字段（待购买/待收货），并按状态分组显示（待购买在上）',
                     '编辑清单新增状态切换按钮（已购买/待购买），点击后自动保存并关闭弹窗',
                     '待收货分组为空时不再显示“暂无待收货清单”占位文案',
-                    '循环提醒升级为实例化记录（item_reminder_instances），支持待完成/已完成/撤销',
+                    '循环提醒支持待完成、已完成、撤销三种操作，处理更灵活',
                     '点击「待完成」后状态变为「已完成」，并自动生成下一次提醒记录',
                     '已完成状态新增「撤销」，可回滚为待完成并撤销对应生成的下一条提醒记录',
                     '物品编辑支持手动修改下次提醒日期，循环提醒字段布局与顺序统一优化',
@@ -7002,7 +9006,7 @@ $currentUserJson = json_encode([
                     '优化浅色模式下“查看清单/待完成/已完成/撤销”按钮文字与边框对比',
                     '优化仪表盘过期提醒与备忘提醒卡片在深浅色模式下的配色协调性',
                     '仪表盘备忘提醒新增分项统计（过期/循环/购物），分类统计与状态统计统一单位“件”',
-                    '展示模式数据补充：新增购物清单演示数据、已完成循环提醒样例，并在重置时同步清理提醒实例与清单序列'
+                    '展示模式补充购物清单与循环提醒示例，重置后演示环境更干净'
                 ]
             },
             {
@@ -7010,7 +9014,7 @@ $currentUserJson = json_encode([
                 changes: [
                     '设置菜单中的「导入/导出」统一改名为「数据管理」',
                     '新增「物品数据重置」与「恢复默认环境」两项能力',
-                    '重置/恢复默认时，uploads 中图片改为移动到 uploads/trash，不直接删除',
+                    '重置或恢复默认时，历史图片会先进入回收区，降低误删风险',
                     '数据管理新增「展示模式」，可一键导入演示数据用于功能展示',
                     '新增购入渠道管理（默认：淘宝/京东/拼多多/闲鱼/线下/礼品），表单改为下拉选择',
                     '移除位置上下级功能，位置管理统一为单级结构',
@@ -7020,12 +9024,12 @@ $currentUserJson = json_encode([
                     '物品管理搜索栏支持属性关键词检索（分类/位置/购入渠道/备注/状态等），支持搜索按钮和 Enter 触发',
                     '物品排序新增名称 Z-A、价格低→高、数量少→多、最早更新/添加、过期日期近→远与远→近（空过期日期自动置后）',
                     '分类管理与位置管理新增排序按钮；下拉层级遮挡问题已修复，并默认跟随系统排序设置',
-                    '导出 JSON 文件名精确到秒，并支持可选导出图片数据',
-                    '导入 JSON 支持读取内置图片数据',
-                    '新增手动批量导入（CSV 模板），模板示例标注必填/可选，日期格式改为 YYYY/MM/DD',
-                    '批量导入日期校验支持 YYYY-MM-DD / YYYY/MM/DD（含单数字月日），错误行自动跳过并给出持久提示',
+                    '导出文件名精确到秒，并支持按需导出图片',
+                    '导入时可同时恢复已导出的图片内容',
+                    '新增手动批量导入（CSV 模板），模板示例明确必填与可选项',
+                    '批量导入日期支持多种常见写法，错误行会自动跳过并提示',
                     '导入时分类/位置/购入渠道/状态支持模糊匹配已有值，不存在时自动回退默认值',
-                    '仪表盘新增状态统计（0 数据状态隐藏）；分类统计右上角显示未分类件数，且仅统计使用中物品',
+                    '仪表盘新增状态统计；分类统计可直接看到未分类件数，并聚焦在使用中的物品',
                     '仪表盘「过期提醒」「状态统计」在无数据时也保持显示空态，不再整块隐藏',
                     '浅色模式下优化过期提醒卡片与时间文字、分类进度条背景，降低突兀感',
                     '状态图标选择器升级为可视化下拉（图标 + 名称）'
@@ -7045,15 +9049,15 @@ $currentUserJson = json_encode([
                     '新增属性显示控制（分类/位置/件数/价格/过期日期/购入渠道/备注）',
                     '新增购入渠道与备注字段，物品表单布局优化为 3 列',
                     '新增筛选栏重置按钮与属性按钮样式优化',
-                    '优化交互性能：减少不必要刷新请求、保持滚动位置',
+                    '列表切换与编辑流程更顺滑，并尽量保持当前浏览位置',
                     '状态管理支持编辑已有状态（名称、图标、颜色）',
-                    '物品卡片中件数显示位置调整到分类前面，修复中尺寸图标缺失与编辑回填问题',
+                    '物品卡片中件数显示位置调整到分类前面，并修复部分显示与编辑回填问题',
                 ]
             },
             {
                 version: 'v1.0.0', date: '2026-02-08', title: '初始版本发布',
                 changes: [
-                    '完整的物品 CRUD 功能',
+                    '完整的物品增删改查功能',
                     '仪表盘统计面板 + 分类进度条',
                     '分类管理（Emoji 图标 + 自定义颜色）',
                     '位置管理（单级结构）',
@@ -7061,7 +9065,7 @@ $currentUserJson = json_encode([
                     '全局搜索 + 多维度筛选 + 多种排序',
                     '数据导出（JSON/CSV）与导入',
                     '深色/浅色主题切换',
-                    '全响应式布局 + 毛玻璃 UI'
+                    '全响应式布局 + 毛玻璃风格界面'
                 ]
             }
         ];
