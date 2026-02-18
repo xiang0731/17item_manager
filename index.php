@@ -99,6 +99,7 @@ function getAuthDB()
             display_name TEXT DEFAULT '',
             role TEXT DEFAULT 'user',
             security_question_key TEXT DEFAULT '',
+            security_question_label TEXT DEFAULT '',
             security_answer_hash TEXT DEFAULT '',
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -129,6 +130,42 @@ function getAuthDB()
         )");
         $authDb->exec("CREATE INDEX IF NOT EXISTS idx_public_shared_comments_shared_id ON public_shared_comments(shared_id)");
         $authDb->exec("CREATE INDEX IF NOT EXISTS idx_public_shared_comments_created_at ON public_shared_comments(created_at)");
+        $authDb->exec("CREATE TABLE IF NOT EXISTS message_board_posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            is_demo_scope INTEGER DEFAULT 0,
+            is_completed INTEGER DEFAULT 0,
+            completed_at DATETIME DEFAULT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )");
+        $authDb->exec("CREATE INDEX IF NOT EXISTS idx_message_board_posts_scope_created ON message_board_posts(is_demo_scope, created_at DESC)");
+        $authDb->exec("CREATE INDEX IF NOT EXISTS idx_message_board_posts_user ON message_board_posts(user_id)");
+        $authDb->exec("CREATE TABLE IF NOT EXISTS admin_operation_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor_user_id INTEGER NOT NULL,
+            actor_username TEXT DEFAULT '',
+            actor_display_name TEXT DEFAULT '',
+            actor_role TEXT DEFAULT 'user',
+            action_key TEXT NOT NULL,
+            action_label TEXT NOT NULL,
+            api TEXT DEFAULT '',
+            method TEXT DEFAULT 'POST',
+            details TEXT DEFAULT '',
+            ip TEXT DEFAULT '',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )");
+        $authDb->exec("CREATE INDEX IF NOT EXISTS idx_admin_operation_logs_created_at ON admin_operation_logs(created_at DESC)");
+        $authDb->exec("CREATE INDEX IF NOT EXISTS idx_admin_operation_logs_actor ON admin_operation_logs(actor_user_id)");
+        $authDb->exec("CREATE TABLE IF NOT EXISTS platform_settings (
+            setting_key TEXT PRIMARY KEY,
+            setting_value TEXT DEFAULT '',
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )");
+        $initRegistrationStmt = $authDb->prepare("INSERT OR IGNORE INTO platform_settings (setting_key, setting_value, updated_at)
+            VALUES ('allow_public_registration', ?, datetime('now','localtime'))");
+        $initRegistrationStmt->execute([ALLOW_PUBLIC_REGISTRATION ? '1' : '0']);
         try {
             $authDb->exec("ALTER TABLE public_shared_items ADD COLUMN recommend_reason TEXT DEFAULT ''");
         } catch (Exception $e) {
@@ -145,6 +182,18 @@ function getAuthDB()
             $authDb->exec("ALTER TABLE users ADD COLUMN security_answer_hash TEXT DEFAULT ''");
         } catch (Exception $e) {
         }
+        try {
+            $authDb->exec("ALTER TABLE users ADD COLUMN security_question_label TEXT DEFAULT ''");
+        } catch (Exception $e) {
+        }
+        try {
+            $authDb->exec("ALTER TABLE message_board_posts ADD COLUMN is_completed INTEGER DEFAULT 0");
+        } catch (Exception $e) {
+        }
+        try {
+            $authDb->exec("ALTER TABLE message_board_posts ADD COLUMN completed_at DATETIME DEFAULT NULL");
+        } catch (Exception $e) {
+        }
 
         // 历史兼容：若存在用户名 admin 的用户，默认升级为管理员
         try {
@@ -158,15 +207,17 @@ function getAuthDB()
         if ($adminCount <= 0) {
             $qKeys = array_keys(SECURITY_QUESTIONS);
             $defaultQuestionKey = count($qKeys) > 0 ? $qKeys[0] : '';
+            $defaultQuestionLabel = ($defaultQuestionKey !== '' && isset(SECURITY_QUESTIONS[$defaultQuestionKey])) ? strval(SECURITY_QUESTIONS[$defaultQuestionKey]) : '';
             $defaultAnswerHash = $defaultQuestionKey !== '' ? password_hash(normalizeSecurityAnswer('admin'), PASSWORD_DEFAULT) : '';
-            $insAdmin = $authDb->prepare("INSERT INTO users (username, password_hash, display_name, role, security_question_key, security_answer_hash, created_at, updated_at)
-                VALUES (?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
+            $insAdmin = $authDb->prepare("INSERT INTO users (username, password_hash, display_name, role, security_question_key, security_question_label, security_answer_hash, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
             $insAdmin->execute([
                 strtolower(DEFAULT_ADMIN_USERNAME),
                 password_hash(DEFAULT_ADMIN_PASSWORD, PASSWORD_DEFAULT),
                 '系统管理员',
                 'admin',
                 $defaultQuestionKey,
+                $defaultQuestionLabel,
                 $defaultAnswerHash
             ]);
         }
@@ -210,6 +261,55 @@ function getSecurityQuestions()
     return SECURITY_QUESTIONS;
 }
 
+function getPlatformSetting($authDb, $key, $defaultValue = '')
+{
+    if (!$authDb instanceof PDO) {
+        return $defaultValue;
+    }
+    $k = trim((string) $key);
+    if ($k === '') {
+        return $defaultValue;
+    }
+    try {
+        $stmt = $authDb->prepare("SELECT setting_value FROM platform_settings WHERE setting_key=? LIMIT 1");
+        $stmt->execute([$k]);
+        $row = $stmt->fetch();
+        if (!$row) {
+            return $defaultValue;
+        }
+        return strval($row['setting_value'] ?? $defaultValue);
+    } catch (Exception $e) {
+        return $defaultValue;
+    }
+}
+
+function setPlatformSetting($authDb, $key, $value)
+{
+    if (!$authDb instanceof PDO) {
+        return false;
+    }
+    $k = trim((string) $key);
+    if ($k === '') {
+        return false;
+    }
+    try {
+        $stmt = $authDb->prepare("INSERT INTO platform_settings (setting_key, setting_value, updated_at)
+            VALUES (?,?,datetime('now','localtime'))
+            ON CONFLICT(setting_key) DO UPDATE SET
+                setting_value=excluded.setting_value,
+                updated_at=datetime('now','localtime')");
+        return $stmt->execute([$k, strval($value)]);
+    } catch (Exception $e) {
+        return false;
+    }
+}
+
+function isPublicRegistrationEnabled($authDb)
+{
+    $raw = strtolower(trim((string) getPlatformSetting($authDb, 'allow_public_registration', ALLOW_PUBLIC_REGISTRATION ? '1' : '0')));
+    return in_array($raw, ['1', 'true', 'yes', 'on'], true);
+}
+
 function isDemoUsername($username)
 {
     $u = strtolower(trim((string) $username));
@@ -241,6 +341,20 @@ function getUserItemStats($userId)
         return ['item_kinds' => $kinds, 'item_qty' => $qty, 'last_item_at' => $lastAt ?: null];
     } catch (Exception $e) {
         return ['item_kinds' => 0, 'item_qty' => 0, 'last_item_at' => null];
+    }
+}
+
+function getUserOperationLogCount($userId)
+{
+    $uid = intval($userId);
+    if ($uid <= 0) {
+        return 0;
+    }
+    try {
+        $db = getUserDB($uid);
+        return intval($db->query("SELECT COUNT(*) FROM operation_logs")->fetchColumn());
+    } catch (Exception $e) {
+        return 0;
     }
 }
 
@@ -373,6 +487,187 @@ function syncPublicSharedItem($authDb, $db, $ownerUserId, $itemId, $isShared)
     upsertPublicSharedItem($authDb, $uid, $snapshot);
 }
 
+function getClientIp()
+{
+    $keys = ['HTTP_X_FORWARDED_FOR', 'HTTP_X_REAL_IP', 'REMOTE_ADDR'];
+    foreach ($keys as $k) {
+        $v = trim((string) ($_SERVER[$k] ?? ''));
+        if ($v === '') {
+            continue;
+        }
+        if ($k === 'HTTP_X_FORWARDED_FOR') {
+            $parts = explode(',', $v);
+            $v = trim((string) ($parts[0] ?? ''));
+        }
+        if ($v !== '') {
+            return $v;
+        }
+    }
+    return '';
+}
+
+function summarizeOperationResult($result)
+{
+    if (!is_array($result)) {
+        return '';
+    }
+    $parts = [];
+    $message = trim((string) ($result['message'] ?? ''));
+    if ($message !== '') {
+        $parts[] = $message;
+    }
+    $metricLabels = [
+        'id' => 'ID',
+        'created' => '新增',
+        'deleted' => '删除',
+        'imported' => '导入',
+        'uploaded' => '上传',
+        'skipped' => '跳过',
+        'moved_images' => '图片转移'
+    ];
+    foreach ($metricLabels as $k => $label) {
+        if (!isset($result[$k])) {
+            continue;
+        }
+        $value = $result[$k];
+        if (!is_numeric($value)) {
+            continue;
+        }
+        $num = intval($value);
+        if ($num <= 0) {
+            continue;
+        }
+        $parts[] = $label . ':' . $num;
+    }
+    return trim(implode('；', $parts));
+}
+
+function composeOperationLogDetail($customDetail, $result)
+{
+    $parts = [];
+    $custom = trim((string) $customDetail);
+    if ($custom !== '') {
+        $parts[] = $custom;
+    }
+    $summary = summarizeOperationResult($result);
+    if ($summary !== '') {
+        $parts[] = $summary;
+    }
+    $parts = array_values(array_filter($parts, function ($v) {
+        return trim((string) $v) !== '';
+    }));
+    return trim(implode('；', $parts));
+}
+
+function logUserOperation($db, $actionKey, $actionLabel, $details = '', $api = '', $method = 'POST')
+{
+    if (!$db instanceof PDO) {
+        return;
+    }
+    $key = trim((string) $actionKey);
+    $label = trim((string) $actionLabel);
+    if ($key === '' || $label === '') {
+        return;
+    }
+    $detailText = trim((string) $details);
+    if (function_exists('mb_substr')) {
+        $detailText = mb_substr($detailText, 0, 500, 'UTF-8');
+    } else {
+        $detailText = substr($detailText, 0, 500);
+    }
+    try {
+        $stmt = $db->prepare("INSERT INTO operation_logs (action_key, action_label, api, method, details, ip, created_at)
+            VALUES (?,?,?,?,?,?,datetime('now','localtime'))");
+        $stmt->execute([
+            $key,
+            $label,
+            trim((string) $api),
+            strtoupper(trim((string) $method)) ?: 'POST',
+            $detailText,
+            getClientIp()
+        ]);
+    } catch (Exception $e) {
+    }
+}
+
+function resolveLogActorMeta($authDb, $actorUser)
+{
+    $meta = [
+        'id' => intval(is_array($actorUser) ? ($actorUser['id'] ?? 0) : 0),
+        'username' => trim((string) (is_array($actorUser) ? ($actorUser['username'] ?? '') : '')),
+        'display_name' => trim((string) (is_array($actorUser) ? ($actorUser['display_name'] ?? '') : '')),
+        'role' => trim((string) (is_array($actorUser) ? ($actorUser['role'] ?? 'user') : 'user')),
+    ];
+    if ($meta['id'] <= 0) {
+        return $meta;
+    }
+    if ($meta['username'] !== '' && $meta['display_name'] !== '' && $meta['role'] !== '') {
+        return $meta;
+    }
+    try {
+        if (!$authDb instanceof PDO) {
+            return $meta;
+        }
+        $stmt = $authDb->prepare("SELECT id, username, display_name, role FROM users WHERE id=? LIMIT 1");
+        $stmt->execute([$meta['id']]);
+        $row = $stmt->fetch();
+        if ($row) {
+            $meta['username'] = trim((string) ($row['username'] ?? $meta['username']));
+            $displayName = trim((string) ($row['display_name'] ?? ''));
+            $meta['display_name'] = $displayName !== '' ? $displayName : $meta['username'];
+            $meta['role'] = trim((string) ($row['role'] ?? $meta['role']));
+        }
+    } catch (Exception $e) {
+    }
+    if ($meta['display_name'] === '' && $meta['username'] !== '') {
+        $meta['display_name'] = $meta['username'];
+    }
+    if ($meta['role'] === '') {
+        $meta['role'] = 'user';
+    }
+    return $meta;
+}
+
+function logAdminOperation($authDb, $actorUser, $actionKey, $actionLabel, $details = '', $api = '', $method = 'POST')
+{
+    if (!$authDb instanceof PDO) {
+        return;
+    }
+    $key = trim((string) $actionKey);
+    $label = trim((string) $actionLabel);
+    if ($key === '' || $label === '') {
+        return;
+    }
+    $actor = resolveLogActorMeta($authDb, $actorUser);
+    if (intval($actor['id']) <= 0) {
+        return;
+    }
+    $detailText = trim((string) $details);
+    if (function_exists('mb_substr')) {
+        $detailText = mb_substr($detailText, 0, 500, 'UTF-8');
+    } else {
+        $detailText = substr($detailText, 0, 500);
+    }
+    try {
+        $stmt = $authDb->prepare("INSERT INTO admin_operation_logs
+            (actor_user_id, actor_username, actor_display_name, actor_role, action_key, action_label, api, method, details, ip, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,datetime('now','localtime'))");
+        $stmt->execute([
+            intval($actor['id']),
+            trim((string) ($actor['username'] ?? '')),
+            trim((string) ($actor['display_name'] ?? '')),
+            trim((string) ($actor['role'] ?? 'user')) ?: 'user',
+            $key,
+            $label,
+            trim((string) $api),
+            strtoupper(trim((string) $method)) ?: 'POST',
+            $detailText,
+            getClientIp()
+        ]);
+    } catch (Exception $e) {
+    }
+}
+
 function initSchema($db)
 {
     $db->exec("CREATE TABLE IF NOT EXISTS categories (
@@ -389,10 +684,23 @@ function initSchema($db)
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
         parent_id INTEGER DEFAULT 0,
+        icon TEXT DEFAULT '📍',
         description TEXT DEFAULT '',
         sort_order INTEGER DEFAULT 0,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )");
+
+    $db->exec("CREATE TABLE IF NOT EXISTS operation_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        action_key TEXT NOT NULL,
+        action_label TEXT NOT NULL,
+        api TEXT DEFAULT '',
+        method TEXT DEFAULT 'POST',
+        details TEXT DEFAULT '',
+        ip TEXT DEFAULT '',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )");
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_operation_logs_created_at ON operation_logs(created_at DESC)");
 
     $db->exec("CREATE TABLE IF NOT EXISTS shopping_list (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -597,6 +905,26 @@ function initSchema($db)
         $db->exec("UPDATE locations SET parent_id=0 WHERE parent_id IS NOT NULL AND parent_id!=0");
     } catch (Exception $e) {
     }
+    try {
+        $db->exec("ALTER TABLE locations ADD COLUMN icon TEXT DEFAULT '📍'");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("UPDATE locations SET icon='📍' WHERE icon IS NULL OR TRIM(icon)=''");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("UPDATE locations SET icon='🛋️' WHERE name='客厅' AND icon='📍'");
+        $db->exec("UPDATE locations SET icon='🛏️' WHERE name='卧室' AND icon='📍'");
+        $db->exec("UPDATE locations SET icon='🍳' WHERE name='厨房' AND icon='📍'");
+        $db->exec("UPDATE locations SET icon='📚' WHERE name='书房' AND icon='📍'");
+        $db->exec("UPDATE locations SET icon='📦' WHERE name='储物间' AND icon='📍'");
+        $db->exec("UPDATE locations SET icon='🌤️' WHERE name='阳台' AND icon='📍'");
+        $db->exec("UPDATE locations SET icon='📺' WHERE name='电视柜' AND icon='📍'");
+        $db->exec("UPDATE locations SET icon='🗄️' WHERE name='书桌抽屉' AND icon='📍'");
+        $db->exec("UPDATE locations SET icon='🚪' WHERE name='玄关' AND icon='📍'");
+    } catch (Exception $e) {
+    }
 
     // 数据库迁移：中文状态值 -> 英文标识
     try {
@@ -729,12 +1057,12 @@ function initSchema($db)
     $count = $db->query("SELECT COUNT(*) FROM locations")->fetchColumn();
     if ($count == 0) {
         $defaults = [
-            ['客厅', 0],
-            ['卧室', 0],
-            ['厨房', 0],
-            ['书房', 0],
+            ['客厅', 0, '🛋️'],
+            ['卧室', 0, '🛏️'],
+            ['厨房', 0, '🍳'],
+            ['书房', 0, '📚'],
         ];
-        $stmt = $db->prepare("INSERT INTO locations (name, parent_id) VALUES (?, ?)");
+        $stmt = $db->prepare("INSERT INTO locations (name, parent_id, icon) VALUES (?, ?, ?)");
         foreach ($defaults as $loc)
             $stmt->execute($loc);
     }
@@ -1088,19 +1416,21 @@ function seedDemoPeerPublicShare($authDb, $viewerUserId)
     $questions = getSecurityQuestions();
     $qKeys = array_keys($questions);
     $defaultQuestionKey = count($qKeys) > 0 ? $qKeys[0] : '';
+    $defaultQuestionLabel = ($defaultQuestionKey !== '' && isset($questions[$defaultQuestionKey])) ? strval($questions[$defaultQuestionKey]) : '';
 
     $peerStmt = $authDb->prepare("SELECT id FROM users WHERE username=? LIMIT 1");
     $peerStmt->execute([$peerUsername]);
     $peerId = intval($peerStmt->fetchColumn() ?: 0);
     if ($peerId <= 0) {
-        $insertPeer = $authDb->prepare("INSERT INTO users (username, password_hash, display_name, role, security_question_key, security_answer_hash, created_at, updated_at)
-            VALUES (?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
+        $insertPeer = $authDb->prepare("INSERT INTO users (username, password_hash, display_name, role, security_question_key, security_question_label, security_answer_hash, created_at, updated_at)
+            VALUES (?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
         $insertPeer->execute([
             $peerUsername,
             password_hash('demo_peer_123456', PASSWORD_DEFAULT),
             $peerDisplayName,
             'user',
             $defaultQuestionKey,
+            $defaultQuestionLabel,
             $defaultQuestionKey !== '' ? password_hash(normalizeSecurityAnswer('demo_peer'), PASSWORD_DEFAULT) : ''
         ]);
         $peerId = intval($authDb->lastInsertId());
@@ -1197,8 +1527,9 @@ function loadDemoDataIntoDb($db, $options = [])
         $db->exec("DELETE FROM shopping_list");
         $db->exec("DELETE FROM categories");
         $db->exec("DELETE FROM locations");
+        $db->exec("DELETE FROM operation_logs");
         try {
-            $db->exec("DELETE FROM sqlite_sequence WHERE name IN ('items','item_reminder_instances','shopping_list','categories','locations')");
+            $db->exec("DELETE FROM sqlite_sequence WHERE name IN ('items','item_reminder_instances','shopping_list','categories','locations','operation_logs')");
         } catch (Exception $e) {
         }
 
@@ -1219,19 +1550,19 @@ function loadDemoDataIntoDb($db, $options = [])
             }
             return $map;
         };
-        $insertLocation = $db->prepare("INSERT INTO locations (name, parent_id, description) VALUES (?,?,?)");
+        $insertLocation = $db->prepare("INSERT INTO locations (name, parent_id, icon, description) VALUES (?,?,?,?)");
         $locMap = $loadLocationMap();
         $requiredLocations = [
-            ['储物间', '集中存放不常用物品'],
-            ['阳台', '户外和工具相关物品'],
-            ['电视柜', '客厅电子设备与配件'],
-            ['书桌抽屉', '文具和常用小配件'],
-            ['玄关', '出门随手物品存放']
+            ['储物间', '📦', '集中存放不常用物品'],
+            ['阳台', '🌤️', '户外和工具相关物品'],
+            ['电视柜', '📺', '客厅电子设备与配件'],
+            ['书桌抽屉', '🗄️', '文具和常用小配件'],
+            ['玄关', '🚪', '出门随手物品存放']
         ];
         foreach ($requiredLocations as $locMeta) {
-            [$name, $desc] = $locMeta;
+            [$name, $icon, $desc] = $locMeta;
             if (!isset($locMap[$name])) {
-                $insertLocation->execute([$name, 0, $desc]);
+                $insertLocation->execute([$name, 0, $icon, $desc]);
                 $locMap = $loadLocationMap();
             }
         }
@@ -1451,9 +1782,143 @@ function loadDemoDataIntoDb($db, $options = [])
             }
         }
 
-        $db->commit();
+        $taskSeeded = 0;
+        $taskCompletedSeeded = 0;
+        if ($authDb && $ownerUserId > 0) {
+            $ownerUsernameStmt = $authDb->prepare("SELECT username FROM users WHERE id=? LIMIT 1");
+            $ownerUsernameStmt->execute([$ownerUserId]);
+            $ownerUsername = trim((string) $ownerUsernameStmt->fetchColumn());
+            $taskScope = isDemoUsername($ownerUsername) ? 1 : 0;
+
+            $cleanTaskStmt = $authDb->prepare("DELETE FROM message_board_posts WHERE user_id=? AND is_demo_scope=?");
+            $cleanTaskStmt->execute([$ownerUserId, $taskScope]);
+
+            $demoTasks = [
+                ['content' => '整理厨房抽屉里的即将到期食材', 'is_completed' => 0],
+                ['content' => '给空气净化器滤芯下单备用件', 'is_completed' => 0],
+                ['content' => '核对公共频道共享条目的推荐理由', 'is_completed' => 1],
+                ['content' => '盘点书房未分类物品并补充二级分类', 'is_completed' => 0]
+            ];
+            $insertTaskStmt = $authDb->prepare("INSERT INTO message_board_posts
+                (user_id, content, is_demo_scope, is_completed, completed_at, created_at, updated_at)
+                VALUES (?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
+            foreach ($demoTasks as $taskRow) {
+                $isCompleted = intval($taskRow['is_completed'] ?? 0) === 1 ? 1 : 0;
+                $insertTaskStmt->execute([
+                    $ownerUserId,
+                    trim((string) ($taskRow['content'] ?? '')),
+                    $taskScope,
+                    $isCompleted,
+                    $isCompleted === 1 ? date('Y-m-d H:i:s') : null
+                ]);
+                $taskSeeded++;
+                if ($isCompleted === 1) {
+                    $taskCompletedSeeded++;
+                }
+            }
+        }
+
         $totalSharedCount = $sharedCount + $peerSharedCount;
         $totalPublicCommentCreated = $publicCommentCreated + $peerCommentCreated;
+        $seedLogs = [
+            [
+                'action_key' => 'items',
+                'action_label' => '新增物品',
+                'api' => 'items',
+                'method' => 'POST',
+                'details' => 'Demo 数据初始化：新增物品 ' . $created . ' 件' . ($subcategoryBoundCount > 0 ? ('，其中二级分类 ' . $subcategoryBoundCount . ' 件') : ''),
+                'created_at' => "datetime('now','-120 minutes','localtime')"
+            ],
+            [
+                'action_key' => 'categories_update',
+                'action_label' => '编辑分类',
+                'api' => 'categories/update',
+                'method' => 'POST',
+                'details' => '分类管理：已准备一级/二级分类结构，支持树状维护',
+                'created_at' => "datetime('now','-95 minutes','localtime')"
+            ],
+            [
+                'action_key' => 'shopping_list',
+                'action_label' => '新增购物清单',
+                'api' => 'shopping-list',
+                'method' => 'POST',
+                'details' => '购物清单初始化：新增 ' . $shoppingCreated . ' 条待办',
+                'created_at' => "datetime('now','-80 minutes','localtime')"
+            ],
+            [
+                'action_key' => 'message_board',
+                'action_label' => '新增任务',
+                'api' => 'message-board',
+                'method' => 'POST',
+                'details' => '任务清单初始化：新增 ' . $taskSeeded . ' 条（已完成 ' . $taskCompletedSeeded . ' 条）',
+                'created_at' => "datetime('now','-70 minutes','localtime')"
+            ],
+            [
+                'action_key' => 'public_channel_add_to_shopping',
+                'action_label' => '公共频道加入购物清单',
+                'api' => 'public-channel/add-to-shopping',
+                'method' => 'POST',
+                'details' => '公共频道示例：可将共享物品一键加入购物清单（含推荐理由）',
+                'created_at' => "datetime('now','-55 minutes','localtime')"
+            ]
+        ];
+        if ($totalSharedCount > 0) {
+            $seedLogs[] = [
+                'action_key' => 'public_channel_update',
+                'action_label' => '编辑公共频道共享物品',
+                'api' => 'public-channel/update',
+                'method' => 'POST',
+                'details' => '共享物品初始化：共 ' . $totalSharedCount . ' 条共享记录',
+                'created_at' => "datetime('now','-45 minutes','localtime')"
+            ];
+        }
+        if ($totalPublicCommentCreated > 0) {
+            $seedLogs[] = [
+                'action_key' => 'public_channel_comment',
+                'action_label' => '发表评论',
+                'api' => 'public-channel/comment',
+                'method' => 'POST',
+                'details' => '公共频道评论初始化：共 ' . $totalPublicCommentCreated . ' 条评论',
+                'created_at' => "datetime('now','-30 minutes','localtime')"
+            ];
+        }
+        if ($completedReminderDemoPrepared) {
+            $seedLogs[] = [
+                'action_key' => 'items_complete_reminder',
+                'action_label' => '完成提醒',
+                'api' => 'items/complete-reminder',
+                'method' => 'POST',
+                'details' => '循环提醒示例：已包含 1 条完成提醒并自动生成下一次提醒',
+                'created_at' => "datetime('now','-20 minutes','localtime')"
+            ];
+        }
+        if ($trashId > 0) {
+            $seedLogs[] = [
+                'action_key' => 'items_delete',
+                'action_label' => '删除物品到回收站',
+                'api' => 'items/delete',
+                'method' => 'POST',
+                'details' => '回收站示例：已预置 1 条可恢复记录',
+                'created_at' => "datetime('now','-10 minutes','localtime')"
+            ];
+        }
+        $operationLogSeeded = count($seedLogs);
+        foreach ($seedLogs as $row) {
+            $insertSql = sprintf(
+                "INSERT INTO operation_logs (action_key, action_label, api, method, details, ip, created_at) VALUES (?,?,?,?,?,'127.0.0.1',%s)",
+                $row['created_at']
+            );
+            $stmt = $db->prepare($insertSql);
+            $stmt->execute([
+                $row['action_key'],
+                $row['action_label'],
+                $row['api'],
+                $row['method'],
+                $row['details']
+            ]);
+        }
+
+        $db->commit();
         $message = "体验数据已初始化：$created 件物品、$shoppingCreated 条购物清单已就绪";
         if ($subcategoryBoundCount > 0) {
             $message .= "，其中 $subcategoryBoundCount 件已绑定二级分类";
@@ -1473,6 +1938,12 @@ function loadDemoDataIntoDb($db, $options = [])
         if ($trashId > 0) {
             $message .= '，含 1 条回收站记录';
         }
+        if ($operationLogSeeded > 0) {
+            $message .= '，含 ' . $operationLogSeeded . ' 条操作日志样例';
+        }
+        if ($taskSeeded > 0) {
+            $message .= '，含 ' . $taskSeeded . ' 条任务清单示例';
+        }
         return [
             'message' => $message,
             'created' => $created,
@@ -1480,6 +1951,9 @@ function loadDemoDataIntoDb($db, $options = [])
             'shopping_created' => $shoppingCreated,
             'shared_created' => $totalSharedCount,
             'public_comment_created' => $totalPublicCommentCreated,
+            'operation_log_seeded' => $operationLogSeeded,
+            'task_seeded' => $taskSeeded,
+            'task_completed_seeded' => $taskCompletedSeeded,
             'owner_shared_created' => $sharedCount,
             'peer_shared_created' => $peerSharedCount,
             'completed_reminder_demo' => $completedReminderDemoPrepared,
@@ -1510,9 +1984,10 @@ if (isset($_GET['api'])) {
             $userCount = intval($authDb->query("SELECT COUNT(*) FROM users")->fetchColumn());
             $currentUser = getCurrentAuthUser($authDb);
             $securityQuestions = getSecurityQuestions();
+            $allowRegistration = isPublicRegistrationEnabled($authDb);
             $result = [
                 'success' => true,
-                'allow_registration' => ALLOW_PUBLIC_REGISTRATION,
+                'allow_registration' => $allowRegistration,
                 'has_users' => $userCount > 0,
                 'needs_setup' => $userCount === 0,
                 'default_admin' => [
@@ -1546,10 +2021,11 @@ if (isset($_GET['api'])) {
             $password = strval($data['password'] ?? '');
             $displayName = trim((string) ($data['display_name'] ?? ''));
             $questionKey = trim((string) ($data['question_key'] ?? ''));
+            $questionCustom = trim((string) ($data['question_custom'] ?? ''));
             $securityAnswer = strval($data['security_answer'] ?? '');
 
-            if (!ALLOW_PUBLIC_REGISTRATION) {
-                $result = ['success' => false, 'message' => '当前已关闭注册'];
+            if (!isPublicRegistrationEnabled($authDb)) {
+                $result = ['success' => false, 'message' => '感谢关注，当前暂未开放注册功能，请稍后再试。'];
                 echo json_encode($result, JSON_UNESCAPED_UNICODE);
                 exit;
             }
@@ -1564,10 +2040,27 @@ if (isset($_GET['api'])) {
                 exit;
             }
             $questions = getSecurityQuestions();
-            if (!isset($questions[$questionKey])) {
-                $result = ['success' => false, 'message' => '请选择有效的验证问题'];
-                echo json_encode($result, JSON_UNESCAPED_UNICODE);
-                exit;
+            $questionLabel = '';
+            if ($questionKey === '__custom__') {
+                $questionLen = function_exists('mb_strlen') ? mb_strlen($questionCustom, 'UTF-8') : strlen($questionCustom);
+                if ($questionLen < 2) {
+                    $result = ['success' => false, 'message' => '请填写自定义验证问题'];
+                    echo json_encode($result, JSON_UNESCAPED_UNICODE);
+                    exit;
+                }
+                if ($questionLen > 60) {
+                    $result = ['success' => false, 'message' => '自定义验证问题最多 60 字'];
+                    echo json_encode($result, JSON_UNESCAPED_UNICODE);
+                    exit;
+                }
+                $questionLabel = $questionCustom;
+            } else {
+                if (!isset($questions[$questionKey])) {
+                    $result = ['success' => false, 'message' => '请选择有效的验证问题'];
+                    echo json_encode($result, JSON_UNESCAPED_UNICODE);
+                    exit;
+                }
+                $questionLabel = strval($questions[$questionKey] ?? '');
             }
             $answerLen = function_exists('mb_strlen') ? mb_strlen(trim($securityAnswer), 'UTF-8') : strlen(trim($securityAnswer));
             if ($answerLen < 1) {
@@ -1589,13 +2082,21 @@ if (isset($_GET['api'])) {
 
             $hash = password_hash($password, PASSWORD_DEFAULT);
             $answerHash = password_hash(normalizeSecurityAnswer($securityAnswer), PASSWORD_DEFAULT);
-            $ins = $authDb->prepare("INSERT INTO users (username, password_hash, display_name, role, security_question_key, security_answer_hash, created_at, updated_at)
-                VALUES (?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
-            $ins->execute([$username, $hash, $displayName, 'user', $questionKey, $answerHash]);
+            $ins = $authDb->prepare("INSERT INTO users (username, password_hash, display_name, role, security_question_key, security_question_label, security_answer_hash, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
+            $ins->execute([$username, $hash, $displayName, 'user', $questionKey, $questionLabel, $answerHash]);
             $newId = intval($authDb->lastInsertId());
 
             $_SESSION['user_id'] = $newId;
             session_regenerate_id(true);
+            $registerDetail = '用户名: ' . $username;
+            $registerActor = ['id' => $newId, 'username' => $username, 'display_name' => $displayName, 'role' => 'user'];
+            try {
+                $newUserDb = getUserDB($newId);
+                logUserOperation($newUserDb, 'auth_register', '注册账号', $registerDetail, 'auth/register', 'POST');
+            } catch (Exception $e) {
+            }
+            logAdminOperation($authDb, $registerActor, 'auth_register', '注册账号', $registerDetail, 'auth/register', 'POST');
             $result = [
                 'success' => true,
                 'message' => '注册成功',
@@ -1628,6 +2129,12 @@ if (isset($_GET['api'])) {
             session_regenerate_id(true);
             $up = $authDb->prepare("UPDATE users SET last_login_at=datetime('now','localtime'), updated_at=datetime('now','localtime') WHERE id=?");
             $up->execute([intval($user['id'])]);
+            try {
+                $loginDb = getUserDB(intval($user['id']));
+                logUserOperation($loginDb, 'auth_login', '登录系统', '', 'auth/login', 'POST');
+            } catch (Exception $e) {
+            }
+            logAdminOperation($authDb, $user, 'auth_login', '登录系统', '', 'auth/login', 'POST');
             $result = [
                 'success' => true,
                 'message' => '登录成功',
@@ -1653,33 +2160,34 @@ if (isset($_GET['api'])) {
             $demoUsername = strtolower(DEFAULT_DEMO_USERNAME);
             $demoPassword = DEFAULT_DEMO_PASSWORD;
             $demoDisplayName = '测试用户';
-            $questions = getSecurityQuestions();
-            $qKeys = array_keys($questions);
-            $defaultQuestionKey = count($qKeys) > 0 ? $qKeys[0] : '';
+            $demoQuestionKey = '__custom__';
+            $demoQuestionLabel = '你最常用的收纳位置是？';
 
             $findStmt = $authDb->prepare("SELECT id, username, display_name, role FROM users WHERE username=? LIMIT 1");
             $findStmt->execute([$demoUsername]);
             $demoUser = $findStmt->fetch();
             $demoId = intval($demoUser['id'] ?? 0);
             if ($demoId <= 0) {
-                $ins = $authDb->prepare("INSERT INTO users (username, password_hash, display_name, role, security_question_key, security_answer_hash, created_at, updated_at)
-                    VALUES (?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
+                $ins = $authDb->prepare("INSERT INTO users (username, password_hash, display_name, role, security_question_key, security_question_label, security_answer_hash, created_at, updated_at)
+                    VALUES (?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
                 $ins->execute([
                     $demoUsername,
                     password_hash($demoPassword, PASSWORD_DEFAULT),
                     $demoDisplayName,
                     'user',
-                    $defaultQuestionKey,
-                    $defaultQuestionKey !== '' ? password_hash(normalizeSecurityAnswer('test'), PASSWORD_DEFAULT) : ''
+                    $demoQuestionKey,
+                    $demoQuestionLabel,
+                    password_hash(normalizeSecurityAnswer('test'), PASSWORD_DEFAULT)
                 ]);
                 $demoId = intval($authDb->lastInsertId());
             } else {
-                $syncStmt = $authDb->prepare("UPDATE users SET password_hash=?, display_name=?, role='user', security_question_key=?, security_answer_hash=?, updated_at=datetime('now','localtime') WHERE id=?");
+                $syncStmt = $authDb->prepare("UPDATE users SET password_hash=?, display_name=?, role='user', security_question_key=?, security_question_label=?, security_answer_hash=?, updated_at=datetime('now','localtime') WHERE id=?");
                 $syncStmt->execute([
                     password_hash($demoPassword, PASSWORD_DEFAULT),
                     $demoDisplayName,
-                    $defaultQuestionKey,
-                    $defaultQuestionKey !== '' ? password_hash(normalizeSecurityAnswer('test'), PASSWORD_DEFAULT) : '',
+                    $demoQuestionKey,
+                    $demoQuestionLabel,
+                    password_hash(normalizeSecurityAnswer('test'), PASSWORD_DEFAULT),
                     $demoId
                 ]);
             }
@@ -1691,6 +2199,10 @@ if (isset($_GET['api'])) {
             session_regenerate_id(true);
             $up = $authDb->prepare("UPDATE users SET last_login_at=datetime('now','localtime'), updated_at=datetime('now','localtime') WHERE id=?");
             $up->execute([$demoId]);
+            $demoDetail = trim((string) ($demoLoad['message'] ?? ''));
+            $demoActor = ['id' => $demoId, 'username' => $demoUsername, 'display_name' => $demoDisplayName, 'role' => 'user'];
+            logUserOperation($demoDb, 'auth_demo_login', '进入 Demo 环境', $demoDetail, 'auth/demo-login', 'POST');
+            logAdminOperation($authDb, $demoActor, 'auth_demo_login', '进入 Demo 环境', $demoDetail, 'auth/demo-login', 'POST');
 
             $result = [
                 'success' => true,
@@ -1709,6 +2221,25 @@ if (isset($_GET['api'])) {
         }
 
         if ($api === 'auth/logout') {
+            $logoutUid = getCurrentUserId();
+            $logoutActor = null;
+            if ($logoutUid > 0) {
+                try {
+                    $stmtLogoutUser = $authDb->prepare("SELECT id, username, display_name, role FROM users WHERE id=? LIMIT 1");
+                    $stmtLogoutUser->execute([$logoutUid]);
+                    $logoutActor = $stmtLogoutUser->fetch();
+                } catch (Exception $e) {
+                    $logoutActor = null;
+                }
+            }
+            if ($logoutUid > 0) {
+                try {
+                    $logoutDb = getUserDB($logoutUid);
+                    logUserOperation($logoutDb, 'auth_logout', '退出登录', '', 'auth/logout', 'POST');
+                } catch (Exception $e) {
+                }
+                logAdminOperation($authDb, $logoutActor ?: ['id' => $logoutUid], 'auth_logout', '退出登录', '', 'auth/logout', 'POST');
+            }
             unset($_SESSION['user_id']);
             session_regenerate_id(true);
             $result = ['success' => true, 'message' => '已退出登录'];
@@ -1744,7 +2275,7 @@ if (isset($_GET['api'])) {
                 echo json_encode($result, JSON_UNESCAPED_UNICODE);
                 exit;
             }
-            $stmt = $authDb->prepare("SELECT security_question_key FROM users WHERE username=? LIMIT 1");
+            $stmt = $authDb->prepare("SELECT security_question_key, security_question_label FROM users WHERE username=? LIMIT 1");
             $stmt->execute([$username]);
             $row = $stmt->fetch();
             if (!$row) {
@@ -1754,12 +2285,17 @@ if (isset($_GET['api'])) {
             }
             $questions = getSecurityQuestions();
             $key = trim((string) ($row['security_question_key'] ?? ''));
-            if ($key === '' || !isset($questions[$key])) {
+            $storedLabel = trim((string) ($row['security_question_label'] ?? ''));
+            $label = $storedLabel;
+            if ($label === '' && $key !== '' && isset($questions[$key])) {
+                $label = strval($questions[$key]);
+            }
+            if ($key === '' || $label === '') {
                 $result = ['success' => false, 'message' => '该账号未设置验证问题'];
                 echo json_encode($result, JSON_UNESCAPED_UNICODE);
                 exit;
             }
-            $result = ['success' => true, 'question_key' => $key, 'question_label' => $questions[$key]];
+            $result = ['success' => true, 'question_key' => $key, 'question_label' => $label];
             echo json_encode($result, JSON_UNESCAPED_UNICODE);
             exit;
         }
@@ -1817,6 +2353,7 @@ if (isset($_GET['api'])) {
             $users = [];
             foreach ($rows as $row) {
                 $stats = getUserItemStats(intval($row['id']));
+                $logCount = getUserOperationLogCount(intval($row['id']));
                 $users[] = [
                     'id' => intval($row['id']),
                     'username' => $row['username'],
@@ -1828,7 +2365,8 @@ if (isset($_GET['api'])) {
                     'last_login_at' => $row['last_login_at'],
                     'item_kinds' => intval($stats['item_kinds'] ?? 0),
                     'item_qty' => intval($stats['item_qty'] ?? 0),
-                    'last_item_at' => $stats['last_item_at'] ?? null
+                    'last_item_at' => $stats['last_item_at'] ?? null,
+                    'operation_log_count' => $logCount
                 ];
             }
             $result = ['success' => true, 'data' => $users];
@@ -1865,11 +2403,19 @@ if (isset($_GET['api'])) {
             }
             $up = $authDb->prepare("UPDATE users SET password_hash=?, updated_at=datetime('now','localtime') WHERE id=?");
             $up->execute([password_hash($newPassword, PASSWORD_DEFAULT), $targetId]);
+            $resetDetail = '目标用户: ' . trim((string) ($targetUser['username'] ?? ('#' . $targetId))) . '（ID:' . $targetId . '）';
+            try {
+                $adminDb = getUserDB(intval($currentUser['id']));
+                logUserOperation($adminDb, 'auth_admin_reset_password', '管理员重置用户密码', $resetDetail, 'auth/admin-reset-password', 'POST');
+            } catch (Exception $e) {
+            }
+            logAdminOperation($authDb, $currentUser, 'auth_admin_reset_password', '管理员重置用户密码', $resetDetail, 'auth/admin-reset-password', 'POST');
             $result = ['success' => true, 'message' => "已重置用户 {$targetUser['username']} 的密码"];
             echo json_encode($result, JSON_UNESCAPED_UNICODE);
             exit;
         }
         $db = getUserDB(intval($currentUser['id']));
+        $operationDetails = '';
 
         switch ($api) {
             // ---------- 仪表盘 ----------
@@ -1909,7 +2455,53 @@ if (isset($_GET['api'])) {
                     ORDER BY r.due_date ASC, r.is_completed ASC, r.id ASC
                     LIMIT 20")->fetchAll();
                 $shoppingReminderItems = $db->query("SELECT s.*, c.name as category_name, c.icon as category_icon, c.color as category_color FROM shopping_list s LEFT JOIN categories c ON s.category_id=c.id WHERE s.reminder_date != '' AND s.reminder_date IS NOT NULL AND s.reminder_date <= date('now','+3 day','localtime') ORDER BY s.reminder_date ASC LIMIT 10")->fetchAll();
-                $result = ['success' => true, 'data' => compact('totalItems', 'totalKinds', 'totalCategories', 'totalLocations', 'totalValue', 'recentItems', 'categoryStats', 'statusStats', 'uncategorizedQty', 'expiringItems', 'reminderItems', 'shoppingReminderItems')];
+                $messageBoardStmt = $authDb->prepare("SELECT
+                        m.id,
+                        m.user_id,
+                        m.content,
+                        COALESCE(m.is_completed,0) as is_completed,
+                        m.completed_at,
+                        m.created_at,
+                        m.updated_at,
+                        u.username,
+                        u.display_name
+                    FROM message_board_posts m
+                    LEFT JOIN users u ON u.id=m.user_id
+                    WHERE m.is_demo_scope=?
+                      AND COALESCE(m.is_completed,0)=0
+                    ORDER BY m.created_at DESC, m.id DESC
+                    LIMIT 6");
+                $messageBoardStmt->execute([$currentUserIsDemoScope ? 1 : 0]);
+                $messageBoardRows = $messageBoardStmt->fetchAll();
+                $messageBoardPosts = [];
+                foreach ($messageBoardRows as $row) {
+                    $author = trim((string) ($row['display_name'] ?? ''));
+                    if ($author === '') {
+                        $author = trim((string) ($row['username'] ?? ''));
+                    }
+                    if ($author === '') {
+                        $author = '用户#' . intval($row['user_id'] ?? 0);
+                    }
+                    $messageBoardPosts[] = [
+                        'id' => intval($row['id'] ?? 0),
+                        'user_id' => intval($row['user_id'] ?? 0),
+                        'author_name' => $author,
+                        'content' => trim((string) ($row['content'] ?? '')),
+                        'is_completed' => intval($row['is_completed'] ?? 0) === 1 ? 1 : 0,
+                        'completed_at' => trim((string) ($row['completed_at'] ?? '')),
+                        'created_at' => trim((string) ($row['created_at'] ?? '')),
+                        'updated_at' => trim((string) ($row['updated_at'] ?? '')),
+                        'can_edit' => (
+                            intval($row['user_id'] ?? 0) === intval($currentUser['id'])
+                            || isAdminUser($currentUser)
+                        ),
+                        'can_delete' => (
+                            intval($row['user_id'] ?? 0) === intval($currentUser['id'])
+                            || isAdminUser($currentUser)
+                        )
+                    ];
+                }
+                $result = ['success' => true, 'data' => compact('totalItems', 'totalKinds', 'totalCategories', 'totalLocations', 'totalValue', 'recentItems', 'categoryStats', 'statusStats', 'uncategorizedQty', 'expiringItems', 'reminderItems', 'shoppingReminderItems', 'messageBoardPosts')];
                 break;
 
             // ---------- 物品 CRUD ----------
@@ -2076,6 +2668,31 @@ if (isset($_GET['api'])) {
                     $newItemId = intval($db->lastInsertId());
                     syncItemReminderInstances($db, $newItemId, $reminderDate, $reminderNextDate, $reminderValue, $reminderUnit);
                     syncPublicSharedItem($authDb, $db, intval($currentUser['id']), $newItemId, $shareFlag);
+                    $itemName = trim((string) ($data['name'] ?? ''));
+                    $itemQty = max(0, intval($data['quantity'] ?? 1));
+                    $operationDetails = '物品: ' . $itemName . '（ID:' . $newItemId . '）' . '；件数: ' . $itemQty;
+                    if ($categoryId > 0) {
+                        $catName = trim((string) ($db->query("SELECT name FROM categories WHERE id=" . intval($categoryId) . " LIMIT 1")->fetchColumn() ?: ''));
+                        if ($catName !== '') {
+                            $operationDetails .= '；一级分类: ' . $catName;
+                        }
+                    }
+                    if ($subcategoryId > 0) {
+                        $subName = trim((string) ($db->query("SELECT name FROM categories WHERE id=" . intval($subcategoryId) . " LIMIT 1")->fetchColumn() ?: ''));
+                        if ($subName !== '') {
+                            $operationDetails .= '；二级分类: ' . $subName;
+                        }
+                    }
+                    $locId = intval($data['location_id'] ?? 0);
+                    if ($locId > 0) {
+                        $locName = trim((string) ($db->query("SELECT name FROM locations WHERE id=" . $locId . " LIMIT 1")->fetchColumn() ?: ''));
+                        if ($locName !== '') {
+                            $operationDetails .= '；位置: ' . $locName;
+                        }
+                    }
+                    if ($shareFlag === 1) {
+                        $operationDetails .= '；已共享到公共频道';
+                    }
                     $result = ['success' => true, 'message' => '添加成功', 'id' => $newItemId];
                 }
                 break;
@@ -2133,6 +2750,34 @@ if (isset($_GET['api'])) {
                     ]);
                     syncItemReminderInstances($db, intval($data['id']), $reminderDate, $reminderNextDate, $reminderValue, $reminderUnit);
                     syncPublicSharedItem($authDb, $db, intval($currentUser['id']), intval($data['id']), $shareFlag);
+                    $itemId = intval($data['id']);
+                    $itemName = trim((string) ($data['name'] ?? ''));
+                    $itemQty = max(0, intval($data['quantity'] ?? 1));
+                    $operationDetails = '物品: ' . $itemName . '（ID:' . $itemId . '）' . '；件数: ' . $itemQty;
+                    if ($categoryId > 0) {
+                        $catName = trim((string) ($db->query("SELECT name FROM categories WHERE id=" . intval($categoryId) . " LIMIT 1")->fetchColumn() ?: ''));
+                        if ($catName !== '') {
+                            $operationDetails .= '；一级分类: ' . $catName;
+                        }
+                    }
+                    if ($subcategoryId > 0) {
+                        $subName = trim((string) ($db->query("SELECT name FROM categories WHERE id=" . intval($subcategoryId) . " LIMIT 1")->fetchColumn() ?: ''));
+                        if ($subName !== '') {
+                            $operationDetails .= '；二级分类: ' . $subName;
+                        }
+                    }
+                    $locId = intval($data['location_id'] ?? 0);
+                    if ($locId > 0) {
+                        $locName = trim((string) ($db->query("SELECT name FROM locations WHERE id=" . $locId . " LIMIT 1")->fetchColumn() ?: ''));
+                        if ($locName !== '') {
+                            $operationDetails .= '；位置: ' . $locName;
+                        }
+                    }
+                    if ($shareFlag === 1) {
+                        $operationDetails .= '；共享状态: 开启';
+                    } else {
+                        $operationDetails .= '；共享状态: 关闭';
+                    }
                     $result = ['success' => true, 'message' => '更新成功'];
                 }
                 break;
@@ -2146,7 +2791,7 @@ if (isset($_GET['api'])) {
                         $result = ['success' => false, 'message' => '缺少物品ID'];
                         break;
                     }
-                    $stmt = $db->prepare("SELECT id, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit FROM items WHERE id=? AND deleted_at IS NULL");
+                    $stmt = $db->prepare("SELECT id, name, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit FROM items WHERE id=? AND deleted_at IS NULL");
                     $stmt->execute([$id]);
                     $item = $stmt->fetch();
                     if (!$item) {
@@ -2208,6 +2853,10 @@ if (isset($_GET['api'])) {
                         $up->execute([$nextDate, $id]);
 
                         $db->commit();
+                        $operationDetails = '物品: ' . trim((string) ($item['name'] ?? ('#' . $id))) . '（ID:' . $id . '）'
+                            . '；完成提醒ID: ' . intval($instance['id'])
+                            . '；本次提醒: ' . $currentDueDate
+                            . '；下次提醒: ' . $nextDate;
                         $result = ['success' => true, 'message' => '提醒已完成，已生成下一次提醒', 'next_date' => $nextDate];
                     } catch (Exception $e) {
                         if ($db->inTransaction())
@@ -2227,7 +2876,7 @@ if (isset($_GET['api'])) {
                         break;
                     }
 
-                    $itemStmt = $db->prepare("SELECT id FROM items WHERE id=? AND deleted_at IS NULL LIMIT 1");
+                    $itemStmt = $db->prepare("SELECT id, name FROM items WHERE id=? AND deleted_at IS NULL LIMIT 1");
                     $itemStmt->execute([$id]);
                     $item = $itemStmt->fetch();
                     if (!$item) {
@@ -2274,6 +2923,9 @@ if (isset($_GET['api'])) {
                         $up->execute([$dueDate, $id]);
 
                         $db->commit();
+                        $operationDetails = '物品: ' . trim((string) ($item['name'] ?? ('#' . $id))) . '（ID:' . $id . '）'
+                            . '；撤销提醒ID: ' . $reminderId
+                            . '；恢复提醒日期: ' . $dueDate;
                         $result = ['success' => true, 'message' => '已撤销完成状态并移除下一次提醒'];
                     } catch (Exception $e) {
                         if ($db->inTransaction())
@@ -2287,12 +2939,21 @@ if (isset($_GET['api'])) {
                 if ($method === 'POST') {
                     $data = json_decode(file_get_contents('php://input'), true);
                     $id = intval($data['id'] ?? 0);
+                    $itemInfoStmt = $db->prepare("SELECT id, name, quantity, image FROM items WHERE id=? LIMIT 1");
+                    $itemInfoStmt->execute([$id]);
+                    $itemInfo = $itemInfoStmt->fetch();
                     // 软删除：移入回收站，图片移到 trash 目录
-                    $img = $db->query("SELECT image FROM items WHERE id=$id")->fetchColumn();
+                    $img = trim((string) ($itemInfo['image'] ?? ''));
                     if ($img && file_exists(UPLOAD_DIR . $img))
                         @rename(UPLOAD_DIR . $img, TRASH_DIR . $img);
                     $db->exec("UPDATE items SET deleted_at=datetime('now','localtime') WHERE id=$id");
                     removePublicSharedItem($authDb, intval($currentUser['id']), $id);
+                    $itemName = trim((string) ($itemInfo['name'] ?? ''));
+                    $itemQty = intval($itemInfo['quantity'] ?? 0);
+                    $operationDetails = '物品: ' . ($itemName !== '' ? $itemName : ('#' . $id)) . '（ID:' . $id . '）';
+                    if ($itemQty > 0) {
+                        $operationDetails .= '；件数: ' . $itemQty;
+                    }
                     $result = ['success' => true, 'message' => '已移入回收站'];
                 }
                 break;
@@ -2301,8 +2962,15 @@ if (isset($_GET['api'])) {
                 if ($method === 'POST') {
                     $data = json_decode(file_get_contents('php://input'), true);
                     $ids = array_map('intval', $data['ids'] ?? []);
+                    $deletedCount = 0;
+                    $sampleNames = [];
                     if ($ids) {
                         $placeholders = implode(',', $ids);
+                        $metaRows = $db->query("SELECT name FROM items WHERE id IN ($placeholders) ORDER BY id ASC")->fetchAll(PDO::FETCH_COLUMN);
+                        $sampleNames = array_slice(array_values(array_filter(array_map(function ($v) {
+                            return trim((string) $v);
+                        }, $metaRows))), 0, 3);
+                        $deletedCount = count($metaRows);
                         $images = $db->query("SELECT image FROM items WHERE id IN ($placeholders) AND image != ''")->fetchAll(PDO::FETCH_COLUMN);
                         foreach ($images as $img) {
                             if (file_exists(UPLOAD_DIR . $img))
@@ -2310,6 +2978,10 @@ if (isset($_GET['api'])) {
                         }
                         $db->exec("UPDATE items SET deleted_at=datetime('now','localtime') WHERE id IN ($placeholders)");
                         removePublicSharedItemsByOwner($authDb, intval($currentUser['id']), $ids);
+                    }
+                    $operationDetails = '删除数量: ' . $deletedCount;
+                    if (count($sampleNames) > 0) {
+                        $operationDetails .= '；示例物品: ' . implode('、', $sampleNames);
                     }
                     $result = ['success' => true, 'message' => '已移入回收站'];
                 }
@@ -2319,6 +2991,8 @@ if (isset($_GET['api'])) {
                 if ($method === 'POST') {
                     $images = $db->query("SELECT image FROM items WHERE image != ''")->fetchAll(PDO::FETCH_COLUMN);
                     $images = array_unique(array_filter($images));
+                    $itemKindsBefore = intval($db->query("SELECT COUNT(*) FROM items")->fetchColumn() ?: 0);
+                    $itemQtyBefore = intval($db->query("SELECT COALESCE(SUM(quantity),0) FROM items")->fetchColumn() ?: 0);
                     $moved = 0;
                     foreach ($images as $img) {
                         $src = UPLOAD_DIR . $img;
@@ -2337,6 +3011,7 @@ if (isset($_GET['api'])) {
                     try {
                         $db->exec("DELETE FROM sqlite_sequence WHERE name='items'");
                     } catch (Exception $e) { /* 某些 SQLite 版本可能无该表 */ }
+                    $operationDetails = '重置前物品种类: ' . $itemKindsBefore . '；重置前总件数: ' . $itemQtyBefore . '；迁移图片: ' . $moved;
                     $result = ['success' => true, 'message' => '所有物品已删除，图片已移入 trash 目录', 'deleted' => intval($deleted ?: 0), 'moved_images' => $moved];
                 }
                 break;
@@ -2427,6 +3102,10 @@ if (isset($_GET['api'])) {
                         $msg = '批量导入完成：成功 ' . $created . ' 条';
                         if ($skipped > 0)
                             $msg .= '，跳过 ' . $skipped . ' 条';
+                        $operationDetails = '提交行数: ' . count($rows) . '；成功: ' . $created . '；跳过: ' . $skipped;
+                        if (count($errors) > 0) {
+                            $operationDetails .= '；错误示例: ' . trim((string) ($errors[0] ?? ''));
+                        }
                         $result = ['success' => true, 'message' => $msg, 'created' => $created, 'skipped' => $skipped, 'errors' => $errors];
                     } catch (Exception $e) {
                         if ($db->inTransaction())
@@ -2438,6 +3117,10 @@ if (isset($_GET['api'])) {
 
             case 'system/reset-default':
                 if ($method === 'POST') {
+                    $itemKindsBefore = intval($db->query("SELECT COUNT(*) FROM items")->fetchColumn() ?: 0);
+                    $shoppingBefore = intval($db->query("SELECT COUNT(*) FROM shopping_list")->fetchColumn() ?: 0);
+                    $categoryBefore = intval($db->query("SELECT COUNT(*) FROM categories")->fetchColumn() ?: 0);
+                    $locationBefore = intval($db->query("SELECT COUNT(*) FROM locations")->fetchColumn() ?: 0);
                     $moved = moveUploadFilesToTrash($db);
 
                     $db->beginTransaction();
@@ -2446,9 +3129,10 @@ if (isset($_GET['api'])) {
                         $db->exec("DELETE FROM categories");
                         $db->exec("DELETE FROM locations");
                         $db->exec("DELETE FROM shopping_list");
+                        $db->exec("DELETE FROM operation_logs");
                         removePublicSharedItemsByOwner($authDb, intval($currentUser['id']));
                         try {
-                            $db->exec("DELETE FROM sqlite_sequence WHERE name IN ('items','categories','locations','shopping_list')");
+                            $db->exec("DELETE FROM sqlite_sequence WHERE name IN ('items','categories','locations','shopping_list','operation_logs')");
                         } catch (Exception $e) { /* 某些 SQLite 版本可能无该表 */ }
                         $db->commit();
                     } catch (Exception $e) {
@@ -2459,6 +3143,7 @@ if (isset($_GET['api'])) {
 
                     // 重新注入默认分类和默认位置
                     initSchema($db);
+                    $operationDetails = '重置前: 物品' . $itemKindsBefore . '种、购物清单' . $shoppingBefore . '条、分类' . $categoryBefore . '个、位置' . $locationBefore . '个；迁移图片: ' . $moved;
                     $result = ['success' => true, 'message' => '已恢复默认环境，上传目录文件已移入 trash 目录', 'moved_images' => $moved];
                 }
                 break;
@@ -2466,7 +3151,164 @@ if (isset($_GET['api'])) {
             case 'system/load-demo':
                 if ($method === 'POST') {
                     $demoLoad = loadDemoDataIntoDb($db, ['move_images' => true, 'auth_db' => $authDb, 'owner_user_id' => intval($currentUser['id'])]);
+                    $operationDetails = '物品: ' . intval($demoLoad['created'] ?? 0)
+                        . '；购物清单: ' . intval($demoLoad['shopping_created'] ?? 0)
+                        . '；任务: ' . intval($demoLoad['task_seeded'] ?? 0)
+                        . '；共享物品: ' . intval($demoLoad['shared_created'] ?? 0)
+                        . '；评论: ' . intval($demoLoad['public_comment_created'] ?? 0)
+                        . '；日志样例: ' . intval($demoLoad['operation_log_seeded'] ?? 0)
+                        . '；回收站示例: ' . (!empty($demoLoad['trash_demo']) ? '有' : '无')
+                        . '；完成提醒示例: ' . (!empty($demoLoad['completed_reminder_demo']) ? '有' : '无');
                     $result = array_merge(['success' => true], $demoLoad);
+                }
+                break;
+
+            case 'platform-settings':
+                if (!isAdminUser($currentUser)) {
+                    http_response_code(403);
+                    $result = ['success' => false, 'message' => '仅管理员可操作', 'code' => 'ADMIN_REQUIRED'];
+                    break;
+                }
+                if ($method === 'GET') {
+                    $result = [
+                        'success' => true,
+                        'data' => [
+                            'allow_registration' => isPublicRegistrationEnabled($authDb)
+                        ]
+                    ];
+                } elseif ($method === 'POST') {
+                    $data = json_decode(file_get_contents('php://input'), true);
+                    $allowRegistration = intval($data['allow_registration'] ?? 0) === 1;
+                    $saved = setPlatformSetting($authDb, 'allow_public_registration', $allowRegistration ? '1' : '0');
+                    if (!$saved) {
+                        $result = ['success' => false, 'message' => '平台设置保存失败'];
+                        break;
+                    }
+                    $operationDetails = '开放注册: ' . ($allowRegistration ? '开启' : '关闭');
+                    $result = [
+                        'success' => true,
+                        'message' => '平台设置已保存',
+                        'data' => [
+                            'allow_registration' => $allowRegistration
+                        ]
+                    ];
+                }
+                break;
+
+            case 'operation-logs/client-event':
+                if ($method === 'POST') {
+                    $data = json_decode(file_get_contents('php://input'), true);
+                    $eventType = trim((string) ($data['event_type'] ?? ''));
+                    $details = trim((string) ($data['details'] ?? ''));
+                    $allowedEvents = [
+                        'settings.sort' => ['key' => 'settings_sort', 'label' => '更新排序设置'],
+                        'settings.item_size' => ['key' => 'settings_item_size', 'label' => '调整物品显示大小'],
+                        'settings.item_attrs' => ['key' => 'settings_item_attrs', 'label' => '更新物品属性显示设置'],
+                        'settings.statuses' => ['key' => 'settings_statuses', 'label' => '更新状态管理设置'],
+                        'settings.channels' => ['key' => 'settings_channels', 'label' => '更新购入渠道设置'],
+                    ];
+                    if (!isset($allowedEvents[$eventType])) {
+                        $result = ['success' => false, 'message' => '不支持的设置事件'];
+                        break;
+                    }
+                    $meta = $allowedEvents[$eventType];
+                    $apiName = 'client-event/' . $eventType;
+                    logUserOperation($db, $meta['key'], $meta['label'], $details, $apiName, 'POST');
+                    logAdminOperation($authDb, $currentUser, $meta['key'], $meta['label'], $details, $apiName, 'POST');
+                    $result = ['success' => true, 'message' => '已记录设置变更'];
+                }
+                break;
+
+            // ---------- 操作日志 ----------
+            case 'operation-logs':
+                if ($method === 'GET') {
+                    $keyword = trim((string) ($_GET['keyword'] ?? ''));
+                    if (isAdminUser($currentUser)) {
+                        $page = max(1, intval($_GET['page'] ?? 1));
+                        $limit = max(20, min(10000, intval($_GET['limit'] ?? 1000)));
+                        $offset = ($page - 1) * $limit;
+                        $actorUserId = intval($_GET['actor_user_id'] ?? 0);
+                        $sort = trim((string) ($_GET['sort'] ?? 'time_desc'));
+                        $where = [];
+                        $params = [];
+                        if ($keyword !== '') {
+                            $where[] = "(action_label LIKE ? OR action_key LIKE ? OR details LIKE ? OR actor_username LIKE ? OR actor_display_name LIKE ? OR api LIKE ?)";
+                            $kw = '%' . $keyword . '%';
+                            $params = [$kw, $kw, $kw, $kw, $kw, $kw];
+                        }
+                        if ($actorUserId > 0) {
+                            $where[] = "actor_user_id = ?";
+                            $params[] = $actorUserId;
+                        }
+                        $whereSql = count($where) > 0 ? ('WHERE ' . implode(' AND ', $where)) : '';
+                        $countStmt = $authDb->prepare("SELECT COUNT(*) FROM admin_operation_logs $whereSql");
+                        $countStmt->execute($params);
+                        $total = intval($countStmt->fetchColumn() ?: 0);
+                        $orderBy = 'id DESC';
+                        if ($sort === 'time_asc') {
+                            $orderBy = 'id ASC';
+                        } elseif ($sort === 'action_asc') {
+                            $orderBy = 'action_label ASC, id DESC';
+                        } elseif ($sort === 'action_desc') {
+                            $orderBy = 'action_label DESC, id DESC';
+                        } elseif ($sort === 'user_asc') {
+                            $orderBy = 'actor_display_name ASC, actor_username ASC, id DESC';
+                        } elseif ($sort === 'user_desc') {
+                            $orderBy = 'actor_display_name DESC, actor_username DESC, id DESC';
+                        }
+                        $queryParams = array_merge($params, [$limit, $offset]);
+                        $listStmt = $authDb->prepare("SELECT id, actor_user_id, actor_username, actor_display_name, actor_role, action_key, action_label, api, method, details, created_at FROM admin_operation_logs $whereSql ORDER BY $orderBy LIMIT ? OFFSET ?");
+                        $listStmt->execute($queryParams);
+                        $rows = $listStmt->fetchAll();
+                        $members = $authDb->query("SELECT id, username, display_name, role FROM users ORDER BY CASE role WHEN 'admin' THEN 0 ELSE 1 END, id ASC")->fetchAll();
+                        $result = [
+                            'success' => true,
+                            'scope' => 'admin',
+                            'data' => $rows,
+                            'members' => $members,
+                            'sort' => $sort,
+                            'total' => $total,
+                            'page' => $page,
+                            'pages' => max(1, intval(ceil($total / max(1, $limit))))
+                        ];
+                    } else {
+                        $where = [];
+                        $params = [];
+                        if ($keyword !== '') {
+                            $where[] = "(action_label LIKE ? OR details LIKE ?)";
+                            $kw = '%' . $keyword . '%';
+                            $params = [$kw, $kw];
+                        }
+                        $whereSql = count($where) > 0 ? ('WHERE ' . implode(' AND ', $where)) : '';
+                        $countStmt = $db->prepare("SELECT COUNT(*) FROM operation_logs $whereSql");
+                        $countStmt->execute($params);
+                        $totalAll = intval($countStmt->fetchColumn() ?: 0);
+                        $listStmt = $db->prepare("SELECT id, action_label, details, created_at FROM operation_logs $whereSql ORDER BY id DESC LIMIT 30");
+                        $listStmt->execute($params);
+                        $rows = $listStmt->fetchAll();
+                        $result = [
+                            'success' => true,
+                            'scope' => 'user',
+                            'data' => $rows,
+                            'total' => count($rows),
+                            'total_all' => $totalAll,
+                            'page' => 1,
+                            'pages' => 1,
+                            'limited_to_recent' => true
+                        ];
+                    }
+                }
+                break;
+
+            case 'operation-logs/clear':
+                if ($method === 'POST') {
+                    if (!isAdminUser($currentUser)) {
+                        http_response_code(403);
+                        $result = ['success' => false, 'message' => '仅管理员可清空汇总日志', 'code' => 'ADMIN_REQUIRED'];
+                        break;
+                    }
+                    $deleted = intval($authDb->exec("DELETE FROM admin_operation_logs") ?: 0);
+                    $result = ['success' => true, 'message' => '管理员汇总日志已清空（不影响成员个人日志）', 'deleted' => $deleted];
                 }
                 break;
 
@@ -2482,13 +3324,22 @@ if (isset($_GET['api'])) {
                 if ($method === 'POST') {
                     $data = json_decode(file_get_contents('php://input'), true);
                     $id = intval($data['id'] ?? 0);
-                    $img = $db->query("SELECT image FROM items WHERE id=$id")->fetchColumn();
+                    $infoStmt = $db->prepare("SELECT id, name, quantity, image FROM items WHERE id=? LIMIT 1");
+                    $infoStmt->execute([$id]);
+                    $itemInfo = $infoStmt->fetch();
+                    $img = trim((string) ($itemInfo['image'] ?? ''));
                     if ($img && file_exists(TRASH_DIR . $img))
                         @rename(TRASH_DIR . $img, UPLOAD_DIR . $img);
                     $db->exec("UPDATE items SET deleted_at=NULL, updated_at=datetime('now','localtime') WHERE id=$id");
                     $shareRow = getItemShareSnapshot($db, $id);
                     if ($shareRow) {
                         syncPublicSharedItem($authDb, $db, intval($currentUser['id']), $id, intval($shareRow['is_public_shared'] ?? 0));
+                    }
+                    $itemName = trim((string) ($itemInfo['name'] ?? ''));
+                    $itemQty = intval($itemInfo['quantity'] ?? 0);
+                    $operationDetails = '恢复物品: ' . ($itemName !== '' ? $itemName : ('#' . $id)) . '（ID:' . $id . '）';
+                    if ($itemQty > 0) {
+                        $operationDetails .= '；件数: ' . $itemQty;
                     }
                     $result = ['success' => true, 'message' => '已恢复'];
                 }
@@ -2498,8 +3349,15 @@ if (isset($_GET['api'])) {
                 if ($method === 'POST') {
                     $data = json_decode(file_get_contents('php://input'), true);
                     $ids = array_map('intval', $data['ids'] ?? []);
+                    $restoredCount = 0;
+                    $sampleNames = [];
                     if ($ids) {
                         $placeholders = implode(',', $ids);
+                        $nameRows = $db->query("SELECT name FROM items WHERE id IN ($placeholders) ORDER BY id ASC")->fetchAll(PDO::FETCH_COLUMN);
+                        $restoredCount = count($nameRows);
+                        $sampleNames = array_slice(array_values(array_filter(array_map(function ($v) {
+                            return trim((string) $v);
+                        }, $nameRows))), 0, 3);
                         $images = $db->query("SELECT image FROM items WHERE id IN ($placeholders) AND image != ''")->fetchAll(PDO::FETCH_COLUMN);
                         foreach ($images as $img) {
                             if (file_exists(TRASH_DIR . $img))
@@ -2513,6 +3371,10 @@ if (isset($_GET['api'])) {
                             }
                         }
                     }
+                    $operationDetails = '恢复数量: ' . $restoredCount;
+                    if (count($sampleNames) > 0) {
+                        $operationDetails .= '；示例物品: ' . implode('、', $sampleNames);
+                    }
                     $result = ['success' => true, 'message' => '已全部恢复'];
                 }
                 break;
@@ -2521,22 +3383,29 @@ if (isset($_GET['api'])) {
                 if ($method === 'POST') {
                     $data = json_decode(file_get_contents('php://input'), true);
                     $id = intval($data['id'] ?? 0);
-                    $img = $db->query("SELECT image FROM items WHERE id=$id")->fetchColumn();
+                    $infoStmt = $db->prepare("SELECT id, name, quantity, image FROM items WHERE id=? LIMIT 1");
+                    $infoStmt->execute([$id]);
+                    $itemInfo = $infoStmt->fetch();
+                    $img = trim((string) ($itemInfo['image'] ?? ''));
                     if ($img && file_exists(TRASH_DIR . $img))
                         unlink(TRASH_DIR . $img);
                     $db->exec("DELETE FROM items WHERE id=$id");
+                    $itemName = trim((string) ($itemInfo['name'] ?? ''));
+                    $operationDetails = '彻底删除: ' . ($itemName !== '' ? $itemName : ('#' . $id)) . '（ID:' . $id . '）';
                     $result = ['success' => true, 'message' => '已彻底删除'];
                 }
                 break;
 
             case 'trash/empty':
                 if ($method === 'POST') {
+                    $trashCount = intval($db->query("SELECT COUNT(*) FROM items WHERE deleted_at IS NOT NULL")->fetchColumn() ?: 0);
                     $images = $db->query("SELECT image FROM items WHERE deleted_at IS NOT NULL AND image != ''")->fetchAll(PDO::FETCH_COLUMN);
                     foreach ($images as $img) {
                         if (file_exists(TRASH_DIR . $img))
                             unlink(TRASH_DIR . $img);
                     }
                     $db->exec("DELETE FROM items WHERE deleted_at IS NOT NULL");
+                    $operationDetails = '清空回收站数量: ' . $trashCount;
                     $result = ['success' => true, 'message' => '回收站已清空'];
                 }
                 break;
@@ -2585,7 +3454,15 @@ if (isset($_GET['api'])) {
                     }
                     $stmt = $db->prepare("INSERT INTO categories (name, parent_id, icon, color) VALUES (?,?,?,?)");
                     $stmt->execute([$name, $parentId, ($icon !== '' ? $icon : '📦'), ($color !== '' ? $color : '#3b82f6')]);
-                    $result = ['success' => true, 'message' => '分类添加成功', 'id' => $db->lastInsertId()];
+                    $newCategoryId = intval($db->lastInsertId());
+                    $parentName = '一级分类';
+                    if ($parentId > 0) {
+                        $parentName = trim((string) ($db->query("SELECT name FROM categories WHERE id=" . $parentId . " LIMIT 1")->fetchColumn() ?: ('#' . $parentId)));
+                    }
+                    $operationDetails = '分类: ' . $name . '（ID:' . $newCategoryId . '）'
+                        . '；层级: ' . ($parentId > 0 ? ('二级（上级:' . $parentName . '）') : '一级')
+                        . '；图标: ' . ($icon !== '' ? $icon : '📦');
+                    $result = ['success' => true, 'message' => '分类添加成功', 'id' => $newCategoryId];
                 }
                 break;
 
@@ -2609,7 +3486,7 @@ if (isset($_GET['api'])) {
                         $result = ['success' => false, 'message' => '分类不能设置自己为上级'];
                         break;
                     }
-                    $currentStmt = $db->prepare("SELECT id, parent_id FROM categories WHERE id=? LIMIT 1");
+                    $currentStmt = $db->prepare("SELECT id, parent_id, name FROM categories WHERE id=? LIMIT 1");
                     $currentStmt->execute([$id]);
                     $currentCat = $currentStmt->fetch();
                     if (!$currentCat) {
@@ -2643,6 +3520,21 @@ if (isset($_GET['api'])) {
                     }
                     $stmt = $db->prepare("UPDATE categories SET name=?, parent_id=?, icon=?, color=? WHERE id=?");
                     $stmt->execute([$name, $parentId, ($icon !== '' ? $icon : '📦'), ($color !== '' ? $color : '#3b82f6'), $id]);
+                    $oldName = trim((string) ($currentCat['name'] ?? ''));
+                    $oldParentId = intval($currentCat['parent_id'] ?? 0);
+                    $oldParentName = '';
+                    $newParentName = '';
+                    if ($oldParentId > 0) {
+                        $oldParentName = trim((string) ($db->query("SELECT name FROM categories WHERE id=" . $oldParentId . " LIMIT 1")->fetchColumn() ?: ('#' . $oldParentId)));
+                    }
+                    if ($parentId > 0) {
+                        $newParentName = trim((string) ($db->query("SELECT name FROM categories WHERE id=" . $parentId . " LIMIT 1")->fetchColumn() ?: ('#' . $parentId)));
+                    }
+                    $operationDetails = '分类ID: ' . $id
+                        . '；名称: ' . ($oldName !== '' ? $oldName : ('#' . $id)) . ' -> ' . $name
+                        . '；层级: ' . ($oldParentId > 0 ? ('二级(' . $oldParentName . ')') : '一级')
+                        . ' -> ' . ($parentId > 0 ? ('二级(' . $newParentName . ')') : '一级')
+                        . '；图标: ' . ($icon !== '' ? $icon : '📦');
                     $result = ['success' => true, 'message' => '分类更新成功'];
                 }
                 break;
@@ -2655,7 +3547,7 @@ if (isset($_GET['api'])) {
                         $result = ['success' => false, 'message' => '缺少分类ID'];
                         break;
                     }
-                    $currentStmt = $db->prepare("SELECT id, parent_id FROM categories WHERE id=? LIMIT 1");
+                    $currentStmt = $db->prepare("SELECT id, parent_id, name FROM categories WHERE id=? LIMIT 1");
                     $currentStmt->execute([$id]);
                     $currentCat = $currentStmt->fetch();
                     if (!$currentCat) {
@@ -2687,6 +3579,10 @@ if (isset($_GET['api'])) {
                         $deleteStmt = $db->prepare("DELETE FROM categories WHERE id IN ($placeholders)");
                         $deleteStmt->execute($allIds);
                     }
+                    $mainName = trim((string) ($currentCat['name'] ?? ('#' . $id)));
+                    $operationDetails = '删除分类: ' . $mainName . '（ID:' . $id . '）'
+                        . '；删除节点数: ' . count($allIds)
+                        . '；受影响物品分类已置空';
                     $result = ['success' => true, 'message' => '分类删除成功'];
                 }
                 break;
@@ -2702,17 +3598,35 @@ if (isset($_GET['api'])) {
                         $result = ['success' => false, 'message' => '位置名称不能为空'];
                         break;
                     }
-                    $stmt = $db->prepare("INSERT INTO locations (name, parent_id, description) VALUES (?,?,?)");
-                    $stmt->execute([$data['name'], 0, $data['description'] ?? '']);
-                    $result = ['success' => true, 'message' => '位置添加成功', 'id' => $db->lastInsertId()];
+                    $icon = trim(strval($data['icon'] ?? ''));
+                    if ($icon === '') {
+                        $icon = '📍';
+                    }
+                    $stmt = $db->prepare("INSERT INTO locations (name, parent_id, icon, description) VALUES (?,?,?,?)");
+                    $stmt->execute([$data['name'], 0, $icon, $data['description'] ?? '']);
+                    $newLocationId = intval($db->lastInsertId());
+                    $locName = trim((string) ($data['name'] ?? ''));
+                    $operationDetails = '位置: ' . $locName . '（ID:' . $newLocationId . '）' . '；图标: ' . $icon;
+                    $result = ['success' => true, 'message' => '位置添加成功', 'id' => $newLocationId];
                 }
                 break;
 
             case 'locations/update':
                 if ($method === 'POST') {
                     $data = json_decode(file_get_contents('php://input'), true);
-                    $stmt = $db->prepare("UPDATE locations SET name=?, parent_id=?, description=? WHERE id=?");
-                    $stmt->execute([$data['name'], 0, $data['description'] ?? '', intval($data['id'])]);
+                    $id = intval($data['id'] ?? 0);
+                    $oldStmt = $db->prepare("SELECT id, name FROM locations WHERE id=? LIMIT 1");
+                    $oldStmt->execute([$id]);
+                    $oldLoc = $oldStmt->fetch();
+                    $icon = trim(strval($data['icon'] ?? ''));
+                    if ($icon === '') {
+                        $icon = '📍';
+                    }
+                    $stmt = $db->prepare("UPDATE locations SET name=?, parent_id=?, icon=?, description=? WHERE id=?");
+                    $stmt->execute([$data['name'], 0, $icon, $data['description'] ?? '', $id]);
+                    $oldName = trim((string) ($oldLoc['name'] ?? ('#' . $id)));
+                    $newName = trim((string) ($data['name'] ?? ''));
+                    $operationDetails = '位置ID: ' . $id . '；名称: ' . $oldName . ' -> ' . $newName . '；图标: ' . $icon;
                     $result = ['success' => true, 'message' => '位置更新成功'];
                 }
                 break;
@@ -2721,8 +3635,11 @@ if (isset($_GET['api'])) {
                 if ($method === 'POST') {
                     $data = json_decode(file_get_contents('php://input'), true);
                     $id = intval($data['id'] ?? 0);
-                    $db->exec("UPDATE items SET location_id=0 WHERE location_id=$id");
+                    $locName = trim((string) ($db->query("SELECT name FROM locations WHERE id=" . $id . " LIMIT 1")->fetchColumn() ?: ''));
+                    $affected = intval($db->exec("UPDATE items SET location_id=0 WHERE location_id=$id"));
                     $db->exec("DELETE FROM locations WHERE id=$id");
+                    $operationDetails = '删除位置: ' . ($locName !== '' ? $locName : ('#' . $id)) . '（ID:' . $id . '）'
+                        . '；受影响物品: ' . $affected . ' 件（位置已置空）';
                     $result = ['success' => true, 'message' => '位置删除成功'];
                 }
                 break;
@@ -2839,7 +3756,17 @@ if (isset($_GET['api'])) {
                     $stmt = $db->prepare("INSERT INTO shopping_list (name, quantity, status, category_id, priority, planned_price, notes, reminder_date, reminder_note, created_at, updated_at)
                         VALUES (?,?,?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
                     $stmt->execute([$name, $qty, $shoppingStatus, $categoryId, $priority, $plannedPrice, $notes, $reminderDate, $reminderNote]);
-                    $result = ['success' => true, 'message' => '已加入购物清单', 'id' => $db->lastInsertId()];
+                    $newShoppingId = intval($db->lastInsertId());
+                    $catName = '';
+                    if ($categoryId > 0) {
+                        $catName = trim((string) ($db->query("SELECT name FROM categories WHERE id=" . $categoryId . " LIMIT 1")->fetchColumn() ?: ''));
+                    }
+                    $operationDetails = '清单: ' . $name . '（ID:' . $newShoppingId . '）'
+                        . '；数量: ' . $qty
+                        . '；状态: ' . $shoppingStatus
+                        . '；优先级: ' . $priority
+                        . ($catName !== '' ? ('；分类: ' . $catName) : '');
+                    $result = ['success' => true, 'message' => '已加入购物清单', 'id' => $newShoppingId];
                 }
                 break;
 
@@ -2864,8 +3791,20 @@ if (isset($_GET['api'])) {
                     $notes = trim((string) ($data['notes'] ?? ''));
                     $reminderDate = normalizeReminderDateValue($data['reminder_date'] ?? '');
                     $reminderNote = trim((string) ($data['reminder_note'] ?? ''));
+                    $oldStmt = $db->prepare("SELECT name, status, quantity FROM shopping_list WHERE id=? LIMIT 1");
+                    $oldStmt->execute([$id]);
+                    $oldRow = $oldStmt->fetch();
                     $stmt = $db->prepare("UPDATE shopping_list SET name=?, quantity=?, status=?, category_id=?, priority=?, planned_price=?, notes=?, reminder_date=?, reminder_note=?, updated_at=datetime('now','localtime') WHERE id=?");
                     $stmt->execute([$name, $qty, $shoppingStatus, $categoryId, $priority, $plannedPrice, $notes, $reminderDate, $reminderNote, $id]);
+                    $catName = '';
+                    if ($categoryId > 0) {
+                        $catName = trim((string) ($db->query("SELECT name FROM categories WHERE id=" . $categoryId . " LIMIT 1")->fetchColumn() ?: ''));
+                    }
+                    $operationDetails = '清单ID: ' . $id
+                        . '；名称: ' . trim((string) ($oldRow['name'] ?? ('#' . $id))) . ' -> ' . $name
+                        . '；状态: ' . trim((string) ($oldRow['status'] ?? '')) . ' -> ' . $shoppingStatus
+                        . '；数量: ' . intval($oldRow['quantity'] ?? 0) . ' -> ' . $qty
+                        . ($catName !== '' ? ('；分类: ' . $catName) : '');
                     $result = ['success' => true, 'message' => '购物清单已更新'];
                 }
                 break;
@@ -2879,8 +3818,13 @@ if (isset($_GET['api'])) {
                         break;
                     }
                     $shoppingStatus = normalizeShoppingStatus($data['status'] ?? 'pending_purchase');
+                    $oldStmt = $db->prepare("SELECT name, status FROM shopping_list WHERE id=? LIMIT 1");
+                    $oldStmt->execute([$id]);
+                    $oldRow = $oldStmt->fetch();
                     $stmt = $db->prepare("UPDATE shopping_list SET status=?, updated_at=datetime('now','localtime') WHERE id=?");
                     $stmt->execute([$shoppingStatus, $id]);
+                    $operationDetails = '清单: ' . trim((string) ($oldRow['name'] ?? ('#' . $id))) . '（ID:' . $id . '）'
+                        . '；状态: ' . trim((string) ($oldRow['status'] ?? '')) . ' -> ' . $shoppingStatus;
                     $result = ['success' => true, 'message' => '清单状态已更新', 'status' => $shoppingStatus];
                 }
                 break;
@@ -2893,7 +3837,13 @@ if (isset($_GET['api'])) {
                         $result = ['success' => false, 'message' => '缺少清单ID'];
                         break;
                     }
+                    $oldStmt = $db->prepare("SELECT name, quantity, status FROM shopping_list WHERE id=? LIMIT 1");
+                    $oldStmt->execute([$id]);
+                    $oldRow = $oldStmt->fetch();
                     $db->exec("DELETE FROM shopping_list WHERE id=$id");
+                    $operationDetails = '删除清单: ' . trim((string) ($oldRow['name'] ?? ('#' . $id))) . '（ID:' . $id . '）'
+                        . '；数量: ' . intval($oldRow['quantity'] ?? 0)
+                        . '；状态: ' . trim((string) ($oldRow['status'] ?? ''));
                     $result = ['success' => true, 'message' => '已从购物清单删除'];
                 }
                 break;
@@ -2953,12 +3903,172 @@ if (isset($_GET['api'])) {
                         $del = $db->prepare("DELETE FROM shopping_list WHERE id=?");
                         $del->execute([$id]);
                         $db->commit();
+                        $operationDetails = '清单入库: ' . trim((string) ($row['name'] ?? ('#' . $id))) . '（清单ID:' . $id . '）'
+                            . '；入库物品ID: ' . $newItemId
+                            . '；件数: ' . $qty;
                         $result = ['success' => true, 'message' => '已移入物品管理', 'item_id' => $newItemId];
                     } catch (Exception $e) {
                         if ($db->inTransaction())
                             $db->rollBack();
                         throw $e;
                     }
+                }
+                break;
+
+            // ---------- 公共频道 ----------
+            case 'message-board':
+                if ($method === 'GET') {
+                    $limit = max(1, min(100, intval($_GET['limit'] ?? 40)));
+                    $stmt = $authDb->prepare("SELECT
+                            m.id,
+                            m.user_id,
+                            m.content,
+                            COALESCE(m.is_completed,0) as is_completed,
+                            m.completed_at,
+                            m.created_at,
+                            m.updated_at,
+                            u.username,
+                            u.display_name
+                        FROM message_board_posts m
+                        LEFT JOIN users u ON u.id=m.user_id
+                        WHERE m.is_demo_scope=?
+                        ORDER BY m.created_at DESC, m.id DESC
+                        LIMIT ?");
+                    $stmt->bindValue(1, $currentUserIsDemoScope ? 1 : 0, PDO::PARAM_INT);
+                    $stmt->bindValue(2, $limit, PDO::PARAM_INT);
+                    $stmt->execute();
+                    $rows = $stmt->fetchAll();
+                    $list = [];
+                    foreach ($rows as $row) {
+                        $author = trim((string) ($row['display_name'] ?? ''));
+                        if ($author === '') {
+                            $author = trim((string) ($row['username'] ?? ''));
+                        }
+                        if ($author === '') {
+                            $author = '用户#' . intval($row['user_id'] ?? 0);
+                        }
+                        $list[] = [
+                            'id' => intval($row['id'] ?? 0),
+                            'user_id' => intval($row['user_id'] ?? 0),
+                            'author_name' => $author,
+                            'content' => trim((string) ($row['content'] ?? '')),
+                            'is_completed' => intval($row['is_completed'] ?? 0) === 1 ? 1 : 0,
+                            'completed_at' => trim((string) ($row['completed_at'] ?? '')),
+                            'created_at' => trim((string) ($row['created_at'] ?? '')),
+                            'updated_at' => trim((string) ($row['updated_at'] ?? '')),
+                            'can_edit' => (
+                                intval($row['user_id'] ?? 0) === intval($currentUser['id'])
+                                || isAdminUser($currentUser)
+                            ),
+                            'can_delete' => (
+                                intval($row['user_id'] ?? 0) === intval($currentUser['id'])
+                                || isAdminUser($currentUser)
+                            )
+                        ];
+                    }
+                    $result = ['success' => true, 'data' => $list];
+                } elseif ($method === 'POST') {
+                    $data = json_decode(file_get_contents('php://input'), true);
+                    $content = trim((string) ($data['content'] ?? ''));
+                    if ($content === '') {
+                        $result = ['success' => false, 'message' => '任务内容不能为空'];
+                        break;
+                    }
+                    if (function_exists('mb_substr')) {
+                        $content = mb_substr($content, 0, 300, 'UTF-8');
+                    } else {
+                        $content = substr($content, 0, 300);
+                    }
+                    $insertStmt = $authDb->prepare("INSERT INTO message_board_posts
+                        (user_id, content, is_demo_scope, is_completed, completed_at, created_at, updated_at)
+                        VALUES (?,?,?,0,NULL,datetime('now','localtime'),datetime('now','localtime'))");
+                    $insertStmt->execute([intval($currentUser['id']), $content, $currentUserIsDemoScope ? 1 : 0]);
+                    $operationDetails = '任务内容: ' . $content;
+                    $result = ['success' => true, 'message' => '任务已添加'];
+                }
+                break;
+
+            case 'message-board/update':
+                if ($method === 'POST') {
+                    $data = json_decode(file_get_contents('php://input'), true);
+                    $taskId = intval($data['id'] ?? 0);
+                    if ($taskId <= 0) {
+                        $result = ['success' => false, 'message' => '缺少任务ID'];
+                        break;
+                    }
+                    $stmt = $authDb->prepare("SELECT id, user_id, content, is_demo_scope, COALESCE(is_completed,0) AS is_completed FROM message_board_posts WHERE id=? LIMIT 1");
+                    $stmt->execute([$taskId]);
+                    $task = $stmt->fetch();
+                    if (!$task || intval($task['is_demo_scope'] ?? 0) !== ($currentUserIsDemoScope ? 1 : 0)) {
+                        $result = ['success' => false, 'message' => '任务不存在或已失效'];
+                        break;
+                    }
+                    $canEdit = intval($task['user_id'] ?? 0) === intval($currentUser['id']) || isAdminUser($currentUser);
+                    if (!$canEdit) {
+                        $result = ['success' => false, 'message' => '仅创建者或管理员可编辑任务'];
+                        break;
+                    }
+                    $oldContent = trim((string) ($task['content'] ?? ''));
+                    $oldCompleted = intval($task['is_completed'] ?? 0) === 1 ? 1 : 0;
+                    $newContent = $oldContent;
+                    if (array_key_exists('content', (array) $data)) {
+                        $incomingContent = trim((string) ($data['content'] ?? ''));
+                        if ($incomingContent === '') {
+                            $result = ['success' => false, 'message' => '任务内容不能为空'];
+                            break;
+                        }
+                        if (function_exists('mb_substr')) {
+                            $incomingContent = mb_substr($incomingContent, 0, 300, 'UTF-8');
+                        } else {
+                            $incomingContent = substr($incomingContent, 0, 300);
+                        }
+                        $newContent = $incomingContent;
+                    }
+                    $newCompleted = $oldCompleted;
+                    if (array_key_exists('is_completed', (array) $data)) {
+                        $newCompleted = intval($data['is_completed'] ?? 0) === 1 ? 1 : 0;
+                    }
+                    $updateStmt = $authDb->prepare("UPDATE message_board_posts
+                        SET content=?,
+                            is_completed=?,
+                            completed_at=(CASE WHEN ?=1 THEN datetime('now','localtime') ELSE NULL END),
+                            updated_at=datetime('now','localtime')
+                        WHERE id=?");
+                    $updateStmt->execute([$newContent, $newCompleted, $newCompleted, $taskId]);
+
+                    $statusLabel = $newCompleted === 1 ? '已完成' : '未完成';
+                    $operationDetails = '任务ID: ' . $taskId . '；状态: ' . $statusLabel . '；内容: ' . $newContent;
+                    $resultMessage = ($oldCompleted !== $newCompleted)
+                        ? ($newCompleted === 1 ? '任务已标记为完成' : '任务已标记为未完成')
+                        : '任务已更新';
+                    $result = ['success' => true, 'message' => $resultMessage];
+                }
+                break;
+
+            case 'message-board/delete':
+                if ($method === 'POST') {
+                    $data = json_decode(file_get_contents('php://input'), true);
+                    $taskId = intval($data['id'] ?? 0);
+                    if ($taskId <= 0) {
+                        $result = ['success' => false, 'message' => '缺少任务ID'];
+                        break;
+                    }
+                    $stmt = $authDb->prepare("SELECT id, user_id, content, is_demo_scope FROM message_board_posts WHERE id=? LIMIT 1");
+                    $stmt->execute([$taskId]);
+                    $task = $stmt->fetch();
+                    if (!$task || intval($task['is_demo_scope'] ?? 0) !== ($currentUserIsDemoScope ? 1 : 0)) {
+                        $result = ['success' => false, 'message' => '任务不存在或已失效'];
+                        break;
+                    }
+                    $canDelete = intval($task['user_id'] ?? 0) === intval($currentUser['id']) || isAdminUser($currentUser);
+                    if (!$canDelete) {
+                        $result = ['success' => false, 'message' => '仅创建者或管理员可删除任务'];
+                        break;
+                    }
+                    $delStmt = $authDb->prepare("DELETE FROM message_board_posts WHERE id=?");
+                    $delStmt->execute([$taskId]);
+                    $operationDetails = '任务ID: ' . $taskId . '；内容: ' . trim((string) ($task['content'] ?? ''));
+                    $result = ['success' => true, 'message' => '任务已删除'];
                 }
                 break;
 
@@ -3190,6 +4300,15 @@ if (isset($_GET['api'])) {
                         WHERE id=? AND deleted_at IS NULL");
                     $updateStmt->execute([$itemName, $categoryId, $purchasePrice, $purchaseFrom, $recommendReason, $ownerItemId]);
                     syncPublicSharedItem($authDb, $db, intval($currentUser['id']), $ownerItemId, 1);
+                    $catName = '';
+                    if ($categoryId > 0) {
+                        $catName = trim((string) ($db->query("SELECT name FROM categories WHERE id=" . $categoryId . " LIMIT 1")->fetchColumn() ?: ''));
+                    }
+                    $operationDetails = '共享ID: ' . $sharedId
+                        . '；物品: ' . $itemName . '（来源物品ID:' . $ownerItemId . '）'
+                        . ($catName !== '' ? ('；分类: ' . $catName) : '')
+                        . ($purchaseFrom !== '' ? ('；购入渠道: ' . $purchaseFrom) : '')
+                        . '；价格: ' . $purchasePrice;
                     $result = ['success' => true, 'message' => '共享物品已更新'];
                 }
                 break;
@@ -3252,6 +4371,7 @@ if (isset($_GET['api'])) {
                     $insertStmt = $authDb->prepare("INSERT INTO public_shared_comments (shared_id, user_id, content, created_at, updated_at)
                         VALUES (?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
                     $insertStmt->execute([$sharedId, intval($currentUser['id']), $content]);
+                    $operationDetails = '共享ID: ' . $sharedId . '；评论内容: ' . $content;
                     $result = ['success' => true, 'message' => '评论已发布'];
                 }
                 break;
@@ -3292,6 +4412,7 @@ if (isset($_GET['api'])) {
                     }
                     $delStmt = $authDb->prepare("DELETE FROM public_shared_comments WHERE id=?");
                     $delStmt->execute([$commentId]);
+                    $operationDetails = '评论ID: ' . $commentId . '；共享ID: ' . intval($comment['shared_id'] ?? 0);
                     $result = ['success' => true, 'message' => '评论已删除'];
                 }
                 break;
@@ -3380,6 +4501,7 @@ if (isset($_GET['api'])) {
                         $existId = intval($legacyDupStmt->fetchColumn() ?: 0);
                     }
                     if ($existId > 0) {
+                        $operationDetails = '共享ID: ' . $sharedId . '；物品: ' . $itemName . '；已存在购物清单ID: ' . $existId;
                         $result = ['success' => true, 'message' => '该共享物品已在你的购物清单中', 'id' => $existId];
                         break;
                     }
@@ -3410,7 +4532,12 @@ if (isset($_GET['api'])) {
                         '',
                         ''
                     ]);
-                    $result = ['success' => true, 'message' => '已加入你的购物清单', 'id' => intval($db->lastInsertId())];
+                    $newShoppingId = intval($db->lastInsertId());
+                    $operationDetails = '共享ID: ' . $sharedId
+                        . '；物品: ' . $itemName
+                        . '；发布者: ' . $ownerName
+                        . '；已加入购物清单ID: ' . $newShoppingId;
+                    $result = ['success' => true, 'message' => '已加入你的购物清单', 'id' => $newShoppingId];
                 }
                 break;
 
@@ -3457,6 +4584,7 @@ if (isset($_GET['api'])) {
                     if (!is_uploaded_file($file['tmp_name'])) {
                         $result = ['success' => false, 'message' => '上传失败：无效上传文件'];
                     } elseif (move_uploaded_file($file['tmp_name'], UPLOAD_DIR . $filename)) {
+                        $operationDetails = '图片: ' . $filename . '；原文件: ' . trim((string) ($file['name'] ?? '')) . '；大小: ' . intval($file['size'] ?? 0) . ' 字节';
                         $result = ['success' => true, 'filename' => $filename];
                     } else {
                         $result = ['success' => false, 'message' => '上传失败'];
@@ -3503,6 +4631,11 @@ if (isset($_GET['api'])) {
                     if ($uploaded === 0) {
                         $result = ['success' => false, 'message' => '没有成功上传任何图片', 'errors' => $errors];
                     } else {
+                        $sampleNames = array_slice(array_keys($map), 0, 3);
+                        $operationDetails = '上传数量: ' . $uploaded;
+                        if (count($sampleNames) > 0) {
+                            $operationDetails .= '；示例文件: ' . implode('、', $sampleNames);
+                        }
                         $result = ['success' => true, 'message' => "成功上传 $uploaded 张图片", 'uploaded' => $uploaded, 'map' => $map, 'errors' => $errors];
                     }
                 }
@@ -3514,7 +4647,7 @@ if (isset($_GET['api'])) {
                 $categories = $db->query("SELECT * FROM categories ORDER BY id")->fetchAll();
                 $locations = $db->query("SELECT * FROM locations ORDER BY id")->fetchAll();
                 $shoppingList = $db->query("SELECT s.*, c.name as category_name FROM shopping_list s LEFT JOIN categories c ON s.category_id=c.id ORDER BY s.id")->fetchAll();
-                $result = ['success' => true, 'data' => ['items' => $items, 'categories' => $categories, 'locations' => $locations, 'shopping_list' => $shoppingList, 'exported_at' => date('Y-m-d H:i:s'), 'version' => '1.5.0']];
+                $result = ['success' => true, 'data' => ['items' => $items, 'categories' => $categories, 'locations' => $locations, 'shopping_list' => $shoppingList, 'exported_at' => date('Y-m-d H:i:s'), 'version' => '1.5.2']];
                 break;
 
             // ---------- 数据导入 ----------
@@ -3677,6 +4810,7 @@ if (isset($_GET['api'])) {
                             }
                         }
                         $db->commit();
+                        $operationDetails = '导入物品: ' . $imported . '；导入购物清单: ' . $importedShopping;
                         $result = ['success' => true, 'message' => "成功导入 $imported 件物品" . ($importedShopping > 0 ? "，购物清单 $importedShopping 条" : '')];
                     } catch (Exception $e) {
                         $db->rollBack();
@@ -3684,6 +4818,50 @@ if (isset($_GET['api'])) {
                     }
                 }
                 break;
+        }
+
+        $operationLogMap = [
+            'items' => '新增物品',
+            'items/update' => '编辑物品',
+            'items/complete-reminder' => '完成提醒',
+            'items/undo-reminder' => '撤销提醒',
+            'items/delete' => '删除物品到回收站',
+            'items/batch-delete' => '批量删除物品到回收站',
+            'items/reset-all' => '重置物品数据',
+            'items/batch-import-manual' => '批量导入物品',
+            'system/reset-default' => '恢复默认环境',
+            'system/load-demo' => '加载展示数据',
+            'platform-settings' => '更新平台设置',
+            'trash/restore' => '恢复回收站物品',
+            'trash/batch-restore' => '批量恢复回收站物品',
+            'trash/permanent-delete' => '彻底删除回收站物品',
+            'trash/empty' => '清空回收站',
+            'categories' => '新增分类',
+            'categories/update' => '编辑分类',
+            'categories/delete' => '删除分类',
+            'locations' => '新增位置',
+            'locations/update' => '编辑位置',
+            'locations/delete' => '删除位置',
+            'shopping-list' => '新增购物清单',
+            'shopping-list/update' => '编辑购物清单',
+            'shopping-list/update-status' => '切换购物清单状态',
+            'shopping-list/delete' => '删除购物清单',
+            'shopping-list/convert' => '购物清单入库',
+            'message-board' => '新增任务',
+            'message-board/update' => '编辑任务',
+            'message-board/delete' => '删除任务',
+            'public-channel/update' => '编辑公共频道共享物品',
+            'public-channel/comment' => '发表评论',
+            'public-channel/comment-delete' => '删除评论',
+            'public-channel/add-to-shopping' => '公共频道加入购物清单',
+            'upload' => '上传图片',
+            'upload/batch-import' => '批量上传图片',
+            'import' => '导入数据'
+        ];
+        if ($method !== 'GET' && !empty($result['success']) && isset($operationLogMap[$api])) {
+            $detail = composeOperationLogDetail($operationDetails, $result);
+            logUserOperation($db, str_replace('/', '_', $api), $operationLogMap[$api], $detail, $api, $method);
+            logAdminOperation($authDb, $currentUser, str_replace('/', '_', $api), $operationLogMap[$api], $detail, $api, $method);
         }
 
         echo json_encode($result, JSON_UNESCAPED_UNICODE);
@@ -3784,6 +4962,13 @@ if (!$currentAuthUser) {
                 background: linear-gradient(135deg, #14b8a6, #0ea5e9);
             }
 
+            .auth-btn:disabled {
+                background: #64748b;
+                color: rgba(255, 255, 255, 0.8);
+                cursor: not-allowed;
+                opacity: 0.72;
+            }
+
             .auth-tab {
                 border: 1px solid rgba(148, 163, 184, 0.35);
                 background: transparent;
@@ -3807,6 +4992,16 @@ if (!$currentAuthUser) {
                 border: none;
                 background: transparent;
                 padding: 0;
+            }
+
+            .auth-panel-note {
+                border: 1px solid rgba(148, 163, 184, 0.32);
+                background: rgba(15, 23, 42, 0.62);
+                border-radius: 12px;
+                padding: 12px;
+                font-size: 13px;
+                color: #cbd5e1;
+                line-height: 1.6;
             }
         </style>
     </head>
@@ -3867,12 +5062,21 @@ if (!$currentAuthUser) {
                         <option value="">请选择验证问题</option>
                     </select>
                 </div>
+                <div id="registerCustomQuestionWrap" class="hidden">
+                    <label class="block text-xs text-slate-400 mb-1">自定义问题</label>
+                    <input type="text" id="registerCustomQuestion" class="auth-input" placeholder="请输入你的验证问题（2-60 字）">
+                </div>
                 <div>
                     <label class="block text-xs text-slate-400 mb-1">验证答案</label>
                     <input type="text" id="registerSecurityAnswer" class="auth-input" required placeholder="用于找回密码">
                 </div>
-                <button class="auth-btn" type="submit">创建账号并登录</button>
+                <button class="auth-btn" id="registerSubmitBtn" type="submit">创建账号并登录</button>
             </form>
+            <div id="registerClosedPanel" class="hidden">
+                <div class="auth-panel-note">
+                    感谢关注，当前暂未开放注册功能，请稍后再试。
+                </div>
+            </div>
 
             <form id="resetForm" class="space-y-3 hidden" onsubmit="return submitResetPassword(event)">
                 <div>
@@ -3926,20 +5130,71 @@ if (!$currentAuthUser) {
                 const resetTabActive = tab === 'reset';
                 const loginForm = document.getElementById('loginForm');
                 const registerForm = document.getElementById('registerForm');
+                const registerClosedPanel = document.getElementById('registerClosedPanel');
                 const resetForm = document.getElementById('resetForm');
                 const isLogin = tab === 'login';
+                const showRegisterForm = tab === 'register' && (authState.allow_registration || authState.needs_setup);
                 loginTab.classList.toggle('active', isLogin);
                 regTab.classList.toggle('active', tab === 'register');
                 loginForm.classList.toggle('hidden', !isLogin);
-                registerForm.classList.toggle('hidden', tab !== 'register');
+                registerForm.classList.toggle('hidden', !showRegisterForm);
+                if (registerClosedPanel) {
+                    registerClosedPanel.classList.toggle('hidden', !(tab === 'register' && !showRegisterForm));
+                }
                 resetForm.classList.toggle('hidden', !resetTabActive);
+                updateAuthHint(tab);
             }
 
             function fillSecurityQuestionOptions() {
                 const select = document.getElementById('registerQuestionKey');
                 if (!select) return;
                 const questions = authState.security_questions || {};
-                select.innerHTML = '<option value="">请选择验证问题</option>' + Object.entries(questions).map(([key, label]) => `<option value="${key}">${label}</option>`).join('');
+                select.innerHTML = '<option value="">请选择验证问题</option>' + Object.entries(questions).map(([key, label]) => `<option value="${key}">${label}</option>`).join('') + '<option value="__custom__">自定义问题</option>';
+                toggleCustomQuestionInput();
+            }
+
+            function toggleCustomQuestionInput() {
+                const select = document.getElementById('registerQuestionKey');
+                const wrap = document.getElementById('registerCustomQuestionWrap');
+                const input = document.getElementById('registerCustomQuestion');
+                if (!select || !wrap || !input) return;
+                const isCustom = select.value === '__custom__';
+                wrap.classList.toggle('hidden', !isCustom);
+                input.required = isCustom;
+                if (!isCustom) {
+                    input.value = '';
+                }
+            }
+
+            function applyRegistrationAvailability() {
+                const disabled = !authState.allow_registration && !authState.needs_setup;
+                const submitBtn = document.getElementById('registerSubmitBtn');
+                if (submitBtn) {
+                    submitBtn.disabled = disabled;
+                }
+            }
+
+            function updateAuthHint(tab) {
+                const hint = document.getElementById('authHint');
+                if (!hint) return;
+                const activeTab = tab || (document.getElementById('tabRegister')?.classList.contains('active') ? 'register' : 'login');
+                if (authState.needs_setup) {
+                    hint.textContent = '首次使用，请先创建管理员账号。';
+                    return;
+                }
+                if (activeTab === 'register') {
+                    hint.textContent = authState.allow_registration
+                        ? '请填写注册信息并设置验证问题，用于后续找回密码。'
+                        : '感谢关注，当前暂未开放注册功能，请稍后再试。';
+                    return;
+                }
+                if (activeTab === 'reset') {
+                    hint.textContent = '请输入用户名并回答验证问题，以重置登录密码。';
+                    return;
+                }
+                const demo = authState.default_demo || {};
+                const demoUser = demo.username || 'test';
+                hint.textContent = `请输入账号密码登录，或点击 Demo 按钮进入体验环境（${demoUser}）。`;
             }
 
             async function loadResetQuestion() {
@@ -3997,8 +5252,8 @@ if (!$currentAuthUser) {
 
             async function submitRegister(e) {
                 e.preventDefault();
-                if (!authState.allow_registration) {
-                    setAuthMessage('当前已关闭注册', true);
+                if (!authState.allow_registration && !authState.needs_setup) {
+                    setAuthMessage('感谢关注，当前暂未开放注册功能，请稍后再试。', true);
                     return false;
                 }
                 setAuthMessage('');
@@ -4007,6 +5262,7 @@ if (!$currentAuthUser) {
                     display_name: document.getElementById('registerDisplayName').value.trim(),
                     password: document.getElementById('registerPassword').value,
                     question_key: document.getElementById('registerQuestionKey').value,
+                    question_custom: document.getElementById('registerCustomQuestion').value.trim(),
                     security_answer: document.getElementById('registerSecurityAnswer').value
                 });
                 if (!res.success) {
@@ -4055,22 +5311,19 @@ if (!$currentAuthUser) {
                     if (init && init.success) {
                         authState = init;
                         fillSecurityQuestionOptions();
-                        if (!init.allow_registration) {
-                            document.getElementById('tabRegister').style.display = 'none';
-                        }
+                        applyRegistrationAvailability();
                         if (init.needs_setup) {
-                            document.getElementById('authHint').textContent = '首次使用，请先创建管理员账号。';
                             switchAuthTab('register');
                         } else {
-                            const demo = init.default_demo || {};
-                            const demoUser = demo.username || 'test';
-                            document.getElementById('authHint').textContent = `请输入账号密码登录，或点击 Demo 按钮进入体验环境（${demoUser}）。`;
+                            switchAuthTab('login');
                         }
                     }
                 } catch (e) {
                     setAuthMessage('初始化失败，请刷新重试', true);
                 }
             })();
+
+            document.getElementById('registerQuestionKey')?.addEventListener('change', toggleCustomQuestionInput);
         </script>
     </body>
 
@@ -4407,6 +5660,8 @@ $currentUserJson = json_encode([
         }
 
         input.input[data-date-placeholder="1"] {
+            display: block;
+            width: 100%;
             height: 40px;
             box-sizing: border-box;
             line-height: 1.2;
@@ -4448,6 +5703,60 @@ $currentUserJson = json_encode([
         .status-icon-picker-menu .status-icon-option.is-selected {
             background: rgba(14, 165, 233, 0.2);
             color: #7dd3fc;
+        }
+
+        .emoji-picker-menu {
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            background: rgba(15, 23, 42, 0.95);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+        }
+
+        .emoji-picker-grid {
+            display: grid;
+            grid-template-columns: repeat(8, minmax(0, 1fr));
+            gap: 6px;
+        }
+
+        .emoji-picker-group+.emoji-picker-group {
+            margin-top: 10px;
+            padding-top: 10px;
+            border-top: 1px solid rgba(255, 255, 255, 0.08);
+        }
+
+        .emoji-picker-group-title {
+            font-size: 11px;
+            color: #94a3b8;
+            margin-bottom: 6px;
+            letter-spacing: 0.02em;
+        }
+
+        .emoji-picker-option {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 10px;
+            border: 1px solid transparent;
+            min-height: 34px;
+            font-size: 20px;
+            line-height: 1;
+            transition: background-color 0.2s, border-color 0.2s, transform 0.15s;
+        }
+
+        .emoji-picker-option:hover {
+            background: rgba(255, 255, 255, 0.08);
+            transform: translateY(-1px);
+        }
+
+        .emoji-picker-option.is-selected {
+            border-color: rgba(56, 189, 248, 0.5);
+            background: rgba(14, 165, 233, 0.2);
+        }
+
+        @media (max-width: 640px) {
+            .emoji-picker-grid {
+                grid-template-columns: repeat(7, minmax(0, 1fr));
+            }
         }
 
         /* 按钮 */
@@ -4907,6 +6216,29 @@ $currentUserJson = json_encode([
             color: #0369a1;
         }
 
+        body.light .emoji-picker-menu {
+            border-color: rgba(15, 23, 42, 0.12);
+            background: rgba(255, 255, 255, 0.98);
+            box-shadow: 0 12px 24px rgba(15, 23, 42, 0.08);
+        }
+
+        body.light .emoji-picker-option:hover {
+            background: rgba(14, 165, 233, 0.08);
+        }
+
+        body.light .emoji-picker-option.is-selected {
+            border-color: rgba(14, 165, 233, 0.4);
+            background: rgba(14, 165, 233, 0.16);
+        }
+
+        body.light .emoji-picker-group+.emoji-picker-group {
+            border-top-color: rgba(15, 23, 42, 0.08);
+        }
+
+        body.light .emoji-picker-group-title {
+            color: #64748b;
+        }
+
         body.light .modal-box {
             background: #fff;
             border-color: rgba(0, 0, 0, 0.08);
@@ -5141,6 +6473,56 @@ $currentUserJson = json_encode([
             .main-area {
                 margin-left: 0 !important;
             }
+
+            /* 移动端日期输入统一尺寸与宽度 */
+            #itemDate,
+            #itemReminderDate,
+            #itemReminderNext {
+                display: block;
+                width: 100% !important;
+                max-width: none;
+                min-width: 0;
+                box-sizing: border-box;
+                height: 40px !important;
+                padding-top: 0 !important;
+                padding-bottom: 0 !important;
+            }
+
+            .categories-header {
+                flex-direction: column;
+                align-items: stretch;
+                gap: 10px;
+            }
+
+            .categories-top-actions {
+                width: 100%;
+                flex-direction: column;
+                align-items: stretch;
+                gap: 8px;
+            }
+
+            .categories-top-actions>.btn,
+            .categories-top-actions>.relative>.btn {
+                width: 100%;
+                justify-content: center;
+            }
+
+            .categories-top-actions .list-sort-menu {
+                left: 0;
+                right: auto;
+                min-width: 100%;
+            }
+
+            .items-danger-actions {
+                flex-direction: column;
+                align-items: stretch;
+                gap: 6px;
+            }
+
+            .items-danger-actions .btn {
+                width: 100%;
+                justify-content: center;
+            }
         }
 
         @media (max-width: 1024px) {
@@ -5205,6 +6587,9 @@ $currentUserJson = json_encode([
             <div class="sidebar-link" data-view="shopping-list" onclick="switchView('shopping-list')">
                 <i class="ri-shopping-cart-2-line"></i><span class="sidebar-text">购物清单</span>
             </div>
+            <div class="sidebar-link" data-view="message-board" onclick="switchView('message-board')">
+                <i class="ri-chat-check-line"></i><span class="sidebar-text">任务清单</span>
+            </div>
             <div class="sidebar-link" data-view="public-channel" onclick="switchView('public-channel')">
                 <i class="ri-broadcast-line"></i><span class="sidebar-text">公共频道</span>
             </div>
@@ -5241,11 +6626,18 @@ $currentUserJson = json_encode([
                         <i class="ri-shopping-bag-line"></i><span class="sidebar-text">购入渠道管理</span>
                     </div>
                     <?php if (isAdminUser($currentAuthUser)): ?>
+                    <div class="sidebar-link sidebar-sub" data-view="platform-settings"
+                        onclick="switchView('platform-settings')">
+                        <i class="ri-global-line"></i><span class="sidebar-text">平台设置</span>
+                    </div>
                     <div class="sidebar-link sidebar-sub" data-view="user-management"
                         onclick="switchView('user-management')">
                         <i class="ri-admin-line"></i><span class="sidebar-text">用户管理</span>
                     </div>
                     <?php endif; ?>
+                    <div class="sidebar-link sidebar-sub" data-view="operation-logs" onclick="switchView('operation-logs')">
+                        <i class="ri-file-list-3-line"></i><span class="sidebar-text">操作日志</span>
+                    </div>
                     <div class="sidebar-link sidebar-sub" data-view="changelog" onclick="switchView('changelog')">
                         <i class="ri-history-line"></i><span class="sidebar-text">更新记录</span>
                     </div>
@@ -5537,8 +6929,10 @@ $currentUserJson = json_encode([
                         </select>
                         <p class="text-[11px] text-slate-500 mt-1">选择上级后将作为二级分类展示；仅支持两级分类。</p>
                     </div>
-                    <div><label class="block text-sm text-slate-400 mb-1.5">图标 (Emoji)</label><input type="text"
-                            id="catIcon" class="input" value="📦" placeholder="📦"></div>
+                    <div>
+                        <label class="block text-sm text-slate-400 mb-1.5">图标 (Emoji)</label>
+                        <div id="catEmojiPickerHost"></div>
+                    </div>
                     <div><label class="block text-sm text-slate-400 mb-1.5">颜色</label><input type="color" id="catColor"
                             class="input !p-1 !h-10" value="#3b82f6"></div>
                 </div>
@@ -5564,6 +6958,10 @@ $currentUserJson = json_encode([
                     <div><label class="block text-sm text-slate-400 mb-1.5">位置名称 <span
                                 class="text-red-400">*</span></label><input type="text" id="locName" class="input"
                             required></div>
+                    <div>
+                        <label class="block text-sm text-slate-400 mb-1.5">图标 (Emoji)</label>
+                        <div id="locEmojiPickerHost"></div>
+                    </div>
                     <div><label class="block text-sm text-slate-400 mb-1.5">描述</label><textarea id="locDesc"
                             class="input" rows="2"></textarea></div>
                 </div>
@@ -5657,7 +7055,14 @@ $currentUserJson = json_encode([
 
         const ITEMS_SIZE_KEY = userScopedStorageKey('items_size');
         function loadItemsSize() { return localStorage.getItem(ITEMS_SIZE_KEY) || 'large'; }
-        function saveItemsSize(s) { localStorage.setItem(ITEMS_SIZE_KEY, s); App.itemsSize = s; }
+        function saveItemsSize(s) {
+            const prev = String((App && App.itemsSize) || '');
+            localStorage.setItem(ITEMS_SIZE_KEY, s);
+            App.itemsSize = s;
+            if (prev !== String(s || '')) {
+                logSettingEvent('settings.item_size', `物品显示大小: ${prev || '默认'} -> ${String(s || '')}`);
+            }
+        }
 
         // ---------- 属性显示设置 ----------
         const ITEM_ATTRS_KEY = userScopedStorageKey('item_attrs');
@@ -5678,7 +7083,14 @@ $currentUserJson = json_encode([
                 return saved ? JSON.parse(saved) : [...defaultItemAttrs];
             } catch { return [...defaultItemAttrs]; }
         }
-        function saveItemAttrs(arr) { localStorage.setItem(ITEM_ATTRS_KEY, JSON.stringify(arr)); App.itemAttrs = arr; }
+        function saveItemAttrs(arr) {
+            localStorage.setItem(ITEM_ATTRS_KEY, JSON.stringify(arr));
+            App.itemAttrs = arr;
+            const labels = allItemAttrs
+                .filter(x => Array.isArray(arr) && arr.includes(x.key))
+                .map(x => x.label);
+            logSettingEvent('settings.item_attrs', `已显示属性: ${labels.length > 0 ? labels.join('、') : '无'}`);
+        }
         function toggleItemAttr(key) {
             const idx = App.itemAttrs.indexOf(key);
             if (idx > -1) App.itemAttrs.splice(idx, 1);
@@ -5687,6 +7099,100 @@ $currentUserJson = json_encode([
             renderItemsFast({ openAttrPanel: true });
         }
         function hasAttr(key) { return App.itemAttrs.includes(key); }
+
+        const EMOJI_GROUPS = [
+            { label: '常用', items: ['📦', '📍', '🏠', '🗂️', '📁', '🛒', '📝', '⭐', '✅', '❗', '🔔', '📌', '🏷️', '🎁', '💡', '🧾'] },
+            { label: '家居空间', items: ['🛋️', '🛏️', '🪑', '🚪', '🪟', '🪴', '🪞', '🧹', '🧺', '🧼', '🧴', '🗑️', '📺', '🛁', '🚿', '🧯'] },
+            { label: '厨房食物', items: ['🍳', '🍽️', '🥣', '🫖', '☕', '🥤', '🧂', '🍱', '🍚', '🍜', '🍞', '🥛', '🍎', '🥬', '🥚', '🍊'] },
+            { label: '电子办公', items: ['💻', '🖥️', '📱', '⌚', '🎧', '📷', '🖨️', '⌨️', '🖱️', '🔋', '🔌', '📡', '📶', '💾', '🧠', '📚'] },
+            { label: '工具维修', items: ['🧰', '🔧', '🪛', '🔨', '🪚', '🧪', '⚙️', '🧯', '🔦', '🧲', '📏', '🧷', '🔩', '🪙', '🧱', '🪣'] },
+            { label: '服饰运动', items: ['👕', '👖', '👟', '🧥', '🧢', '🎒', '👜', '⌚', '⚽', '🏀', '🏸', '🏓', '🏋️', '🚴', '🥾', '🧤'] },
+            { label: '出行健康', items: ['🚗', '🧳', '🎫', '💳', '🪪', '🗺️', '🌤️', '☔', '🩺', '💊', '🧴', '😷', '❤️', '🧘', '🚲', '🛵'] },
+            { label: '文档学习', items: ['📖', '📚', '🧾', '🗂️', '📅', '🗓️', '✏️', '🖊️', '📐', '📎', '🖇️', '📌', '📍', '🧮', '📰', '📜'] }
+        ];
+        function normalizeEmojiValue(value, fallback = '📦') {
+            const icon = String(value || '').trim();
+            return icon || fallback;
+        }
+        function renderEmojiPicker(pickerId, inputId, selectedEmoji = '📦', fallbackEmoji = '📦') {
+            const selected = normalizeEmojiValue(selectedEmoji, fallbackEmoji);
+            const existsInGroups = EMOJI_GROUPS.some(group => Array.isArray(group.items) && group.items.includes(selected));
+            const renderGroups = existsInGroups ? EMOJI_GROUPS : [{ label: '当前图标', items: [selected] }, ...EMOJI_GROUPS];
+            return `
+                <div class="relative emoji-picker" id="${pickerId}">
+                    <input type="hidden" id="${inputId}" value="${selected}">
+                    <button type="button" onclick="toggleEmojiPicker('${pickerId}')" class="input w-full !py-2 flex items-center justify-between gap-2">
+                        <span class="inline-flex items-center gap-2 min-w-0">
+                            <span id="${inputId}Preview" class="text-2xl leading-none">${selected}</span>
+                            <span class="text-xs text-slate-400 truncate">点击选择图标</span>
+                        </span>
+                        <i class="ri-arrow-down-s-line text-slate-500"></i>
+                    </button>
+                    <div id="${pickerId}Menu" class="emoji-picker-menu hidden absolute z-30 mt-1 w-full max-h-64 overflow-auto rounded-xl p-2">
+                        ${renderGroups.map(group => `
+                            <div class="emoji-picker-group">
+                                <div class="emoji-picker-group-title">${group.label}</div>
+                                <div class="emoji-picker-grid">
+                                    ${(Array.isArray(group.items) ? group.items : []).map(emoji => `
+                                        <button type="button" data-emoji="${emoji}" onclick="pickEmoji('${pickerId}','${inputId}','${emoji}')" class="emoji-picker-option ${emoji === selected ? 'is-selected' : ''}" title="${emoji}" aria-label="${emoji}">
+                                            ${emoji}
+                                        </button>
+                                    `).join('')}
+                                </div>
+                            </div>
+                        `).join('')}
+                    </div>
+                </div>
+            `;
+        }
+        function mountEmojiPicker(hostId, pickerId, inputId, selectedEmoji = '📦', fallbackEmoji = '📦') {
+            const host = document.getElementById(hostId);
+            if (!host) return;
+            host.innerHTML = renderEmojiPicker(pickerId, inputId, selectedEmoji, fallbackEmoji);
+        }
+        function hideEmojiPickerMenus(exceptMenuId = '') {
+            document.querySelectorAll('.emoji-picker-menu').forEach(menu => {
+                if (!exceptMenuId || menu.id !== exceptMenuId) menu.classList.add('hidden');
+            });
+        }
+        function toggleEmojiPicker(pickerId) {
+            const menuId = pickerId + 'Menu';
+            const target = document.getElementById(menuId);
+            if (!target) return;
+            hideEmojiPickerMenus(menuId);
+            document.querySelectorAll('.status-icon-picker-menu').forEach(menu => menu.classList.add('hidden'));
+            target.classList.toggle('hidden');
+        }
+        function pickEmoji(pickerId, inputId, emoji) {
+            const input = document.getElementById(inputId);
+            if (input) input.value = emoji;
+            const preview = document.getElementById(inputId + 'Preview');
+            if (preview) preview.textContent = emoji;
+            const menu = document.getElementById(pickerId + 'Menu');
+            if (menu) {
+                menu.querySelectorAll('button[data-emoji]').forEach(btn => {
+                    btn.classList.toggle('is-selected', btn.getAttribute('data-emoji') === emoji);
+                });
+                menu.classList.add('hidden');
+            }
+        }
+        function setEmojiPickerValue(pickerId, inputId, value, fallbackEmoji = '📦') {
+            const icon = normalizeEmojiValue(value, fallbackEmoji);
+            const input = document.getElementById(inputId);
+            if (input) input.value = icon;
+            const preview = document.getElementById(inputId + 'Preview');
+            if (preview) preview.textContent = icon;
+            const menu = document.getElementById(pickerId + 'Menu');
+            if (menu) {
+                menu.querySelectorAll('button[data-emoji]').forEach(btn => {
+                    btn.classList.toggle('is-selected', btn.getAttribute('data-emoji') === icon);
+                });
+            }
+        }
+        function initFormEmojiPickers() {
+            mountEmojiPicker('catEmojiPickerHost', 'catEmojiPicker', 'catIcon', '📦', '📦');
+            mountEmojiPicker('locEmojiPickerHost', 'locEmojiPicker', 'locIcon', '📍', '📍');
+        }
 
         // ---------- 状态管理 ----------
         const STATUS_KEY = userScopedStorageKey('statuses');
@@ -5731,6 +7237,7 @@ $currentUserJson = json_encode([
             document.querySelectorAll('.status-icon-picker-menu').forEach(menu => {
                 if (menu.id !== menuId) menu.classList.add('hidden');
             });
+            hideEmojiPickerMenus();
             target.classList.toggle('hidden');
         }
         function pickStatusIcon(pickerId, inputId, icon) {
@@ -5750,8 +7257,12 @@ $currentUserJson = json_encode([
             }
         }
         document.addEventListener('click', (e) => {
-            if (e.target.closest('.status-icon-picker')) return;
-            document.querySelectorAll('.status-icon-picker-menu').forEach(menu => menu.classList.add('hidden'));
+            if (!e.target.closest('.status-icon-picker')) {
+                document.querySelectorAll('.status-icon-picker-menu').forEach(menu => menu.classList.add('hidden'));
+            }
+            if (!e.target.closest('.emoji-picker')) {
+                hideEmojiPickerMenus();
+            }
         });
         function normalizeStatuses(arr) {
             const source = Array.isArray(arr) ? arr : [];
@@ -5798,6 +7309,7 @@ $currentUserJson = json_encode([
             const next = normalized.length > 0 ? normalized : defaultStatuses.map(s => ({ ...s }));
             localStorage.setItem(STATUS_KEY, JSON.stringify(next));
             App.statuses = next;
+            logSettingEvent('settings.statuses', `状态数量: ${next.length}；当前状态: ${next.map(s => s.label).join('、')}`);
         }
         function getDefaultStatusKey() {
             return (App.statuses[0] && App.statuses[0].key) ? App.statuses[0].key : 'active';
@@ -5839,6 +7351,7 @@ $currentUserJson = json_encode([
             const normalized = normalizeChannels(arr);
             localStorage.setItem(CHANNEL_KEY, JSON.stringify(normalized));
             App.purchaseChannels = normalized;
+            logSettingEvent('settings.channels', `渠道数量: ${normalized.length}；渠道: ${normalized.join('、')}`);
         }
 
         let itemFormInitialState = '';
@@ -5895,6 +7408,7 @@ $currentUserJson = json_encode([
             currentView: 'dashboard',
             categories: [],
             publicChannelItems: [],
+            messageBoardTasks: [],
             shoppingList: [],
             pendingShoppingEditId: 0,
             itemsSize: loadItemsSize(),
@@ -5906,6 +7420,7 @@ $currentUserJson = json_encode([
             itemsOrder: 'DESC',
             itemsFilter: { search: '', category: 0, location: 0, status: '', expiryOnly: false },
             sortSettings: loadSortSettings(),
+            operationLogsFilters: { keyword: '', actorUserId: 0, sort: 'time_desc' },
             _cachedItems: null,   // 缓存物品列表数据，避免频繁 API 请求
             _cachedTotal: 0,
             _cachedPages: 0
@@ -5939,6 +7454,16 @@ $currentUserJson = json_encode([
 
         async function apiPost(endpoint, data) {
             return api(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+        }
+
+        async function logSettingEvent(eventType, details = '') {
+            try {
+                await apiPost('operation-logs/client-event', {
+                    event_type: String(eventType || ''),
+                    details: String(details || '')
+                });
+            } catch (e) {
+            }
         }
 
         async function logout() {
@@ -6046,14 +7571,14 @@ $currentUserJson = json_encode([
         }
 
         // ---------- 视图切换 ----------
-        const settingsSubViews = ['import-export', 'settings', 'status-settings', 'channel-settings', 'user-management', 'changelog'];
+        const settingsSubViews = ['import-export', 'settings', 'status-settings', 'channel-settings', 'platform-settings', 'user-management', 'operation-logs', 'changelog'];
 
         function switchView(view) {
             App.currentView = view;
             document.querySelectorAll('.sidebar-link[data-view]').forEach(el => {
                 el.classList.toggle('active', el.dataset.view === view);
             });
-            const titles = { dashboard: '仪表盘', items: '物品管理', 'shopping-list': '购物清单', 'public-channel': '公共频道', categories: '分类管理', locations: '位置管理', trash: '物品管理', 'import-export': '数据管理', settings: '排序设置', 'status-settings': '状态管理', 'channel-settings': '购入渠道管理', 'user-management': '用户管理', changelog: '更新记录' };
+            const titles = { dashboard: '仪表盘', items: '物品管理', 'shopping-list': '购物清单', 'message-board': '任务清单', 'public-channel': '公共频道', categories: '分类管理', locations: '位置管理', trash: '物品管理', 'import-export': '数据管理', settings: '排序设置', 'status-settings': '状态管理', 'channel-settings': '购入渠道管理', 'platform-settings': '平台设置', 'user-management': '用户管理', 'operation-logs': '操作日志', changelog: '更新记录' };
             document.getElementById('viewTitle').textContent = titles[view] || '';
             // 回收站视图高亮物品管理侧边栏
             if (view === 'trash') document.querySelector('.sidebar-link[data-view="items"]')?.classList.add('active');
@@ -6080,6 +7605,7 @@ $currentUserJson = json_encode([
                 case 'dashboard': await renderDashboard(c); break;
                 case 'items': await renderItems(c); break;
                 case 'shopping-list': await renderShoppingList(c); break;
+                case 'message-board': await renderMessageBoard(c); break;
                 case 'public-channel': await renderPublicChannel(c); break;
                 case 'categories': await renderCategories(c); break;
                 case 'locations': await renderLocations(c); break;
@@ -6088,7 +7614,9 @@ $currentUserJson = json_encode([
                 case 'settings': renderSettings(c); break;
                 case 'status-settings': renderStatusSettings(c); break;
                 case 'channel-settings': renderChannelSettings(c); break;
+                case 'platform-settings': await renderPlatformSettings(c); break;
                 case 'user-management': await renderUserManagement(c); break;
+                case 'operation-logs': await renderOperationLogs(c); break;
                 case 'changelog': renderChangelog(c); break;
             }
         }
@@ -6096,8 +7624,14 @@ $currentUserJson = json_encode([
         // ---------- 加载基础数据 ----------
         async function loadBaseData() {
             const [catRes, locRes] = await Promise.all([api('categories'), api('locations')]);
-            if (catRes.success) App.categories = catRes.data;
-            if (locRes.success) App.locations = locRes.data;
+            if (catRes.success) {
+                const rows = Array.isArray(catRes.data) ? catRes.data : [];
+                App.categories = rows.map(cat => ({ ...cat, icon: normalizeEmojiValue(cat.icon, '📦') }));
+            }
+            if (locRes.success) {
+                const rows = Array.isArray(locRes.data) ? locRes.data : [];
+                App.locations = rows.map(loc => ({ ...loc, icon: normalizeEmojiValue(loc.icon, '📍') }));
+            }
         }
 
         function getCategoryById(categoryId) {
@@ -6136,6 +7670,11 @@ $currentUserJson = json_encode([
                 const parentName = String(parent?.name || cat?.parent_name || '').trim();
                 return `${icon} ${parentName ? `${parentName} / ` : ''}${name}`;
             }
+            return `${icon} ${name}`;
+        }
+        function getLocationOptionLabel(loc) {
+            const name = String(loc?.name || '').trim() || '未命名位置';
+            const icon = String(loc?.icon || '📍').trim() || '📍';
             return `${icon} ${name}`;
         }
 
@@ -6224,6 +7763,198 @@ $currentUserJson = json_encode([
             return optionRows.join('');
         }
 
+        function formatMessageBoardDateTime(value) {
+            const s = String(value || '').replace('T', ' ');
+            if (!s) return '未知时间';
+            return s.length >= 16 ? s.slice(0, 16) : s;
+        }
+
+        function getTaskBoardById(taskId) {
+            const id = Number(taskId || 0);
+            if (id <= 0) return null;
+            const list = Array.isArray(App.messageBoardTasks) ? App.messageBoardTasks : [];
+            return list.find(x => Number(x.id || 0) === id) || null;
+        }
+
+        function renderMessageBoardListHtml(posts, options = {}) {
+            const list = Array.isArray(posts) ? posts : [];
+            const {
+                emptyText = '暂无任务',
+                showActions = true,
+                hideCompleted = false
+            } = options || {};
+            const rows = hideCompleted ? list.filter(x => Number(x.is_completed || 0) !== 1) : list;
+            if (rows.length === 0) {
+                return `<p class="text-slate-500 text-sm text-center py-6">${esc(emptyText)}</p>`;
+            }
+            return rows.map(post => {
+                const isCompleted = Number(post.is_completed || 0) === 1;
+                const canEdit = !!post.can_edit;
+                const canDelete = !!post.can_delete;
+                return `
+                <div class="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5">
+                    <div class="flex items-center justify-between gap-3 mb-1">
+                        <div class="flex items-center gap-2 min-w-0">
+                            <span class="text-xs text-sky-300 truncate">${esc(String(post.author_name || '未知用户'))}</span>
+                            <span class="badge ${isCompleted ? 'badge-active' : 'badge-warning'} !text-[10px]">${isCompleted ? '已完成' : '待完成'}</span>
+                        </div>
+                        <span class="text-[11px] text-slate-500 flex-shrink-0">${esc(formatMessageBoardDateTime(post.created_at))}</span>
+                    </div>
+                    <p class="text-sm ${isCompleted ? 'text-slate-500 line-through' : 'text-slate-200'} break-words leading-6">${esc(String(post.content || ''))}</p>
+                    ${showActions && (canEdit || canDelete) ? `
+                        <div class="mt-2.5 flex items-center justify-end gap-2">
+                            ${canEdit ? `<button onclick="toggleMessageBoardTaskStatus(${Number(post.id || 0)}, ${isCompleted ? 0 : 1})" class="btn btn-ghost btn-sm !py-1 !px-2 text-xs ${isCompleted ? 'text-amber-300 border-amber-400/25 hover:border-amber-300/40' : 'text-emerald-300 border-emerald-400/25 hover:border-emerald-300/40'}"><i class="${isCompleted ? 'ri-refresh-line' : 'ri-check-line'}"></i>${isCompleted ? '设为待办' : '标记完成'}</button>` : ''}
+                            ${canEdit ? `<button onclick="editMessageBoardTask(${Number(post.id || 0)})" class="btn btn-ghost btn-sm !py-1 !px-2 text-xs text-cyan-300 border-cyan-400/25 hover:border-cyan-300/40"><i class="ri-edit-line"></i>编辑</button>` : ''}
+                            ${canDelete ? `<button onclick="deleteMessageBoardTask(${Number(post.id || 0)})" class="btn btn-ghost btn-sm !py-1 !px-2 text-xs text-rose-300 border-rose-400/25 hover:border-rose-300/40"><i class="ri-delete-bin-6-line"></i>删除</button>` : ''}
+                        </div>
+                    ` : ''}
+                </div>`;
+            }).join('');
+        }
+
+        function handleMessageBoardInputKey(e, inputId) {
+            if (e.key !== 'Enter') return;
+            e.preventDefault();
+            postMessageBoard(inputId);
+        }
+
+        async function postMessageBoard(inputId) {
+            const input = document.getElementById(inputId);
+            if (!input) return;
+            const content = String(input.value || '').trim();
+            if (!content) {
+                toast('请输入任务内容', 'error');
+                input.focus();
+                return;
+            }
+            const res = await apiPost('message-board', { content });
+            if (!res || !res.success) {
+                toast((res && res.message) || '任务添加失败', 'error');
+                return;
+            }
+            input.value = '';
+            toast(res.message || '任务已添加');
+            renderView();
+        }
+
+        async function editMessageBoardTask(taskId) {
+            const task = getTaskBoardById(taskId);
+            if (!task) {
+                toast('任务不存在', 'error');
+                return;
+            }
+            if (!task.can_edit) {
+                toast('仅创建者或管理员可编辑任务', 'error');
+                return;
+            }
+            const nextContent = prompt('编辑任务内容：', String(task.content || ''));
+            if (nextContent === null) return;
+            const content = String(nextContent || '').trim();
+            if (!content) {
+                toast('任务内容不能为空', 'error');
+                return;
+            }
+            const res = await apiPost('message-board/update', { id: Number(task.id || 0), content });
+            if (!res || !res.success) {
+                toast((res && res.message) || '任务编辑失败', 'error');
+                return;
+            }
+            toast(res.message || '任务已更新');
+            renderView();
+        }
+
+        async function toggleMessageBoardTaskStatus(taskId, isCompleted) {
+            const task = getTaskBoardById(taskId);
+            if (!task) {
+                toast('任务不存在', 'error');
+                return;
+            }
+            if (!task.can_edit) {
+                toast('仅创建者或管理员可修改任务', 'error');
+                return;
+            }
+            const res = await apiPost('message-board/update', {
+                id: Number(task.id || 0),
+                is_completed: Number(isCompleted || 0) === 1 ? 1 : 0
+            });
+            if (!res || !res.success) {
+                toast((res && res.message) || '任务状态更新失败', 'error');
+                return;
+            }
+            toast(res.message || '任务状态已更新');
+            renderView();
+        }
+
+        async function deleteMessageBoardTask(taskId) {
+            const task = getTaskBoardById(taskId);
+            if (!task) {
+                toast('任务不存在', 'error');
+                return;
+            }
+            if (!task.can_delete) {
+                toast('仅创建者或管理员可删除任务', 'error');
+                return;
+            }
+            if (!confirm('确定删除这条任务吗？')) return;
+            const res = await apiPost('message-board/delete', { id: Number(task.id || 0) });
+            if (!res || !res.success) {
+                toast((res && res.message) || '任务删除失败', 'error');
+                return;
+            }
+            toast(res.message || '任务已删除');
+            renderView();
+        }
+
+        async function renderMessageBoard(container) {
+            const res = await api('message-board&limit=120');
+            if (!res || !res.success) {
+                container.innerHTML = '<p class="text-red-400">任务清单加载失败</p>';
+                return;
+            }
+            const list = Array.isArray(res.data) ? res.data : [];
+            App.messageBoardTasks = list;
+            const today = new Date().toISOString().slice(0, 10);
+            const todayCount = list.filter(x => String(x.created_at || '').slice(0, 10) === today).length;
+            const pendingTasks = list.filter(x => Number(x.is_completed || 0) !== 1);
+            const completedTasks = list.filter(x => Number(x.is_completed || 0) === 1);
+            container.innerHTML = `
+        <div class="space-y-6">
+            <div class="glass rounded-2xl p-4 anim-up">
+                <div class="flex flex-wrap items-center gap-x-6 gap-y-2">
+                    <span class="text-sm text-slate-400"><i class="ri-chat-check-line mr-1 text-sky-400"></i>任务总数 ${list.length} 条</span>
+                    <span class="text-sm text-slate-400"><i class="ri-time-line mr-1 text-amber-400"></i>待完成 ${pendingTasks.length} 条</span>
+                    <span class="text-sm text-slate-400"><i class="ri-checkbox-circle-line mr-1 text-emerald-400"></i>已完成 ${completedTasks.length} 条</span>
+                    <span class="text-sm text-slate-400"><i class="ri-calendar-check-line mr-1 text-cyan-400"></i>今日新增 ${todayCount} 条</span>
+                </div>
+            </div>
+            <div class="glass rounded-2xl p-5 anim-up" style="animation-delay:0.03s">
+                <div class="flex items-center justify-between mb-4">
+                    <h3 class="font-semibold text-white flex items-center gap-2"><i class="ri-task-line text-cyan-400"></i>新增任务</h3>
+                    <button onclick="switchView('public-channel')" class="text-sm text-sky-400 hover:text-sky-300 transition">前往公共频道 →</button>
+                </div>
+                <div class="flex items-center gap-2 mb-4">
+                    <input id="messageBoardInputMain" type="text" maxlength="300" class="input !py-2.5 flex-1" placeholder="输入任务内容..." onkeydown="handleMessageBoardInputKey(event, 'messageBoardInputMain')">
+                    <button onclick="postMessageBoard('messageBoardInputMain')" class="btn btn-primary !py-2.5 !px-4"><i class="ri-add-line"></i>添加</button>
+                </div>
+                <div class="space-y-5 max-h-[65vh] overflow-auto pr-1">
+                    <div>
+                        <p class="text-xs text-slate-500 mb-2">待完成</p>
+                        <div class="space-y-2.5">
+                            ${renderMessageBoardListHtml(pendingTasks, { emptyText: '暂无待完成任务', showActions: true })}
+                        </div>
+                    </div>
+                    <div>
+                        <p class="text-xs text-slate-500 mb-2">已完成</p>
+                        <div class="space-y-2.5">
+                            ${renderMessageBoardListHtml(completedTasks, { emptyText: '暂无已完成任务', showActions: true })}
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+        }
+
         // ============================================================
         // 📊 仪表盘
         // ============================================================
@@ -6245,6 +7976,8 @@ $currentUserJson = json_encode([
             const memoCycleCount = memoReminderItems.filter(item => item._source === 'item').length;
             const memoShoppingCount = memoReminderItems.filter(item => item._source === 'shopping').length;
             const dashboardStatusStats = (d.statusStats || []).filter(s => Number(s.total_qty || 0) > 0);
+            const taskBoardPosts = (Array.isArray(d.messageBoardPosts) ? d.messageBoardPosts : []).filter(x => Number(x.is_completed || 0) !== 1);
+            App.messageBoardTasks = taskBoardPosts;
 
             container.innerHTML = `
         <div class="glass rounded-2xl p-4 mb-6 anim-up">
@@ -6356,24 +8089,40 @@ $currentUserJson = json_encode([
         </div>
 
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            <div class="lg:col-span-2 glass rounded-2xl p-5 anim-up">
-                <div class="flex items-center justify-between mb-4">
-                    <h3 class="font-semibold text-white flex items-center gap-2"><i class="ri-time-line text-sky-400"></i>最近更新</h3>
-                    <button onclick="switchView('items')" class="text-sm text-sky-400 hover:text-sky-300 transition">查看全部 →</button>
+            <div class="lg:col-span-2 space-y-6">
+                <div class="glass rounded-2xl p-5 anim-up" style="animation-delay:0.08s">
+                    <div class="flex items-center justify-between mb-4">
+                        <h3 class="font-semibold text-white flex items-center gap-2"><i class="ri-task-line text-cyan-400"></i>任务清单</h3>
+                        <button onclick="switchView('message-board')" class="text-sm text-sky-400 hover:text-sky-300 transition">查看全部 →</button>
+                    </div>
+                    <div class="flex items-center gap-2 mb-4">
+                        <input id="messageBoardInputDashboard" type="text" maxlength="300" class="input !py-2.5 flex-1" placeholder="添加待办任务..." onkeydown="handleMessageBoardInputKey(event, 'messageBoardInputDashboard')">
+                        <button onclick="postMessageBoard('messageBoardInputDashboard')" class="btn btn-primary btn-sm !py-2 !px-3"><i class="ri-add-line"></i>添加</button>
+                    </div>
+                    <div class="space-y-2.5">
+                        ${renderMessageBoardListHtml(taskBoardPosts, { emptyText: '暂无待办任务', showActions: true, hideCompleted: true })}
+                    </div>
                 </div>
-                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-2 xl:grid-cols-3 gap-2">
-                    ${d.recentItems.map(item => `
-                        <div class="flex items-center gap-2.5 px-2.5 py-2 rounded-lg hover:bg-white/5 transition cursor-pointer" onclick="showDetail(${item.id})">
-                            <div class="w-8 h-8 rounded-md ${item.image ? '' : 'bg-slate-700/50 flex items-center justify-center text-sm'} flex-shrink-0 overflow-hidden">
-                                ${item.image ? `<img src="?img=${item.image}" class="w-full h-full object-cover rounded-md">` : `<span>${item.category_icon || '📦'}</span>`}
+
+                <div class="glass rounded-2xl p-5 anim-up">
+                    <div class="flex items-center justify-between mb-4">
+                        <h3 class="font-semibold text-white flex items-center gap-2"><i class="ri-time-line text-sky-400"></i>最近更新</h3>
+                        <button onclick="switchView('items')" class="text-sm text-sky-400 hover:text-sky-300 transition">查看全部 →</button>
+                    </div>
+                    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-2 xl:grid-cols-3 gap-2">
+                        ${d.recentItems.map(item => `
+                            <div class="flex items-center gap-2.5 px-2.5 py-2 rounded-lg hover:bg-white/5 transition cursor-pointer" onclick="showDetail(${item.id})">
+                                <div class="w-8 h-8 rounded-md ${item.image ? '' : 'bg-slate-700/50 flex items-center justify-center text-sm'} flex-shrink-0 overflow-hidden">
+                                    ${item.image ? `<img src="?img=${item.image}" class="w-full h-full object-cover rounded-md">` : `<span>${item.category_icon || '📦'}</span>`}
+                                </div>
+                                <div class="min-w-0 flex-1">
+                                    <p class="text-sm text-slate-200 truncate leading-tight">${esc(item.name)}</p>
+                                    <p class="text-[11px] text-slate-500 truncate">${esc(item.location_name || '未设定位置')} · x${item.quantity}</p>
+                                </div>
                             </div>
-                            <div class="min-w-0 flex-1">
-                                <p class="text-sm text-slate-200 truncate leading-tight">${esc(item.name)}</p>
-                                <p class="text-[11px] text-slate-500 truncate">${esc(item.location_name || '未设定位置')} · x${item.quantity}</p>
-                            </div>
-                        </div>
-                    `).join('')}
-                    ${d.recentItems.length === 0 ? '<p class="text-slate-500 text-sm col-span-full text-center py-8">还没有物品，点击右上角「添加物品」开始吧</p>' : ''}
+                        `).join('')}
+                        ${d.recentItems.length === 0 ? '<p class="text-slate-500 text-sm col-span-full text-center py-8">还没有物品，点击右上角「添加物品」开始吧</p>' : ''}
+                    </div>
                 </div>
             </div>
 
@@ -6481,7 +8230,7 @@ $currentUserJson = json_encode([
                 <select class="input !w-auto !py-2" onchange="App.itemsFilter.location=+this.value;App.itemsPage=1;renderView()">
                     <option value="0">所有位置</option>
                     <option value="-1" ${f.location === -1 ? 'selected' : ''}>未设定</option>
-                    ${App.locations.map(l => `<option value="${l.id}" ${f.location == l.id ? 'selected' : ''}>${esc(l.name)}</option>`).join('')}
+                    ${App.locations.map(l => `<option value="${l.id}" ${f.location == l.id ? 'selected' : ''}>${esc(getLocationOptionLabel(l))}</option>`).join('')}
                 </select>
                 <select class="input !w-auto !py-2" onchange="App.itemsFilter.status=this.value;App.itemsPage=1;renderView()">
                     <option value="">所有状态</option>
@@ -6536,12 +8285,14 @@ $currentUserJson = json_encode([
                     <button onclick="setItemsSize('medium')" class="size-btn ${App.itemsSize === 'medium' ? 'active' : ''}" title="中"><i class="ri-grid-fill"></i></button>
                     <button onclick="setItemsSize('small')" class="size-btn ${App.itemsSize === 'small' ? 'active' : ''}" title="小"><i class="ri-list-check"></i></button>
                 </div>
-                <button onclick="toggleExpiryOnlyFilter()" class="btn btn-ghost btn-sm ${f.expiryOnly ? 'text-amber-400 border-amber-400/30 bg-amber-500/10' : 'text-slate-400 hover:text-amber-400'}" title="只显示带过期日期的物品">
-                    <i class="ri-alarm-warning-line mr-1"></i>过期管理
-                </button>
-                <button onclick="switchView('trash')" class="btn btn-ghost btn-sm text-slate-400 hover:text-red-400 transition" title="回收站">
-                    <i class="ri-delete-bin-line mr-1"></i>回收站
-                </button>
+                <div class="items-danger-actions flex items-center gap-2">
+                    <button onclick="toggleExpiryOnlyFilter()" class="btn btn-ghost btn-sm ${f.expiryOnly ? 'text-amber-400 border-amber-400/30 bg-amber-500/10' : 'text-slate-400 hover:text-amber-400'}" title="只显示带过期日期的物品">
+                        <i class="ri-alarm-warning-line mr-1"></i>过期管理
+                    </button>
+                    <button onclick="switchView('trash')" class="btn btn-ghost btn-sm text-slate-400 hover:text-red-400 transition" title="回收站">
+                        <i class="ri-delete-bin-line mr-1"></i>回收站
+                    </button>
+                </div>
             </div>
         </div>
 
@@ -6967,7 +8718,7 @@ $currentUserJson = json_encode([
                 }
             }
             const locSelect = document.getElementById('itemLocation');
-            locSelect.innerHTML = '<option value="0">选择位置</option>' + App.locations.map(l => `<option value="${l.id}">${esc(l.name)}</option>`).join('');
+            locSelect.innerHTML = '<option value="0">选择位置</option>' + App.locations.map(l => `<option value="${l.id}">${esc(getLocationOptionLabel(l))}</option>`).join('');
             const statusSelect = document.getElementById('itemStatus');
             statusSelect.innerHTML = App.statuses.map(s => `<option value="${s.key}">${s.label}</option>`).join('');
             const purchaseSelect = document.getElementById('itemPurchaseFrom');
@@ -7872,9 +9623,9 @@ $currentUserJson = json_encode([
             });
             const totalCount = 1 + rootCats.length + subCats.length + orphanSubCats.length;
             container.innerHTML = `
-        <div class="flex items-center justify-between mb-6 anim-up" style="position:relative;z-index:40;">
+        <div class="flex items-center justify-between mb-6 anim-up categories-header" style="position:relative;z-index:40;">
             <p class="text-sm text-slate-500">共 ${totalCount} 个分类（一级 ${rootCats.length} / 二级 ${subCats.length + orphanSubCats.length}）</p>
-            <div class="flex items-center gap-2">
+            <div class="flex items-center gap-2 categories-top-actions">
                 <div class="relative">
                     <button onclick="toggleListSortMenu('categoriesSortMenu', this)" class="btn btn-ghost btn-sm text-slate-400 hover:text-white transition">
                         <i class="ri-sort-desc mr-1"></i>排序：${getListSortLabel(catSortMode)}
@@ -7884,8 +9635,8 @@ $currentUserJson = json_encode([
                         <button onclick="setListSort('categories','name_asc')" class="w-full text-left px-2 py-1.5 rounded-lg text-xs transition ${catSortMode === 'name_asc' ? 'bg-sky-500/15 text-sky-300' : 'text-slate-300 hover:bg-white/[0.05]'}">按名称首字母 A→Z</button>
                     </div>
                 </div>
-                <button onclick="openAddCategory(0)" class="btn btn-primary btn-sm"><i class="ri-add-line"></i>添加一级分类</button>
-                <button onclick="openAddCategory(-1)" class="btn btn-ghost btn-sm"><i class="ri-node-tree"></i>添加二级分类</button>
+                <button onclick="openAddCategory(0)" class="btn btn-ghost btn-sm text-slate-400 hover:text-sky-300 transition"><i class="ri-add-line"></i>添加一级分类</button>
+                <button onclick="openAddCategory(-1)" class="btn btn-ghost btn-sm text-slate-400 hover:text-cyan-300 transition"><i class="ri-node-tree"></i>添加二级分类</button>
             </div>
         </div>
         <div class="category-mindmap space-y-4" style="position:relative;z-index:1;">
@@ -7932,7 +9683,7 @@ $currentUserJson = json_encode([
                             </div>
                             <div class="category-node-actions">
                                 <button onclick="viewItemsByCategory(${cat.id})" class="btn btn-ghost btn-sm" style="color:#38bdf8" title="查看物品"><i class="ri-archive-line"></i>物品</button>
-                                <button onclick="openAddSubCategory(${cat.id})" class="btn btn-ghost btn-sm" title="添加二级分类"><i class="ri-node-tree"></i>添加二级</button>
+                                <button onclick="openAddSubCategory(${cat.id})" class="btn btn-ghost btn-sm" title="添加二级分类"><i class="ri-node-tree"></i>添加二级分类</button>
                                 <button onclick="editCategory(${cat.id})" class="btn btn-ghost btn-sm"><i class="ri-edit-line"></i>编辑</button>
                                 <button onclick="deleteCategory(${cat.id},'${esc(cat.name)}',${cat.item_count},${cat.child_count || 0})" class="btn btn-danger btn-sm"><i class="ri-delete-bin-line"></i>删除</button>
                             </div>
@@ -8022,7 +9773,7 @@ $currentUserJson = json_encode([
             document.getElementById('catModalTitle').textContent = (forceSubMode || parentId > 0) ? '添加二级分类' : '添加一级分类';
             document.getElementById('catId').value = '';
             document.getElementById('catName').value = '';
-            document.getElementById('catIcon').value = '📦';
+            setEmojiPickerValue('catEmojiPicker', 'catIcon', '📦', '📦');
             document.getElementById('catColor').value = '#3b82f6';
             populateCategoryParentSelect(parentId > 0 ? parentId : 0, 0);
             document.getElementById('catParentId').disabled = false;
@@ -8039,7 +9790,7 @@ $currentUserJson = json_encode([
             document.getElementById('catModalTitle').textContent = '编辑分类';
             document.getElementById('catId').value = cat.id;
             document.getElementById('catName').value = cat.name;
-            document.getElementById('catIcon').value = cat.icon;
+            setEmojiPickerValue('catEmojiPicker', 'catIcon', cat.icon, '📦');
             document.getElementById('catColor').value = cat.color;
             populateCategoryParentSelect(Number(cat.parent_id || 0), Number(cat.id || 0));
             const hasChildren = Number(cat.child_count || 0) > 0;
@@ -8072,7 +9823,10 @@ $currentUserJson = json_encode([
             if (res.success) { toast('分类已删除'); renderView(); } else toast(res.message, 'error');
         }
 
-        function closeCategoryModal() { document.getElementById('categoryModal').classList.remove('show'); }
+        function closeCategoryModal() {
+            document.getElementById('categoryModal').classList.remove('show');
+            hideEmojiPickerMenus();
+        }
 
         // ============================================================
         // 📍 位置管理
@@ -8103,7 +9857,7 @@ $currentUserJson = json_encode([
         <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4" style="position:relative;z-index:1;">
             <div class="glass glass-hover rounded-2xl p-5 anim-up" style="animation-delay:0ms">
                 <div class="flex items-center gap-3 mb-3">
-                    <div class="w-10 h-10 rounded-xl bg-slate-500/10 flex items-center justify-center"><i class="ri-map-pin-2-line text-slate-400 text-xl"></i></div>
+                    <div class="w-10 h-10 rounded-xl bg-slate-500/10 flex items-center justify-center"><span class="text-2xl leading-none">📍</span></div>
                     <div>
                         <h3 class="font-semibold text-white">未设定</h3>
                         <p class="text-xs text-slate-500">${unsetLocationCount} 件物品</p>
@@ -8118,7 +9872,7 @@ $currentUserJson = json_encode([
             ${sortedLocs.map((loc, i) => `
                 <div class="glass glass-hover rounded-2xl p-5 anim-up" style="animation-delay:${(i + 1) * 40}ms">
                     <div class="flex items-center gap-3 mb-3">
-                        <div class="w-10 h-10 rounded-xl bg-amber-500/10 flex items-center justify-center"><i class="ri-map-pin-2-fill text-amber-400 text-xl"></i></div>
+                        <div class="w-10 h-10 rounded-xl bg-amber-500/10 flex items-center justify-center"><span class="text-2xl leading-none">${esc(normalizeEmojiValue(loc.icon, '📍'))}</span></div>
                         <div class="min-w-0 flex-1 h-10 flex flex-col justify-center">
                             <div class="flex items-center gap-2 min-w-0 leading-5">
                                 <h3 class="font-semibold text-white truncate max-w-[45%]">${esc(loc.name)}</h3>
@@ -8155,6 +9909,7 @@ $currentUserJson = json_encode([
             document.getElementById('locModalTitle').textContent = '添加位置';
             document.getElementById('locId').value = '';
             document.getElementById('locName').value = '';
+            setEmojiPickerValue('locEmojiPicker', 'locIcon', '📍', '📍');
             document.getElementById('locDesc').value = '';
             document.getElementById('locationModal').classList.add('show');
         }
@@ -8165,6 +9920,7 @@ $currentUserJson = json_encode([
             document.getElementById('locModalTitle').textContent = '编辑位置';
             document.getElementById('locId').value = loc.id;
             document.getElementById('locName').value = loc.name;
+            setEmojiPickerValue('locEmojiPicker', 'locIcon', loc.icon, '📍');
             document.getElementById('locDesc').value = loc.description || '';
             document.getElementById('locationModal').classList.add('show');
         }
@@ -8172,7 +9928,12 @@ $currentUserJson = json_encode([
         async function saveLocation(e) {
             e.preventDefault();
             const id = document.getElementById('locId').value;
-            const data = { id: id ? +id : undefined, name: document.getElementById('locName').value.trim(), description: document.getElementById('locDesc').value.trim() };
+            const data = {
+                id: id ? +id : undefined,
+                name: document.getElementById('locName').value.trim(),
+                icon: document.getElementById('locIcon').value.trim() || '📍',
+                description: document.getElementById('locDesc').value.trim()
+            };
             if (!data.name) { toast('请输入位置名称', 'error'); return false; }
             const endpoint = id ? 'locations/update' : 'locations';
             const res = await apiPost(endpoint, data);
@@ -8186,7 +9947,10 @@ $currentUserJson = json_encode([
             if (res.success) { toast('位置已删除'); renderView(); } else toast(res.message, 'error');
         }
 
-        function closeLocationModal() { document.getElementById('locationModal').classList.remove('show'); }
+        function closeLocationModal() {
+            document.getElementById('locationModal').classList.remove('show');
+            hideEmojiPickerMenus();
+        }
 
         // ============================================================
         // 🔄 数据管理
@@ -8957,6 +10721,36 @@ $currentUserJson = json_encode([
         // ---------- 更新记录数据 ----------
         const CHANGELOG = [
             {
+                version: 'v1.5.2', date: '2026-02-19', title: '账号体验升级：注册双态提示 + 自定义验证问题 + Demo 覆盖增强',
+                changes: [
+                    '注册页新增“开放注册/暂未开放”双态提示，登录页与注册页提示语分开显示，信息更清晰',
+                    '平台关闭注册时，仍保留“注册”入口，但创建账号按钮会禁用并显示关闭说明',
+                    '注册关闭时不再展示用户名、密码等注册输入框，避免无效填写',
+                    '注册验证问题新增“自定义问题”，可自行填写问题与答案，找回密码时可直接显示该问题',
+                    '用户管理卡片新增每位成员的操作日志条数，便于管理员快速判断活跃度',
+                    'Demo 账号升级为自定义验证问题样例，便于演示注册与找回密码的新流程',
+                    'Demo 数据补充操作日志样例，首次进入即可覆盖日志筛选与日志查看场景',
+                    '数据导出版本号同步升级为 v1.5.2'
+                ]
+            },
+            {
+                version: 'v1.5.1', date: '2026-02-18', title: '分类与位置体验升级：二级分类联动 + Emoji 图标分组 + 移动端优化',
+                changes: [
+                    '新增默认一级分类“食物”，并补齐常用一级分类的预设二级分类，开箱即可直接使用',
+                    '二级分类升级为独立物品属性，在“编辑物品”和“已购买入库”流程中都可填写',
+                    '二级分类与一级分类联动，只显示当前一级分类下的可选项，减少误选',
+                    '分类管理升级为一对多可视化视图，可直接查看一级分类与其二级分类关系',
+                    '分类图标改为可展开的分组 Emoji 选择面板，图标选择更直观',
+                    '位置图标统一改为 Emoji 展示，列表、筛选和编辑流程保持一致',
+                    '位置编辑弹窗新增分组 Emoji 选择能力，与分类编辑体验统一',
+                    '公共频道“加入购物清单”流程优化，加入动作更稳定，备注文案更清晰（如“1件”）',
+                    '公共频道权限体验优化：可清楚区分“仅发布者可编辑”与“其他用户可查看/评论”',
+                    '展示模式（Demo）数据升级，覆盖二级分类、共享权限差异、评论互动与加入购物清单场景',
+                    '修复展示数据串入正式账号公共频道的问题，演示与正式数据边界更清晰',
+                    '移动端体验优化：日期输入框尺寸统一，分类管理与物品管理关键操作按钮改为纵向排布'
+                ]
+            },
+            {
                 version: 'v1.5.0', date: '2026-02-16', title: '公共频道升级：发布者编辑 + 推荐理由 + 评论协作',
                 changes: [
                     '新增公共频道编辑能力：共享物品卡片支持“编辑”，仅发布者可修改名称、分类、购入价格、购入渠道与推荐理由',
@@ -9131,6 +10925,213 @@ $currentUserJson = json_encode([
     `;
         }
 
+        async function renderPlatformSettings(container) {
+            if (!CURRENT_USER || !CURRENT_USER.is_admin) {
+                container.innerHTML = '<div class="glass rounded-2xl p-8 text-center text-slate-400">仅管理员可访问平台设置</div>';
+                return;
+            }
+            const res = await api('platform-settings');
+            if (!res || !res.success) {
+                container.innerHTML = `<div class="glass rounded-2xl p-8 text-center text-red-400">${esc(res?.message || '平台设置加载失败')}</div>`;
+                return;
+            }
+            const allowRegistration = !!(res.data && res.data.allow_registration);
+            container.innerHTML = `
+        <div class="max-w-2xl mx-auto space-y-6">
+            <div class="glass rounded-2xl p-6 anim-up">
+                <div class="flex items-center gap-3 mb-5">
+                    <div class="w-10 h-10 rounded-xl bg-cyan-500/10 flex items-center justify-center"><i class="ri-global-line text-xl text-cyan-400"></i></div>
+                    <div><h3 class="font-semibold text-white">账号注册设置</h3><p class="text-xs text-slate-500">控制平台是否允许新用户自行注册</p></div>
+                </div>
+                <label class="flex items-center justify-between gap-4 p-4 rounded-xl bg-white/[0.03] border border-white/[0.06]">
+                    <div>
+                        <p class="text-sm text-white">开放注册</p>
+                        <p class="text-xs text-slate-500">关闭后，仅管理员预置账号可登录平台</p>
+                    </div>
+                    <input type="checkbox" id="platformAllowRegistration" class="w-5 h-5 accent-sky-500" ${allowRegistration ? 'checked' : ''}>
+                </label>
+                <button onclick="savePlatformSettings()" class="btn btn-primary w-full mt-5"><i class="ri-save-line"></i>保存平台设置</button>
+            </div>
+        </div>
+    `;
+        }
+
+        async function savePlatformSettings() {
+            if (!CURRENT_USER || !CURRENT_USER.is_admin) {
+                toast('仅管理员可操作', 'error');
+                return;
+            }
+            const allow = document.getElementById('platformAllowRegistration')?.checked ? 1 : 0;
+            const res = await apiPost('platform-settings', { allow_registration: allow });
+            if (!res || !res.success) {
+                toast(res?.message || '保存失败', 'error');
+                return;
+            }
+            toast('平台设置已保存');
+        }
+
+        // ---------- 操作日志 ----------
+        async function renderOperationLogs(container) {
+            const isAdmin = !!(CURRENT_USER && CURRENT_USER.is_admin);
+            let query = 'operation-logs&page=1&limit=30';
+            if (isAdmin) {
+                const f = App.operationLogsFilters || { keyword: '', actorUserId: 0, sort: 'time_desc' };
+                const params = new URLSearchParams();
+                params.set('page', '1');
+                params.set('limit', '10000');
+                params.set('sort', String(f.sort || 'time_desc'));
+                if (String(f.keyword || '').trim() !== '') {
+                    params.set('keyword', String(f.keyword || '').trim());
+                }
+                if (Number(f.actorUserId || 0) > 0) {
+                    params.set('actor_user_id', String(Number(f.actorUserId || 0)));
+                }
+                query = 'operation-logs&' + params.toString();
+            }
+            const res = await api(query);
+            if (!res || !res.success) {
+                container.innerHTML = `<div class="glass rounded-2xl p-8 text-center text-red-400">${esc(res?.message || '日志加载失败')}</div>`;
+                return;
+            }
+            const rows = Array.isArray(res.data) ? res.data : [];
+            const scope = String(res.scope || (isAdmin ? 'admin' : 'user'));
+            if (scope === 'admin') {
+                const f = App.operationLogsFilters || { keyword: '', actorUserId: 0, sort: 'time_desc' };
+                const members = Array.isArray(res.members) ? res.members : [];
+
+                container.innerHTML = `
+        <div class="max-w-5xl mx-auto space-y-6">
+            <div class="glass rounded-2xl p-6 anim-up">
+                <div class="flex items-center justify-between gap-3 mb-4">
+                    <div class="flex items-center gap-3">
+                        <div class="w-10 h-10 rounded-xl bg-cyan-500/10 flex items-center justify-center"><i class="ri-file-list-3-line text-xl text-cyan-400"></i></div>
+                        <div>
+                            <h3 class="font-semibold text-white">操作日志（管理员汇总）</h3>
+                            <p class="text-xs text-slate-500">共 ${Number(res.total || rows.length)} 条日志，可按成员/关键词过滤并排序</p>
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <button onclick="renderView()" class="btn btn-ghost btn-sm"><i class="ri-refresh-line"></i>刷新</button>
+                        <button onclick="clearOperationLogs()" class="btn btn-danger btn-sm"><i class="ri-delete-bin-line"></i>清空汇总日志</button>
+                    </div>
+                </div>
+                <div class="grid grid-cols-1 md:grid-cols-4 gap-3 mb-4">
+                    <input id="opLogKeyword" class="input md:col-span-2" placeholder="关键词（成员/动作/详情）" value="${esc(String(f.keyword || ''))}">
+                    <select id="opLogActor" class="input">
+                        <option value="0">全部成员</option>
+                        ${members.map(m => {
+                            const uid = Number(m.id || 0);
+                            const display = String(m.display_name || m.username || ('用户#' + uid));
+                            const role = String(m.role || 'user') === 'admin' ? '管理员' : '普通用户';
+                            return `<option value="${uid}" ${Number(f.actorUserId || 0) === uid ? 'selected' : ''}>${esc(display)}（${esc(role)}）</option>`;
+                        }).join('')}
+                    </select>
+                    <select id="opLogSort" class="input">
+                        <option value="time_desc" ${String(f.sort || 'time_desc') === 'time_desc' ? 'selected' : ''}>时间：新→旧</option>
+                        <option value="time_asc" ${String(f.sort || '') === 'time_asc' ? 'selected' : ''}>时间：旧→新</option>
+                        <option value="user_asc" ${String(f.sort || '') === 'user_asc' ? 'selected' : ''}>成员：A→Z</option>
+                        <option value="user_desc" ${String(f.sort || '') === 'user_desc' ? 'selected' : ''}>成员：Z→A</option>
+                        <option value="action_asc" ${String(f.sort || '') === 'action_asc' ? 'selected' : ''}>动作：A→Z</option>
+                        <option value="action_desc" ${String(f.sort || '') === 'action_desc' ? 'selected' : ''}>动作：Z→A</option>
+                    </select>
+                </div>
+                <div class="flex items-center gap-2 mb-4">
+                    <button onclick="applyOperationLogsFilters()" class="btn btn-primary btn-sm"><i class="ri-filter-3-line"></i>应用过滤</button>
+                    <button onclick="resetOperationLogsFilters()" class="btn btn-ghost btn-sm"><i class="ri-close-line"></i>重置</button>
+                </div>
+                <div class="space-y-2">
+                    ${rows.map(log => {
+                        const actorDisplay = String(log.actor_display_name || log.actor_username || (`用户#${Number(log.actor_user_id || 0)}`));
+                        const actorRole = String(log.actor_role || 'user') === 'admin' ? '管理员' : '普通用户';
+                        return `
+                        <div class="rounded-xl border border-white/5 bg-white/[0.02] p-3">
+                            <div class="flex items-start justify-between gap-3">
+                                <div class="min-w-0">
+                                    <p class="text-sm text-white">${esc(log.action_label || '操作')}</p>
+                                    <p class="text-[11px] text-slate-500 mt-0.5">@${esc(actorDisplay)} · ${esc(actorRole)}</p>
+                                    ${log.details ? `<p class="text-xs text-slate-400 mt-1 break-all">${esc(log.details)}</p>` : ''}
+                                </div>
+                                <div class="text-right flex-shrink-0">
+                                    <p class="text-[11px] text-slate-500">${esc(formatDateTimeText(log.created_at, ''))}</p>
+                                    <p class="text-[10px] text-slate-600 mt-0.5 font-mono">${esc((log.method || '') + ' ' + (log.api || ''))}</p>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                    }).join('')}
+                    ${rows.length === 0 ? '<div class="text-center text-slate-500 text-sm py-10">暂无汇总日志</div>' : ''}
+                </div>
+            </div>
+        </div>`;
+                return;
+            }
+
+            container.innerHTML = `
+        <div class="max-w-3xl mx-auto space-y-6">
+            <div class="glass rounded-2xl p-6 anim-up">
+                <div class="flex items-center justify-between gap-3 mb-4">
+                    <div class="flex items-center gap-3">
+                        <div class="w-10 h-10 rounded-xl bg-cyan-500/10 flex items-center justify-center"><i class="ri-file-list-3-line text-xl text-cyan-400"></i></div>
+                        <div>
+                            <h3 class="font-semibold text-white">操作日志</h3>
+                            <p class="text-xs text-slate-500">仅显示当前账号最近 30 条操作记录（当前返回 ${rows.length} 条）</p>
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <button onclick="renderView()" class="btn btn-ghost btn-sm"><i class="ri-refresh-line"></i>刷新</button>
+                    </div>
+                </div>
+                <div class="space-y-2">
+                    ${rows.map(log => `
+                        <div class="rounded-xl border border-white/5 bg-white/[0.02] p-3">
+                            <div class="flex items-start justify-between gap-3">
+                                <div class="min-w-0">
+                                    <p class="text-sm text-white">${esc(log.action_label || '操作')}</p>
+                                    ${log.details ? `<p class="text-xs text-slate-400 mt-1 break-all">${esc(log.details)}</p>` : ''}
+                                </div>
+                                <div class="text-right flex-shrink-0">
+                                    <p class="text-[11px] text-slate-500">${esc(formatDateTimeText(log.created_at, ''))}</p>
+                                </div>
+                            </div>
+                        </div>
+                    `).join('')}
+                    ${rows.length === 0 ? '<div class="text-center text-slate-500 text-sm py-10">暂无操作日志</div>' : ''}
+                </div>
+            </div>
+        </div>`;
+        }
+
+        function applyOperationLogsFilters() {
+            if (!(CURRENT_USER && CURRENT_USER.is_admin)) return;
+            App.operationLogsFilters = {
+                keyword: String(document.getElementById('opLogKeyword')?.value || '').trim(),
+                actorUserId: Number(document.getElementById('opLogActor')?.value || 0),
+                sort: String(document.getElementById('opLogSort')?.value || 'time_desc')
+            };
+            renderView();
+        }
+
+        function resetOperationLogsFilters() {
+            if (!(CURRENT_USER && CURRENT_USER.is_admin)) return;
+            App.operationLogsFilters = { keyword: '', actorUserId: 0, sort: 'time_desc' };
+            renderView();
+        }
+
+        async function clearOperationLogs() {
+            if (!(CURRENT_USER && CURRENT_USER.is_admin)) {
+                toast('仅管理员可清空汇总日志', 'error');
+                return;
+            }
+            if (!confirm('确定清空管理员汇总日志吗？此操作不会影响各成员个人日志。')) return;
+            const res = await apiPost('operation-logs/clear', {});
+            if (!res || !res.success) {
+                toast(res?.message || '清空失败', 'error');
+                return;
+            }
+            toast('管理员汇总日志已清空');
+            renderView();
+        }
+
         // ---------- 更新记录页面 ----------
         function renderChangelog(container) {
             container.innerHTML = `
@@ -9159,6 +11160,7 @@ $currentUserJson = json_encode([
         }
 
         function applySettings() {
+            const prev = { ...App.sortSettings };
             const s = {
                 dashboard_categories: document.getElementById('set_dashboard_categories').value,
                 items_default: document.getElementById('set_items_default').value,
@@ -9169,6 +11171,8 @@ $currentUserJson = json_encode([
             // 同步物品默认排序
             const [sort, order] = s.items_default.split(':');
             App.itemsSort = sort; App.itemsOrder = order;
+            const detail = `仪表盘分类排序: ${prev.dashboard_categories} -> ${s.dashboard_categories}；物品默认排序: ${prev.items_default} -> ${s.items_default}；分类列表排序: ${prev.categories_list} -> ${s.categories_list}；位置列表排序: ${prev.locations_list} -> ${s.locations_list}`;
+            logSettingEvent('settings.sort', detail);
             toast('设置已保存');
         }
 
@@ -9395,6 +11399,19 @@ $currentUserJson = json_encode([
             renderView();
         }
 
+        function openUserOperationLogs(userId, username = '') {
+            if (!(CURRENT_USER && CURRENT_USER.is_admin)) return;
+            App.operationLogsFilters = {
+                keyword: '',
+                actorUserId: Number(userId || 0),
+                sort: 'time_desc'
+            };
+            switchView('operation-logs');
+            if (username) {
+                toast(`已切换到 ${username} 的日志`, 'success', { duration: 1600 });
+            }
+        }
+
         async function renderUserManagement(container) {
             if (!CURRENT_USER || !CURRENT_USER.is_admin) {
                 container.innerHTML = '<div class="glass rounded-2xl p-8 text-center text-slate-400">仅管理员可访问用户管理</div>';
@@ -9431,10 +11448,14 @@ $currentUserJson = json_encode([
                         <div class="space-y-1.5 text-xs text-slate-400 mb-4">
                             <p><i class="ri-archive-line mr-1 text-sky-400"></i>物品种类：${Number(u.item_kinds || 0)} 种</p>
                             <p><i class="ri-stack-line mr-1 text-violet-400"></i>物品件数：${Number(u.item_qty || 0)} 件</p>
+                            <p><i class="ri-file-list-3-line mr-1 text-emerald-400"></i>操作日志：${Number(u.operation_log_count || 0)} 条</p>
                             <p><i class="ri-time-line mr-1 text-amber-400"></i>最近登录：${esc(formatDateTimeText(u.last_login_at, '从未登录'))}</p>
                             <p><i class="ri-edit-2-line mr-1 text-slate-500"></i>最近物品变更：${esc(formatDateTimeText(u.last_item_at, '暂无记录'))}</p>
                         </div>
                         <div class="flex items-center justify-end gap-2">
+                            <button onclick='openUserOperationLogs(${Number(u.id || 0)}, ${JSON.stringify(String(u.username || ""))})' class="btn btn-ghost btn-sm text-emerald-300 border-emerald-400/30 hover:border-emerald-300/50">
+                                <i class="ri-file-list-3-line"></i>查看日志
+                            </button>
                             <button onclick='adminResetUserPassword(${Number(u.id || 0)}, ${JSON.stringify(String(u.username || ""))})' class="btn btn-ghost btn-sm text-cyan-300 border-cyan-400/30 hover:border-cyan-300/50">
                                 <i class="ri-lock-password-line"></i>重置密码
                             </button>
@@ -9602,6 +11623,7 @@ $currentUserJson = json_encode([
         // ============================================================
         initTheme();
         setupDateInputPlaceholders();
+        initFormEmojiPickers();
         // 设置版本号
         document.getElementById('appVersion').textContent = APP_VERSION;
         // 应用默认排序设置

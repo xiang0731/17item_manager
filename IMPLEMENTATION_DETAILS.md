@@ -2,7 +2,7 @@
 
 > 目标：将实现说明拆分为数据库层、API 层、UI 层，方便按职责快速定位与修改。
 >
-> 行号基于当前版本：`index.php` 约 8589 行，`README.md` 约 228 行。后续行号漂移时请用本文提供的命令重新定位。
+> 行号基于当前版本：`index.php` 约 11145 行，`README.md` 约 279 行。后续行号漂移时请用本文提供的命令重新定位。
 
 ## 目录
 
@@ -51,6 +51,12 @@ rg -n "getAuthDB|auth/init|auth/login|auth/demo-login|auth/users|auth/admin-rese
 
 # 公共频道（v1.5）
 rg -n "public-channel|public_shared_items|public_shared_comments|recommend_reason|comment-delete" index.php
+
+# v1.5.1 分类与 Emoji 图标
+rg -n "subcategory|parent_id|category-mindmap|catEmojiPicker|locEmojiPicker|EMOJI_GROUPS|getLocationOptionLabel" index.php
+
+# v1.5.2 注册与账号体验
+rg -n "question_custom|security_question_label|registerClosedPanel|updateAuthHint|allow_public_registration|operation_log_count" index.php
 
 # 日期占位相关
 rg -n "DATE_PLACEHOLDER_TEXT|data-date-placeholder|refreshDateInputPlaceholderDisplay" index.php
@@ -490,13 +496,33 @@ php -l index.php
 - `index.php:3928`：分类统计单位“件”
 - `index.php:3948`：状态统计单位“件”
 
+### 4.7 v1.5.1：二级分类联动 + 分类树视图 + 分类/位置 Emoji 选择器
+
+- 代码位置
+- `index.php`：`const EMOJI_GROUPS = [...]`（分组 Emoji 数据源）
+- `index.php`：`renderEmojiPicker / mountEmojiPicker / setEmojiPickerValue`（分类与位置通用 Emoji 选择器）
+- `index.php`：`renderCategories`（一级 -> 二级的一对多可视化）
+- `index.php`：`refreshItemSubcategorySelect`（二级分类仅展示当前一级分类可选项）
+- `index.php`：`case 'locations'`（位置图标 `icon` 的读写）
+- `index.php`：`initSchema` 与 locations 迁移（位置 icon 字段兼容）
+
+### 4.8 v1.5.2：注册双态提示 + 自定义验证问题 + 用户日志计数
+
+- 代码位置
+- `index.php`：`auth/register`（支持 `question_custom` 与 `security_question_label` 存储）
+- `index.php`：`auth/get-reset-question`（优先回显用户自定义验证问题）
+- `index.php`：登录页 `switchAuthTab / updateAuthHint / registerClosedPanel`（注册开放/关闭双态界面）
+- `index.php`：`auth/users` 与 `renderUserManagement`（用户卡片展示操作日志条数）
+- `index.php`：`auth/demo-login`（Demo 账号预置自定义验证问题）
+- `index.php`：`loadDemoDataIntoDb`（补充操作日志样例，便于演示日志能力）
+
 ---
 
 ## <a id="sec-release"></a>发布与文档同步
 
 - 页面内置更新记录：`index.php` 中 `const CHANGELOG = [...]`
 - 当前版本号来源：`index.php` 中 `const APP_VERSION = CHANGELOG[0].version`
-- README 版本记录：`README.md` 的“更新记录”章节（当前置顶 `v1.5.0`）
+- README 版本记录：`README.md` 的“更新记录”章节（当前置顶 `v1.5.2`）
 - README 功能总览：`README.md` 的“功能概览”章节（含公共频道）
 
 发布新功能建议同步顺序：
