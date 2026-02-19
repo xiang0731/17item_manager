@@ -6362,6 +6362,12 @@ $currentUserJson = json_encode([
             border-color: rgba(239, 68, 68, 0.36);
         }
 
+        .dashboard-reminder-grid {
+            display: grid;
+            gap: 0.75rem;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        }
+
         /* 仪表盘提醒卡片（浅色模式统一优化） */
         body.light .expiry-remind-item,
         body.light .reminder-remind-item {
@@ -8000,7 +8006,7 @@ $currentUserJson = json_encode([
                 <span class="text-xs text-slate-500">${expiringItems.length} 件物品设有过期日期</span>
             </div>
             ${expiringItems.length > 0 ? `
-            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
+            <div class="dashboard-reminder-grid">
                 ${expiringItems.map(item => {
                 const days = daysUntilExpiry(item.expiry_date);
                 const urgency = days < 0 ? 'expired' : days <= 7 ? 'urgent' : days <= 30 ? 'warning' : 'normal';
@@ -8033,7 +8039,7 @@ $currentUserJson = json_encode([
                 <span class="text-xs text-slate-500">过期 ${memoExpiredCount} 条 · 循环 ${memoCycleCount} 条 · 购物 ${memoShoppingCount} 条</span>
             </div>
             ${memoReminderItems.length > 0 ? `
-            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
+            <div class="dashboard-reminder-grid">
                 ${memoReminderItems.map(item => {
                 const dueDate = item._dueDate;
                 const days = daysUntilReminder(dueDate);
