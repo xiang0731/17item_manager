@@ -668,6 +668,138 @@ function logAdminOperation($authDb, $actorUser, $actionKey, $actionLabel, $detai
     }
 }
 
+function textContains($haystack, $needle)
+{
+    $h = strval($haystack);
+    $n = strval($needle);
+    if ($n === '') {
+        return true;
+    }
+    if (function_exists('mb_strpos')) {
+        return mb_strpos($h, $n, 0, 'UTF-8') !== false;
+    }
+    return strpos($h, $n) !== false;
+}
+
+function normalizeUserSortSettingLogDetails($details)
+{
+    $raw = trim((string) $details);
+    if ($raw === '') {
+        return '';
+    }
+    $labelToField = [
+        '仪表盘分类排序' => 'dashboard_categories',
+        '仪表盘分类统计排序' => 'dashboard_categories',
+        '物品默认排序' => 'items_default',
+        '物品管理默认排序' => 'items_default',
+        '分类列表排序' => 'categories_list',
+        '分类管理列表排序' => 'categories_list',
+        '位置列表排序' => 'locations_list',
+        '位置管理列表排序' => 'locations_list',
+    ];
+    $fieldDisplayLabels = [
+        'dashboard_categories' => '仪表盘分类排序',
+        'items_default' => '物品默认排序',
+        'categories_list' => '分类列表排序',
+        'locations_list' => '位置列表排序',
+    ];
+    $valueLabelMaps = [
+        'dashboard_categories' => [
+            'count_desc' => '按物品种类数 多→少',
+            'total_qty_desc' => '按物品总件数 多→少',
+            'name_asc' => '按名称首字母 A→Z',
+        ],
+        'items_default' => [
+            'updated_at:DESC' => '最近更新',
+            'created_at:DESC' => '最近添加',
+            'name:ASC' => '名称 A→Z',
+            'purchase_price:DESC' => '价格 高→低',
+            'quantity:DESC' => '数量 多→少',
+        ],
+        'categories_list' => [
+            'custom' => '系统默认顺序',
+            'count_desc' => '按物品数量 多→少',
+            'name_asc' => '按名称首字母 A→Z',
+        ],
+        'locations_list' => [
+            'custom' => '系统默认顺序',
+            'count_desc' => '按物品数量 多→少',
+            'name_asc' => '按名称首字母 A→Z',
+        ],
+    ];
+
+    $segments = preg_split('/[；;]/u', $raw);
+    $rows = [];
+    $fallbacks = [];
+    foreach ($segments as $segmentRaw) {
+        $segment = trim((string) $segmentRaw);
+        if ($segment === '') {
+            continue;
+        }
+
+        $label = '';
+        $payload = $segment;
+        if (preg_match('/^([^:：]+)\s*[：:]\s*(.+)$/u', $segment, $matches)) {
+            $label = trim((string) $matches[1]);
+            $payload = trim((string) $matches[2]);
+        }
+
+        if (preg_match('/^(.+?)\s*(?:->|→)\s*(.+)$/u', $payload, $arrowMatches)) {
+            $beforeRaw = trim((string) $arrowMatches[1]);
+            $afterRaw = trim((string) $arrowMatches[2]);
+            if ($beforeRaw === $afterRaw) {
+                continue;
+            }
+            $fieldKey = '';
+            if ($label !== '' && isset($labelToField[$label])) {
+                $fieldKey = $labelToField[$label];
+            } else {
+                foreach ($labelToField as $candidateLabel => $candidateField) {
+                    if (textContains($segment, $candidateLabel)) {
+                        $fieldKey = $candidateField;
+                        break;
+                    }
+                }
+            }
+            $displayLabel = $label !== '' ? $label : '排序设置';
+            if ($fieldKey !== '') {
+                $displayLabel = $fieldDisplayLabels[$fieldKey] ?? $displayLabel;
+            }
+            $beforeText = $beforeRaw;
+            $afterText = $afterRaw;
+            if ($fieldKey !== '') {
+                $beforeText = $valueLabelMaps[$fieldKey][$beforeRaw] ?? $beforeRaw;
+                $afterText = $valueLabelMaps[$fieldKey][$afterRaw] ?? $afterRaw;
+            }
+            $rows[$displayLabel] = $displayLabel . '：“' . $beforeText . '” → “' . $afterText . '”';
+            continue;
+        }
+        if (textContains($segment, '调整') && textContains($segment, '排序')) {
+            $fallbacks[$segment] = true;
+        }
+    }
+    if (count($rows) > 0) {
+        return implode('；', array_values($rows));
+    }
+    if (count($fallbacks) > 0) {
+        return implode('；', array_keys($fallbacks));
+    }
+    return '';
+}
+
+function normalizeUserOperationLogDetails($actionKey, $details)
+{
+    $key = trim((string) $actionKey);
+    $detailText = trim((string) $details);
+    if ($detailText === '') {
+        return '';
+    }
+    if ($key === 'settings_sort') {
+        return normalizeUserSortSettingLogDetails($detailText);
+    }
+    return $detailText;
+}
+
 function initSchema($db)
 {
     $db->exec("CREATE TABLE IF NOT EXISTS categories (
@@ -725,6 +857,8 @@ function initSchema($db)
         subcategory_id INTEGER DEFAULT 0,
         location_id INTEGER DEFAULT 0,
         quantity INTEGER DEFAULT 1,
+        remaining_current INTEGER DEFAULT 0,
+        remaining_total INTEGER DEFAULT 0,
         description TEXT DEFAULT '',
         image TEXT DEFAULT '',
         barcode TEXT DEFAULT '',
@@ -806,6 +940,14 @@ function initSchema($db)
     }
     try {
         $db->exec("ALTER TABLE items ADD COLUMN reminder_note TEXT DEFAULT ''");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("ALTER TABLE items ADD COLUMN remaining_current INTEGER DEFAULT 0");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("ALTER TABLE items ADD COLUMN remaining_total INTEGER DEFAULT 0");
     } catch (Exception $e) {
     }
     try {
@@ -931,6 +1073,7 @@ function initSchema($db)
         $db->exec("UPDATE items SET status='active' WHERE status='使用中' OR status IS NULL OR status=''");
         $db->exec("UPDATE items SET status='archived' WHERE status='已归档'");
         $db->exec("UPDATE items SET status='sold' WHERE status='已转卖'");
+        $db->exec("UPDATE items SET status='used_up' WHERE status='已用完'");
     } catch (Exception $e) {
     }
 
@@ -1209,7 +1352,28 @@ function normalizeStatusValue($status)
         return 'archived';
     if ($lv === 'sold' || $v === '已转卖')
         return 'sold';
+    if ($lv === 'used_up' || $v === '已用完')
+        return 'used_up';
     return $v;
+}
+
+function normalizeRemainingPair($currentRaw, $totalRaw)
+{
+    $currentRaw = trim((string) ($currentRaw ?? '0'));
+    $totalRaw = trim((string) ($totalRaw ?? '0'));
+    if ($currentRaw === '')
+        $currentRaw = '0';
+    if ($totalRaw === '')
+        $totalRaw = '0';
+    if (!preg_match('/^\d+$/', $currentRaw) || !preg_match('/^\d+$/', $totalRaw)) {
+        return [0, 0, '余量格式无效：只能输入数字'];
+    }
+    $current = max(0, intval($currentRaw));
+    $total = max(0, intval($totalRaw));
+    if ($current > $total) {
+        return [$current, $total, '余量格式无效：左侧数值不能大于右侧'];
+    }
+    return [$current, $total, null];
 }
 
 function normalizeItemCategorySelection($db, $categoryId, $subcategoryId)
@@ -1466,13 +1630,15 @@ function seedDemoPeerPublicShare($authDb, $viewerUserId)
     $locationId = intval($locStmt->fetchColumn() ?: 0);
 
     $insertPeerItem = $peerDb->prepare("INSERT INTO items
-        (name, category_id, subcategory_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, is_public_shared, public_recommend_reason, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        (name, category_id, subcategory_id, location_id, quantity, remaining_current, remaining_total, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, is_public_shared, public_recommend_reason, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
     $insertPeerItem->execute([
         '降噪蓝牙耳机（演示成员）',
         $categoryId,
         $subcategoryId,
         $locationId,
+        1,
+        1,
         1,
         '公共频道权限演示：由其他成员发布',
         '',
@@ -1574,11 +1740,11 @@ function loadDemoDataIntoDb($db, $options = [])
             ['name' => '机械键盘', 'category' => '电子设备', 'subcategory' => '电脑外设', 'location' => '书桌抽屉', 'quantity' => 1, 'description' => '备用键盘', 'barcode' => 'KB-RED-87', 'purchase_date' => date('Y-m-d', strtotime('-540 days')), 'purchase_price' => 399, 'tags' => '键盘,外设', 'status' => 'archived', 'expiry_date' => '', 'purchase_from' => '拼多多', 'notes' => '近期未使用，已归档保存'],
             ['name' => '二手显示器', 'category' => '电子设备', 'subcategory' => '电脑外设', 'location' => '储物间', 'quantity' => 1, 'description' => '已转卖物品', 'barcode' => 'MON-USED-24', 'purchase_date' => date('Y-m-d', strtotime('-800 days')), 'purchase_price' => 1200, 'tags' => '显示器,转卖', 'status' => 'sold', 'expiry_date' => '', 'purchase_from' => '闲鱼', 'notes' => '已完成交易，保留记录'],
             ['name' => '胶囊咖啡机', 'category' => '厨房用品', 'subcategory' => '厨房小电', 'location' => '厨房', 'quantity' => 1, 'description' => '家用咖啡机', 'barcode' => 'COFFEE-01', 'purchase_date' => date('Y-m-d', strtotime('-320 days')), 'purchase_price' => 899, 'tags' => '咖啡,厨房', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '线下', 'notes' => '常用设备', 'is_public_shared' => 1, 'public_recommend_reason' => '稳定耐用，家用入门友好，维护成本低', 'reminder_date' => date('Y-m-d', strtotime('-28 days')), 'reminder_next_date' => date('Y-m-d', strtotime('+2 days')), 'reminder_cycle_value' => 30, 'reminder_cycle_unit' => 'day', 'reminder_note' => '需要清洗水箱并补充咖啡胶囊'],
-            ['name' => '维生素 D3', 'category' => '其他', 'subcategory' => '日用杂项', 'location' => '厨房', 'quantity' => 2, 'description' => '保健品', 'barcode' => 'HEALTH-D3-01', 'purchase_date' => date('Y-m-d', strtotime('-60 days')), 'purchase_price' => 128, 'tags' => '保健,补剂', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+5 days')), 'purchase_from' => '线下', 'notes' => '还有约一周到期，优先使用'],
-            ['name' => '车载灭火器', 'category' => '工具五金', 'location' => '阳台', 'quantity' => 1, 'description' => '安全应急用品', 'barcode' => 'SAFE-FIRE-01', 'purchase_date' => date('Y-m-d', strtotime('-480 days')), 'purchase_price' => 89, 'tags' => '安全,应急', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('-12 days')), 'purchase_from' => '京东', 'notes' => '已超过有效期，需尽快更换'],
+            ['name' => '维生素 D3', 'category' => '其他', 'subcategory' => '日用杂项', 'location' => '厨房', 'quantity' => 2, 'remaining_current' => 1, 'description' => '保健品', 'barcode' => 'HEALTH-D3-01', 'purchase_date' => date('Y-m-d', strtotime('-60 days')), 'purchase_price' => 128, 'tags' => '保健,补剂', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+5 days')), 'purchase_from' => '线下', 'notes' => '还有约一周到期，优先使用'],
+            ['name' => '车载灭火器', 'category' => '工具五金', 'location' => '阳台', 'quantity' => 1, 'remaining_current' => 0, 'description' => '安全应急用品', 'barcode' => 'SAFE-FIRE-01', 'purchase_date' => date('Y-m-d', strtotime('-480 days')), 'purchase_price' => 89, 'tags' => '安全,应急', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('-12 days')), 'purchase_from' => '京东', 'notes' => '已超过有效期，需尽快更换'],
             ['name' => '沐浴露补充装', 'category' => '其他', 'subcategory' => '日用杂项', 'location' => '储物间', 'quantity' => 3, 'description' => '家庭日用品', 'barcode' => 'HOME-BATH-03', 'purchase_date' => date('Y-m-d', strtotime('-30 days')), 'purchase_price' => 75, 'tags' => '日用品,家居', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+25 days')), 'purchase_from' => '拼多多', 'notes' => '本月内到期，先用旧库存'],
             ['name' => '训练足球', 'category' => '运动户外', 'subcategory' => '球类器材', 'location' => '阳台', 'quantity' => 1, 'description' => '周末运动使用', 'barcode' => 'SPORT-BALL-01', 'purchase_date' => date('Y-m-d', strtotime('-210 days')), 'purchase_price' => 199, 'tags' => '运动,户外', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '淘宝', 'notes' => '周末固定训练用球', 'reminder_date' => date('Y-m-d', strtotime('-13 days')), 'reminder_next_date' => date('Y-m-d', strtotime('+1 day')), 'reminder_cycle_value' => 1, 'reminder_cycle_unit' => 'week', 'reminder_note' => '周末出门前检查气压'],
-            ['name' => '空气净化器滤芯', 'category' => '家具家居', 'subcategory' => '清洁收纳', 'location' => '客厅', 'quantity' => 1, 'description' => '客厅净化器维护项目', 'barcode' => 'AIR-FILTER-01', 'purchase_date' => date('Y-m-d', strtotime('-200 days')), 'purchase_price' => 169, 'tags' => '家居,维护', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '上次维护后需持续追踪更换周期', 'is_public_shared' => 1, 'public_recommend_reason' => '价格和性能平衡，适合作为常备耗材', 'reminder_date' => date('Y-m-d', strtotime('-1 day')), 'reminder_next_date' => $today, 'reminder_cycle_value' => 1, 'reminder_cycle_unit' => 'day', 'reminder_note' => '每日检查滤芯状态并记录'],
+            ['name' => '空气净化器滤芯', 'category' => '家具家居', 'subcategory' => '清洁收纳', 'location' => '客厅', 'quantity' => 1, 'remaining_current' => 0, 'description' => '客厅净化器维护项目', 'barcode' => 'AIR-FILTER-01', 'purchase_date' => date('Y-m-d', strtotime('-200 days')), 'purchase_price' => 169, 'tags' => '家居,维护', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '上次维护后需持续追踪更换周期', 'is_public_shared' => 1, 'public_recommend_reason' => '价格和性能平衡，适合作为常备耗材', 'reminder_date' => date('Y-m-d', strtotime('-1 day')), 'reminder_next_date' => $today, 'reminder_cycle_value' => 1, 'reminder_cycle_unit' => 'day', 'reminder_note' => '每日检查滤芯状态并记录'],
             ['name' => '空气净化器滤芯（原厂）', 'category' => '家具家居', 'subcategory' => '清洁收纳', 'location' => '储物间', 'quantity' => 1, 'description' => '上一批次原厂滤芯采购记录', 'barcode' => 'AIR-FILTER-OEM-02', 'purchase_date' => date('Y-m-d', strtotime('-35 days')), 'purchase_price' => 199, 'tags' => '滤芯,原厂', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '价格较高但安装更稳', 'is_public_shared' => 1, 'public_recommend_reason' => '安装契合度高，追求稳定可优先考虑'],
             ['name' => '空气净化器滤芯（兼容款）', 'category' => '家具家居', 'subcategory' => '清洁收纳', 'location' => '储物间', 'quantity' => 2, 'description' => '兼容款滤芯采购记录', 'barcode' => 'AIR-FILTER-COMP-03', 'purchase_date' => date('Y-m-d', strtotime('-120 days')), 'purchase_price' => 129, 'tags' => '滤芯,兼容', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '拼多多', 'notes' => '单价更低，适合备货'],
             ['name' => '维生素D3滴剂', 'category' => '其他', 'subcategory' => '日用杂项', 'location' => '厨房', 'quantity' => 1, 'description' => '儿童可用滴剂版本', 'barcode' => 'HEALTH-D3-DROP-02', 'purchase_date' => date('Y-m-d', strtotime('-22 days')), 'purchase_price' => 139, 'tags' => '保健,滴剂', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+320 days')), 'purchase_from' => '淘宝', 'notes' => '最近一次补货'],
@@ -1588,15 +1754,18 @@ function loadDemoDataIntoDb($db, $options = [])
             ['name' => '设计模式（第2版）', 'category' => '书籍文档', 'subcategory' => '纸质书', 'location' => '书房', 'quantity' => 1, 'description' => '技术书籍', 'barcode' => 'BOOK-DESIGN-02', 'purchase_date' => date('Y-m-d', strtotime('-700 days')), 'purchase_price' => 88, 'tags' => '书籍,学习', 'status' => 'archived', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '已读完，暂存书架'],
             ['name' => '纪念手表', 'category' => '电子设备', 'location' => '卧室', 'quantity' => 1, 'description' => '礼品来源物品', 'barcode' => 'GIFT-WATCH-01', 'purchase_date' => date('Y-m-d', strtotime('-95 days')), 'purchase_price' => 0, 'tags' => '礼物,收藏', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '礼品', 'notes' => '生日礼物，定期保养'],
             ['name' => '在线课程年度会员', 'category' => '虚拟产品', 'subcategory' => '会员服务', 'location' => '书房', 'quantity' => 1, 'description' => '在线学习会员服务', 'barcode' => 'VIP-COURSE-2026', 'purchase_date' => date('Y-m-d', strtotime('-20 days')), 'purchase_price' => 399, 'tags' => '会员,学习', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+340 days')), 'purchase_from' => '线下', 'notes' => '到期前一个月提醒续费', 'is_public_shared' => 1, 'public_recommend_reason' => '内容更新频率高，长期学习性价比高'],
-            ['name' => '有机燕麦片', 'category' => '食物', 'subcategory' => '主食粮油', 'location' => '厨房', 'quantity' => 2, 'description' => '早餐常备食材', 'barcode' => 'FOOD-OAT-01', 'purchase_date' => date('Y-m-d', strtotime('-18 days')), 'purchase_price' => 45, 'tags' => '食物,早餐', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+120 days')), 'purchase_from' => '京东', 'notes' => '用于覆盖食物分类与二级分类示例'],
+            ['name' => '有机燕麦片', 'category' => '食物', 'subcategory' => '主食粮油', 'location' => '厨房', 'quantity' => 2, 'remaining_current' => 0, 'description' => '早餐常备食材', 'barcode' => 'FOOD-OAT-01', 'purchase_date' => date('Y-m-d', strtotime('-18 days')), 'purchase_price' => 45, 'tags' => '食物,早餐', 'status' => 'used_up', 'expiry_date' => date('Y-m-d', strtotime('+120 days')), 'purchase_from' => '京东', 'notes' => '已用完状态示例，用于覆盖状态筛选与余量提醒联动'],
+            ['name' => '便携湿巾（家庭装）', 'category' => '其他', 'subcategory' => '日用杂项', 'location' => '玄关', 'quantity' => 6, 'remaining_total' => 0, 'description' => '常备清洁用品', 'barcode' => 'HOME-WIPE-06', 'purchase_date' => date('Y-m-d', strtotime('-8 days')), 'purchase_price' => 29, 'tags' => '清洁,日用品', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '线下', 'notes' => '用于演示“清空余量后不触发余量提醒”'],
             ['name' => '未分类收纳箱', 'category' => '', 'location' => '', 'quantity' => 2, 'description' => '暂未归类，等待整理', 'barcode' => 'BOX-UNCAT-01', 'purchase_date' => date('Y-m-d', strtotime('-15 days')), 'purchase_price' => 59, 'tags' => '收纳,未分类', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '线下', 'notes' => '暂放玄关，待统一收纳'],
         ];
 
-        $insertItem = $db->prepare("INSERT INTO items (name, category_id, subcategory_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, is_public_shared, public_recommend_reason, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        $insertItem = $db->prepare("INSERT INTO items (name, category_id, subcategory_id, location_id, quantity, remaining_current, remaining_total, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, is_public_shared, public_recommend_reason, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
         $created = 0;
         $subcategoryBoundCount = 0;
         $sharedCount = 0;
         $publicCommentCreated = 0;
+        $usedUpCount = 0;
+        $remainingUnsetCount = 0;
         if ($authDb && $ownerUserId > 0) {
             removePublicSharedItemsByOwner($authDb, $ownerUserId);
         }
@@ -1610,19 +1779,38 @@ function loadDemoDataIntoDb($db, $options = [])
             }
             $locationId = isset($locMap[$item['location'] ?? '']) ? intval($locMap[$item['location']]) : 0;
             $isPublicShared = intval($item['is_public_shared'] ?? 0) === 1 ? 1 : 0;
+            $itemQty = max(0, intval($item['quantity'] ?? 1));
+            $remainingUnset = array_key_exists('remaining_total', $item) && intval($item['remaining_total']) <= 0;
+            if ($remainingUnset) {
+                $remainingCurrent = 0;
+                $remainingTotal = 0;
+                $remainingUnsetCount++;
+            } else {
+                $remainingCurrent = max(0, intval($item['remaining_current'] ?? $itemQty));
+                if ($remainingCurrent > $itemQty) {
+                    $remainingCurrent = $itemQty;
+                }
+                $remainingTotal = $itemQty;
+            }
+            $itemStatus = normalizeStatusValue($item['status'] ?? 'active');
+            if ($itemStatus === 'used_up') {
+                $usedUpCount++;
+            }
             $insertItem->execute([
                 $item['name'],
                 $categoryId,
                 $subcategoryId,
                 $locationId,
-                max(0, intval($item['quantity'] ?? 1)),
+                $itemQty,
+                $remainingCurrent,
+                $remainingTotal,
                 $item['description'] ?? '',
                 '',
                 $item['barcode'] ?? '',
                 normalizeDateYmd($item['purchase_date'] ?? '') ?? '',
                 floatval($item['purchase_price'] ?? 0),
                 $item['tags'] ?? '',
-                normalizeStatusValue($item['status'] ?? 'active'),
+                $itemStatus,
                 normalizeDateYmd($item['expiry_date'] ?? '') ?? '',
                 $item['purchase_from'] ?? '',
                 $item['notes'] ?? '',
@@ -1684,12 +1872,14 @@ function loadDemoDataIntoDb($db, $options = [])
         }
 
         // 回收站预置记录（用于验证恢复与彻底删除流程）
-        $insertTrash = $db->prepare("INSERT INTO items (name, category_id, subcategory_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        $insertTrash = $db->prepare("INSERT INTO items (name, category_id, subcategory_id, location_id, quantity, remaining_current, remaining_total, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
         $insertTrash->execute([
             '旧数据线（待清理）',
             isset($catIdByName['电子设备']) ? intval($catIdByName['电子设备']) : 0,
             0,
             isset($locMap['电视柜']) ? intval($locMap['电视柜']) : 0,
+            1,
+            0,
             1,
             '已损坏，待确认是否恢复',
             '',
@@ -1790,14 +1980,21 @@ function loadDemoDataIntoDb($db, $options = [])
             $ownerUsername = trim((string) $ownerUsernameStmt->fetchColumn());
             $taskScope = isDemoUsername($ownerUsername) ? 1 : 0;
 
-            $cleanTaskStmt = $authDb->prepare("DELETE FROM message_board_posts WHERE user_id=? AND is_demo_scope=?");
-            $cleanTaskStmt->execute([$ownerUserId, $taskScope]);
+            if ($taskScope === 1) {
+                // Demo 环境每次重建任务清单，避免旧演示任务累积导致结果不稳定
+                $cleanTaskStmt = $authDb->prepare("DELETE FROM message_board_posts WHERE is_demo_scope=1");
+                $cleanTaskStmt->execute();
+            } else {
+                $cleanTaskStmt = $authDb->prepare("DELETE FROM message_board_posts WHERE user_id=? AND is_demo_scope=?");
+                $cleanTaskStmt->execute([$ownerUserId, $taskScope]);
+            }
 
             $demoTasks = [
                 ['content' => '整理厨房抽屉里的即将到期食材', 'is_completed' => 0],
                 ['content' => '给空气净化器滤芯下单备用件', 'is_completed' => 0],
-                ['content' => '核对公共频道共享条目的推荐理由', 'is_completed' => 1],
-                ['content' => '盘点书房未分类物品并补充二级分类', 'is_completed' => 0]
+                ['content' => '核对本周购物清单优先级与预算', 'is_completed' => 1],
+                ['content' => '盘点书房未分类物品并补充二级分类', 'is_completed' => 0],
+                ['content' => '复核备忘提醒范围设置是否符合本周计划', 'is_completed' => 1]
             ];
             $insertTaskStmt = $authDb->prepare("INSERT INTO message_board_posts
                 (user_id, content, is_demo_scope, is_completed, completed_at, created_at, updated_at)
@@ -1826,7 +2023,10 @@ function loadDemoDataIntoDb($db, $options = [])
                 'action_label' => '新增物品',
                 'api' => 'items',
                 'method' => 'POST',
-                'details' => 'Demo 数据初始化：新增物品 ' . $created . ' 件' . ($subcategoryBoundCount > 0 ? ('，其中二级分类 ' . $subcategoryBoundCount . ' 件') : ''),
+                'details' => 'Demo 数据初始化：新增物品 ' . $created . ' 件'
+                    . ($subcategoryBoundCount > 0 ? ('，其中二级分类 ' . $subcategoryBoundCount . ' 件') : '')
+                    . ($usedUpCount > 0 ? ('，已用完状态 ' . $usedUpCount . ' 件') : '')
+                    . ($remainingUnsetCount > 0 ? ('，余量未设置 ' . $remainingUnsetCount . ' 件') : ''),
                 'created_at' => "datetime('now','-120 minutes','localtime')"
             ],
             [
@@ -1846,11 +2046,27 @@ function loadDemoDataIntoDb($db, $options = [])
                 'created_at' => "datetime('now','-80 minutes','localtime')"
             ],
             [
+                'action_key' => 'settings_dashboard_ranges',
+                'action_label' => '更新仪表盘管理设置',
+                'api' => 'client-event/settings.dashboard_ranges',
+                'method' => 'POST',
+                'details' => '仪表盘管理示例：过期提醒默认“未来60天”，备忘提醒默认“未来3天”，支持按需调整范围',
+                'created_at' => "datetime('now','-75 minutes','localtime')"
+            ],
+            [
+                'action_key' => 'settings_reminder_low_stock',
+                'action_label' => '更新余量提醒阈值设置',
+                'api' => 'client-event/settings.reminder_low_stock',
+                'method' => 'POST',
+                'details' => '提醒管理示例：余量提醒阈值设为 20%，已覆盖“余量不足自动提醒”与“余量留空不提醒”场景',
+                'created_at' => "datetime('now','-73 minutes','localtime')"
+            ],
+            [
                 'action_key' => 'message_board',
                 'action_label' => '新增任务',
                 'api' => 'message-board',
                 'method' => 'POST',
-                'details' => '任务清单初始化：新增 ' . $taskSeeded . ' 条（已完成 ' . $taskCompletedSeeded . ' 条）',
+                'details' => '任务清单初始化：新增 ' . $taskSeeded . ' 条（待完成 ' . max(0, $taskSeeded - $taskCompletedSeeded) . ' 条，已完成 ' . $taskCompletedSeeded . ' 条）',
                 'created_at' => "datetime('now','-70 minutes','localtime')"
             ],
             [
@@ -1923,6 +2139,12 @@ function loadDemoDataIntoDb($db, $options = [])
         if ($subcategoryBoundCount > 0) {
             $message .= "，其中 $subcategoryBoundCount 件已绑定二级分类";
         }
+        if ($usedUpCount > 0) {
+            $message .= "，含 $usedUpCount 件“已用完”状态示例";
+        }
+        if ($remainingUnsetCount > 0) {
+            $message .= "，含 $remainingUnsetCount 件“余量未设置”示例";
+        }
         if ($totalSharedCount > 0) {
             $message .= "，含 $totalSharedCount 条公共频道共享物品";
         }
@@ -1948,6 +2170,8 @@ function loadDemoDataIntoDb($db, $options = [])
             'message' => $message,
             'created' => $created,
             'subcategory_bound' => $subcategoryBoundCount,
+            'used_up_seeded' => $usedUpCount,
+            'remaining_unset_seeded' => $remainingUnsetCount,
             'shopping_created' => $shoppingCreated,
             'shared_created' => $totalSharedCount,
             'public_comment_created' => $totalPublicCommentCreated,
@@ -2420,6 +2644,44 @@ if (isset($_GET['api'])) {
         switch ($api) {
             // ---------- 仪表盘 ----------
             case 'dashboard':
+                $parseDashboardRange = function ($key, $defaultValue = null) {
+                    if (!array_key_exists($key, $_GET)) {
+                        return $defaultValue;
+                    }
+                    $raw = trim((string) ($_GET[$key] ?? ''));
+                    if ($raw === '') {
+                        return null;
+                    }
+                    if (!preg_match('/^-?\d+$/', $raw)) {
+                        return $defaultValue;
+                    }
+                    $value = intval($raw);
+                    return $value < 0 ? 0 : $value;
+                };
+                $expiryPastDays = $parseDashboardRange('expiry_past_days', null);
+                $expiryFutureDays = $parseDashboardRange('expiry_future_days', 60);
+                $reminderPastDays = $parseDashboardRange('reminder_past_days', null);
+                $reminderFutureDays = $parseDashboardRange('reminder_future_days', 3);
+                $parseThresholdPercent = function ($key, $defaultValue = 20) {
+                    if (!array_key_exists($key, $_GET)) {
+                        return $defaultValue;
+                    }
+                    $raw = trim((string) ($_GET[$key] ?? ''));
+                    if ($raw === '') {
+                        return $defaultValue;
+                    }
+                    if (!preg_match('/^\d+$/', $raw)) {
+                        return $defaultValue;
+                    }
+                    $value = intval($raw);
+                    if ($value < 0)
+                        $value = 0;
+                    if ($value > 100)
+                        $value = 100;
+                    return $value;
+                };
+                $lowStockThresholdPct = $parseThresholdPercent('low_stock_threshold_pct', 20);
+
                 $totalItems = $db->query("SELECT COALESCE(SUM(quantity),0) FROM items WHERE deleted_at IS NULL")->fetchColumn();
                 $totalKinds = $db->query("SELECT COUNT(*) FROM items WHERE deleted_at IS NULL")->fetchColumn();
                 $totalCategories = $db->query("SELECT COUNT(*) FROM categories")->fetchColumn();
@@ -2429,9 +2691,39 @@ if (isset($_GET['api'])) {
                 $categoryStats = $db->query("SELECT c.name, c.icon, c.color, COUNT(i.id) as count, COALESCE(SUM(i.quantity),0) as total_qty FROM categories c LEFT JOIN items i ON c.id=i.category_id AND i.deleted_at IS NULL AND i.status='active' GROUP BY c.id ORDER BY count DESC")->fetchAll();
                 $statusStats = $db->query("SELECT status, COUNT(*) as count, COALESCE(SUM(quantity),0) as total_qty FROM items WHERE deleted_at IS NULL GROUP BY status ORDER BY total_qty DESC")->fetchAll();
                 $uncategorizedQty = $db->query("SELECT COALESCE(SUM(i.quantity),0) FROM items i LEFT JOIN categories c ON i.category_id=c.id WHERE i.deleted_at IS NULL AND i.status='active' AND (i.category_id=0 OR c.id IS NULL)")->fetchColumn();
-                $expiringItems = $db->query("SELECT i.*, c.name as category_name, c.icon as category_icon, sc.name as subcategory_name, sc.icon as subcategory_icon, l.name as location_name FROM items i LEFT JOIN categories c ON i.category_id=c.id LEFT JOIN categories sc ON i.subcategory_id=sc.id LEFT JOIN locations l ON i.location_id=l.id WHERE i.deleted_at IS NULL AND i.expiry_date != '' AND i.expiry_date IS NOT NULL ORDER BY i.expiry_date ASC LIMIT 10")->fetchAll();
+                $expiryWhere = [
+                    "i.deleted_at IS NULL",
+                    "i.expiry_date != ''",
+                    "i.expiry_date IS NOT NULL"
+                ];
+                if ($expiryPastDays !== null) {
+                    $expiryWhere[] = "i.expiry_date >= date('now','-" . intval($expiryPastDays) . " day','localtime')";
+                }
+                if ($expiryFutureDays !== null) {
+                    $expiryWhere[] = "i.expiry_date <= date('now','+" . intval($expiryFutureDays) . " day','localtime')";
+                }
+                $expiringItemsSql = "SELECT i.*, c.name as category_name, c.icon as category_icon, sc.name as subcategory_name, sc.icon as subcategory_icon, l.name as location_name
+                    FROM items i
+                    LEFT JOIN categories c ON i.category_id=c.id
+                    LEFT JOIN categories sc ON i.subcategory_id=sc.id
+                    LEFT JOIN locations l ON i.location_id=l.id
+                    WHERE " . implode(' AND ', $expiryWhere) . "
+                    ORDER BY i.expiry_date ASC
+                    LIMIT 10";
+                $expiringItems = $db->query($expiringItemsSql)->fetchAll();
                 seedReminderInstancesFromItems($db);
-                    $reminderItems = $db->query("SELECT
+                $reminderWhere = [
+                    "i.deleted_at IS NULL",
+                    "r.due_date != ''",
+                    "r.due_date IS NOT NULL"
+                ];
+                if ($reminderPastDays !== null) {
+                    $reminderWhere[] = "r.due_date >= date('now','-" . intval($reminderPastDays) . " day','localtime')";
+                }
+                if ($reminderFutureDays !== null) {
+                    $reminderWhere[] = "r.due_date <= date('now','+" . intval($reminderFutureDays) . " day','localtime')";
+                }
+                $reminderItemsSql = "SELECT
                         r.id as reminder_instance_id,
                         r.due_date as reminder_due_date,
                         COALESCE(r.is_completed,0) as reminder_completed,
@@ -2447,14 +2739,74 @@ if (isset($_GET['api'])) {
                     LEFT JOIN categories c ON i.category_id=c.id
                     LEFT JOIN categories sc ON i.subcategory_id=sc.id
                     LEFT JOIN locations l ON i.location_id=l.id
-                    WHERE i.deleted_at IS NULL
-                      AND r.due_date != ''
-                      AND r.due_date IS NOT NULL
-                      AND r.due_date >= date('now','-3 day','localtime')
-                      AND r.due_date <= date('now','+3 day','localtime')
+                    WHERE " . implode(' AND ', $reminderWhere) . "
                     ORDER BY r.due_date ASC, r.is_completed ASC, r.id ASC
-                    LIMIT 20")->fetchAll();
-                $shoppingReminderItems = $db->query("SELECT s.*, c.name as category_name, c.icon as category_icon, c.color as category_color FROM shopping_list s LEFT JOIN categories c ON s.category_id=c.id WHERE s.reminder_date != '' AND s.reminder_date IS NOT NULL AND s.reminder_date <= date('now','+3 day','localtime') ORDER BY s.reminder_date ASC LIMIT 10")->fetchAll();
+                    LIMIT 20";
+                $reminderItems = $db->query($reminderItemsSql)->fetchAll();
+                $shoppingReminderWhere = [
+                    "s.reminder_date != ''",
+                    "s.reminder_date IS NOT NULL"
+                ];
+                if ($reminderPastDays !== null) {
+                    $shoppingReminderWhere[] = "s.reminder_date >= date('now','-" . intval($reminderPastDays) . " day','localtime')";
+                }
+                if ($reminderFutureDays !== null) {
+                    $shoppingReminderWhere[] = "s.reminder_date <= date('now','+" . intval($reminderFutureDays) . " day','localtime')";
+                }
+                $shoppingReminderSql = "SELECT s.*, c.name as category_name, c.icon as category_icon, c.color as category_color
+                    FROM shopping_list s
+                    LEFT JOIN categories c ON s.category_id=c.id
+                    WHERE " . implode(' AND ', $shoppingReminderWhere) . "
+                    ORDER BY s.reminder_date ASC
+                    LIMIT 10";
+                $shoppingReminderItems = $db->query($shoppingReminderSql)->fetchAll();
+                $lowStockReminderItems = [];
+                if ($lowStockThresholdPct > 0) {
+                    $stockTotalExpr = "CASE WHEN COALESCE(i.remaining_total,0) > 0 THEN i.remaining_total ELSE i.quantity END";
+                    $stockCurrentExpr = "CASE WHEN COALESCE(i.remaining_total,0) > 0 THEN i.remaining_current ELSE i.quantity END";
+                    $lowStockSql = "SELECT
+                            i.*,
+                            c.name as category_name,
+                            c.icon as category_icon,
+                            sc.name as subcategory_name,
+                            sc.icon as subcategory_icon,
+                            l.name as location_name,
+                            $stockCurrentExpr as stock_current,
+                            $stockTotalExpr as stock_total
+                        FROM items i
+                        LEFT JOIN categories c ON i.category_id=c.id
+                        LEFT JOIN categories sc ON i.subcategory_id=sc.id
+                        LEFT JOIN locations l ON i.location_id=l.id
+                        WHERE i.deleted_at IS NULL
+                          AND i.status IN ('active','used_up')
+                          AND ($stockTotalExpr) > 0
+                          AND ($stockCurrentExpr) >= 0
+                          AND (($stockCurrentExpr) * 100) < (($stockTotalExpr) * ?)
+                        ORDER BY (CAST($stockCurrentExpr AS REAL) / CAST($stockTotalExpr AS REAL)) ASC, i.updated_at DESC
+                        LIMIT 20";
+                    $lowStockStmt = $db->prepare($lowStockSql);
+                    $lowStockStmt->execute([$lowStockThresholdPct]);
+                    $today = date('Y-m-d');
+                    $lowStockRows = $lowStockStmt->fetchAll();
+                    foreach ($lowStockRows as $row) {
+                        $stockTotal = max(0, intval($row['stock_total'] ?? 0));
+                        $stockCurrent = max(0, intval($row['stock_current'] ?? 0));
+                        if ($stockTotal <= 0) {
+                            continue;
+                        }
+                        if ($stockCurrent > $stockTotal) {
+                            $stockCurrent = $stockTotal;
+                        }
+                        $ratioPct = intval(floor(($stockCurrent * 100) / $stockTotal));
+                        $row['stock_total'] = $stockTotal;
+                        $row['stock_current'] = $stockCurrent;
+                        $row['low_stock_ratio_pct'] = $ratioPct;
+                        $row['low_stock_threshold_pct'] = $lowStockThresholdPct;
+                        $row['reminder_due_date'] = $today;
+                        $row['reminder_note'] = '当前余量 ' . $stockCurrent . '/' . $stockTotal . '（' . $ratioPct . '%），低于阈值 ' . $lowStockThresholdPct . '%，建议补货';
+                        $lowStockReminderItems[] = $row;
+                    }
+                }
                 $messageBoardStmt = $authDb->prepare("SELECT
                         m.id,
                         m.user_id,
@@ -2501,7 +2853,7 @@ if (isset($_GET['api'])) {
                         )
                     ];
                 }
-                $result = ['success' => true, 'data' => compact('totalItems', 'totalKinds', 'totalCategories', 'totalLocations', 'totalValue', 'recentItems', 'categoryStats', 'statusStats', 'uncategorizedQty', 'expiringItems', 'reminderItems', 'shoppingReminderItems', 'messageBoardPosts')];
+                $result = ['success' => true, 'data' => compact('totalItems', 'totalKinds', 'totalCategories', 'totalLocations', 'totalValue', 'recentItems', 'categoryStats', 'statusStats', 'uncategorizedQty', 'expiringItems', 'reminderItems', 'shoppingReminderItems', 'lowStockReminderItems', 'lowStockThresholdPct', 'messageBoardPosts')];
                 break;
 
             // ---------- 物品 CRUD ----------
@@ -2542,7 +2894,7 @@ if (isset($_GET['api'])) {
                             OR sc.name LIKE ?
                             OR l.name LIKE ?
                             OR i.status LIKE ?
-                            OR (CASE i.status WHEN 'active' THEN '使用中' WHEN 'archived' THEN '已归档' WHEN 'sold' THEN '已转卖' ELSE i.status END) LIKE ?
+                            OR (CASE i.status WHEN 'active' THEN '使用中' WHEN 'archived' THEN '已归档' WHEN 'sold' THEN '已转卖' WHEN 'used_up' THEN '已用完' ELSE i.status END) LIKE ?
                         )";
                         $s = "%$search%";
                         $params = array_merge($params, [$s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s]);
@@ -2636,18 +2988,32 @@ if (isset($_GET['api'])) {
                     }
                     $reminderNote = trim((string) ($data['reminder_note'] ?? ''));
                     $shareFlag = intval($data['is_public_shared'] ?? 0) === 1 ? 1 : 0;
+                    $itemQty = max(0, intval($data['quantity'] ?? 1));
+                    $remainingFlag = max(0, intval($data['remaining_total'] ?? 0));
+                    if ($remainingFlag <= 0) {
+                        $remainingCurrent = 0;
+                        $remainingTotal = 0;
+                    } else {
+                        [$remainingCurrent, $remainingTotal, $remainingError] = normalizeRemainingPair($data['remaining_current'] ?? 0, $itemQty);
+                        if ($remainingError) {
+                            $result = ['success' => false, 'message' => $remainingError];
+                            break;
+                        }
+                    }
                     [$categoryId, $subcategoryId, $categoryError] = normalizeItemCategorySelection($db, intval($data['category_id'] ?? 0), intval($data['subcategory_id'] ?? 0));
                     if ($categoryError) {
                         $result = ['success' => false, 'message' => $categoryError];
                         break;
                     }
-                    $stmt = $db->prepare("INSERT INTO items (name, category_id, subcategory_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, is_public_shared, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+                    $stmt = $db->prepare("INSERT INTO items (name, category_id, subcategory_id, location_id, quantity, remaining_current, remaining_total, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, is_public_shared, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
                     $stmt->execute([
                         $data['name'],
                         $categoryId,
                         $subcategoryId,
                         intval($data['location_id'] ?? 0),
-                        max(0, intval($data['quantity'] ?? 1)),
+                        $itemQty,
+                        $remainingCurrent,
+                        $remainingTotal,
                         $data['description'] ?? '',
                         $data['image'] ?? '',
                         $data['barcode'] ?? '',
@@ -2669,8 +3035,10 @@ if (isset($_GET['api'])) {
                     syncItemReminderInstances($db, $newItemId, $reminderDate, $reminderNextDate, $reminderValue, $reminderUnit);
                     syncPublicSharedItem($authDb, $db, intval($currentUser['id']), $newItemId, $shareFlag);
                     $itemName = trim((string) ($data['name'] ?? ''));
-                    $itemQty = max(0, intval($data['quantity'] ?? 1));
                     $operationDetails = '物品: ' . $itemName . '（ID:' . $newItemId . '）' . '；件数: ' . $itemQty;
+                    if ($remainingTotal > 0 || $remainingCurrent > 0) {
+                        $operationDetails .= '；余量: ' . $remainingCurrent . '/' . $remainingTotal;
+                    }
                     if ($categoryId > 0) {
                         $catName = trim((string) ($db->query("SELECT name FROM categories WHERE id=" . intval($categoryId) . " LIMIT 1")->fetchColumn() ?: ''));
                         if ($catName !== '') {
@@ -2718,18 +3086,32 @@ if (isset($_GET['api'])) {
                     }
                     $reminderNote = trim((string) ($data['reminder_note'] ?? ''));
                     $shareFlag = intval($data['is_public_shared'] ?? 0) === 1 ? 1 : 0;
+                    $itemQty = max(0, intval($data['quantity'] ?? 1));
+                    $remainingFlag = max(0, intval($data['remaining_total'] ?? 0));
+                    if ($remainingFlag <= 0) {
+                        $remainingCurrent = 0;
+                        $remainingTotal = 0;
+                    } else {
+                        [$remainingCurrent, $remainingTotal, $remainingError] = normalizeRemainingPair($data['remaining_current'] ?? 0, $itemQty);
+                        if ($remainingError) {
+                            $result = ['success' => false, 'message' => $remainingError];
+                            break;
+                        }
+                    }
                     [$categoryId, $subcategoryId, $categoryError] = normalizeItemCategorySelection($db, intval($data['category_id'] ?? 0), intval($data['subcategory_id'] ?? 0));
                     if ($categoryError) {
                         $result = ['success' => false, 'message' => $categoryError];
                         break;
                     }
-                    $stmt = $db->prepare("UPDATE items SET name=?, category_id=?, subcategory_id=?, location_id=?, quantity=?, description=?, image=?, barcode=?, purchase_date=?, purchase_price=?, tags=?, status=?, expiry_date=?, purchase_from=?, notes=?, is_public_shared=?, reminder_date=?, reminder_next_date=?, reminder_cycle_value=?, reminder_cycle_unit=?, reminder_note=?, updated_at=CURRENT_TIMESTAMP WHERE id=?");
+                    $stmt = $db->prepare("UPDATE items SET name=?, category_id=?, subcategory_id=?, location_id=?, quantity=?, remaining_current=?, remaining_total=?, description=?, image=?, barcode=?, purchase_date=?, purchase_price=?, tags=?, status=?, expiry_date=?, purchase_from=?, notes=?, is_public_shared=?, reminder_date=?, reminder_next_date=?, reminder_cycle_value=?, reminder_cycle_unit=?, reminder_note=?, updated_at=CURRENT_TIMESTAMP WHERE id=?");
                     $stmt->execute([
                         $data['name'],
                         $categoryId,
                         $subcategoryId,
                         intval($data['location_id'] ?? 0),
-                        max(0, intval($data['quantity'] ?? 1)),
+                        $itemQty,
+                        $remainingCurrent,
+                        $remainingTotal,
                         $data['description'] ?? '',
                         $data['image'] ?? '',
                         $data['barcode'] ?? '',
@@ -2752,8 +3134,10 @@ if (isset($_GET['api'])) {
                     syncPublicSharedItem($authDb, $db, intval($currentUser['id']), intval($data['id']), $shareFlag);
                     $itemId = intval($data['id']);
                     $itemName = trim((string) ($data['name'] ?? ''));
-                    $itemQty = max(0, intval($data['quantity'] ?? 1));
                     $operationDetails = '物品: ' . $itemName . '（ID:' . $itemId . '）' . '；件数: ' . $itemQty;
+                    if ($remainingTotal > 0 || $remainingCurrent > 0) {
+                        $operationDetails .= '；余量: ' . $remainingCurrent . '/' . $remainingTotal;
+                    }
                     if ($categoryId > 0) {
                         $catName = trim((string) ($db->query("SELECT name FROM categories WHERE id=" . intval($categoryId) . " LIMIT 1")->fetchColumn() ?: ''));
                         if ($catName !== '') {
@@ -3202,6 +3586,8 @@ if (isset($_GET['api'])) {
                     $details = trim((string) ($data['details'] ?? ''));
                     $allowedEvents = [
                         'settings.sort' => ['key' => 'settings_sort', 'label' => '更新排序设置'],
+                        'settings.dashboard_ranges' => ['key' => 'settings_dashboard_ranges', 'label' => '更新仪表盘管理设置'],
+                        'settings.reminder_low_stock' => ['key' => 'settings_reminder_low_stock', 'label' => '更新余量提醒阈值设置'],
                         'settings.item_size' => ['key' => 'settings_item_size', 'label' => '调整物品显示大小'],
                         'settings.item_attrs' => ['key' => 'settings_item_attrs', 'label' => '更新物品属性显示设置'],
                         'settings.statuses' => ['key' => 'settings_statuses', 'label' => '更新状态管理设置'],
@@ -3283,9 +3669,14 @@ if (isset($_GET['api'])) {
                         $countStmt = $db->prepare("SELECT COUNT(*) FROM operation_logs $whereSql");
                         $countStmt->execute($params);
                         $totalAll = intval($countStmt->fetchColumn() ?: 0);
-                        $listStmt = $db->prepare("SELECT id, action_label, details, created_at FROM operation_logs $whereSql ORDER BY id DESC LIMIT 30");
+                        $listStmt = $db->prepare("SELECT id, action_key, action_label, details, created_at FROM operation_logs $whereSql ORDER BY id DESC LIMIT 30");
                         $listStmt->execute($params);
                         $rows = $listStmt->fetchAll();
+                        foreach ($rows as &$row) {
+                            $row['details'] = normalizeUserOperationLogDetails($row['action_key'] ?? '', $row['details'] ?? '');
+                            unset($row['action_key']);
+                        }
+                        unset($row);
                         $result = [
                             'success' => true,
                             'scope' => 'user',
@@ -4647,7 +5038,7 @@ if (isset($_GET['api'])) {
                 $categories = $db->query("SELECT * FROM categories ORDER BY id")->fetchAll();
                 $locations = $db->query("SELECT * FROM locations ORDER BY id")->fetchAll();
                 $shoppingList = $db->query("SELECT s.*, c.name as category_name FROM shopping_list s LEFT JOIN categories c ON s.category_id=c.id ORDER BY s.id")->fetchAll();
-                $result = ['success' => true, 'data' => ['items' => $items, 'categories' => $categories, 'locations' => $locations, 'shopping_list' => $shoppingList, 'exported_at' => date('Y-m-d H:i:s'), 'version' => '1.5.2']];
+                $result = ['success' => true, 'data' => ['items' => $items, 'categories' => $categories, 'locations' => $locations, 'shopping_list' => $shoppingList, 'exported_at' => date('Y-m-d H:i:s'), 'version' => '1.6.1']];
                 break;
 
             // ---------- 数据导入 ----------
@@ -4947,6 +5338,124 @@ if (!$currentAuthUser) {
                 box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.18);
             }
 
+            select.auth-input {
+                -webkit-appearance: none;
+                -moz-appearance: none;
+                appearance: none;
+                background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%2394a3b8' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+                background-repeat: no-repeat;
+                background-size: 12px 12px;
+                background-position: right 10px center;
+                padding-right: 32px;
+            }
+
+            select.auth-input::-ms-expand {
+                display: none;
+            }
+
+            .auth-custom-select {
+                position: relative;
+                width: 100%;
+            }
+
+            .auth-custom-native {
+                position: absolute !important;
+                width: 1px !important;
+                height: 1px !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                border: 0 !important;
+                opacity: 0 !important;
+                pointer-events: none !important;
+                clip: rect(0, 0, 0, 0) !important;
+                clip-path: inset(50%) !important;
+                overflow: hidden !important;
+            }
+
+            .auth-custom-trigger {
+                display: inline-flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 10px;
+                text-align: left;
+                cursor: pointer;
+            }
+
+            .auth-custom-trigger .label {
+                flex: 1;
+                min-width: 0;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+
+            .auth-custom-select.open .auth-custom-trigger .arrow {
+                transform: rotate(180deg);
+                color: #7dd3fc;
+            }
+
+            .auth-custom-trigger .arrow {
+                transition: transform 0.18s ease, color 0.18s ease;
+            }
+
+            .auth-custom-menu {
+                position: absolute;
+                left: 0;
+                top: calc(100% + 6px);
+                width: 100%;
+                max-height: 220px;
+                overflow: auto;
+                padding: 6px;
+                border-radius: 10px;
+                border: 1px solid rgba(148, 163, 184, 0.35);
+                background: rgba(15, 23, 42, 0.96);
+                box-shadow: 0 12px 24px rgba(2, 6, 23, 0.45);
+                z-index: 80;
+            }
+
+            .auth-custom-option {
+                width: 100%;
+                border: 0;
+                border-radius: 8px;
+                background: transparent;
+                color: #cbd5e1;
+                padding: 8px 10px;
+                text-align: left;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                font-size: 13px;
+                cursor: pointer;
+            }
+
+            .auth-custom-option:hover {
+                background: rgba(255, 255, 255, 0.08);
+            }
+
+            .auth-custom-option.active {
+                background: rgba(14, 165, 233, 0.2);
+                color: #7dd3fc;
+            }
+
+            .auth-custom-option .check {
+                opacity: 0;
+            }
+
+            .auth-custom-option.active .check {
+                opacity: 1;
+            }
+
+            .auth-custom-menu.hidden {
+                display: none;
+            }
+
+            @media (max-width: 640px) {
+                .auth-custom-option {
+                    font-size: 14px;
+                    padding: 10px 12px;
+                }
+            }
+
             .auth-btn {
                 width: 100%;
                 border: none;
@@ -5116,6 +5625,136 @@ if (!$currentAuthUser) {
                 default_demo: { username: 'test' }
             };
             let resetQuestionKey = '';
+            const authCustomSelectStates = new Map();
+            let authCustomSelectBound = false;
+
+            function authSelectText(option) {
+                return String(option?.textContent || '').replace(/\s+/g, ' ').trim();
+            }
+
+            function closeAuthCustomSelect(state) {
+                if (!state || !state.open) return;
+                state.open = false;
+                state.wrapper.classList.remove('open');
+                state.menu.classList.add('hidden');
+                state.trigger.setAttribute('aria-expanded', 'false');
+            }
+
+            function closeAllAuthCustomSelects(except = null) {
+                authCustomSelectStates.forEach((state, select) => {
+                    if (except && select === except) return;
+                    closeAuthCustomSelect(state);
+                });
+            }
+
+            function syncAuthCustomSelect(state) {
+                if (!state || !state.select || !state.select.isConnected) return;
+                const select = state.select;
+                const menu = state.menu;
+                menu.innerHTML = '';
+                Array.from(select.options || []).forEach((opt, idx) => {
+                    const btn = document.createElement('button');
+                    btn.type = 'button';
+                    btn.className = `auth-custom-option ${select.selectedIndex === idx ? 'active' : ''}`;
+                    btn.disabled = !!opt.disabled;
+                    btn.innerHTML = `<span class="truncate">${authSelectText(opt) || opt.value || ''}</span><i class="ri-check-line check"></i>`;
+                    btn.addEventListener('click', event => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        if (btn.disabled) return;
+                        const changed = select.selectedIndex !== idx;
+                        select.selectedIndex = idx;
+                        if (changed) {
+                            select.dispatchEvent(new Event('input', { bubbles: true }));
+                            select.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                        syncAuthCustomSelect(state);
+                        closeAuthCustomSelect(state);
+                        state.trigger.focus();
+                    });
+                    menu.appendChild(btn);
+                });
+                const selected = select.options && select.selectedIndex >= 0 ? select.options[select.selectedIndex] : null;
+                state.label.textContent = selected ? authSelectText(selected) : '请选择';
+                state.trigger.disabled = !!select.disabled;
+            }
+
+            function ensureAuthCustomSelect(select) {
+                if (!(select instanceof HTMLSelectElement)) return;
+                if (select.dataset.authCustomReady === '1') {
+                    const existing = authCustomSelectStates.get(select);
+                    if (existing) syncAuthCustomSelect(existing);
+                    return;
+                }
+                const parent = select.parentElement;
+                if (!parent) return;
+                const classes = String(select.className || '').trim() || 'auth-input';
+                const wrapper = document.createElement('div');
+                wrapper.className = 'auth-custom-select';
+                parent.insertBefore(wrapper, select);
+                wrapper.appendChild(select);
+                select.dataset.authCustomReady = '1';
+                select.classList.add('auth-custom-native');
+
+                const trigger = document.createElement('button');
+                trigger.type = 'button';
+                trigger.className = `${classes} auth-custom-trigger`;
+                trigger.innerHTML = `<span class="label"></span><i class="ri-arrow-down-s-line arrow"></i>`;
+                trigger.setAttribute('aria-expanded', 'false');
+                trigger.setAttribute('aria-haspopup', 'listbox');
+
+                const menu = document.createElement('div');
+                menu.className = 'auth-custom-menu hidden';
+
+                wrapper.appendChild(trigger);
+                wrapper.appendChild(menu);
+
+                const state = { select, wrapper, trigger, menu, label: trigger.querySelector('.label'), open: false };
+                authCustomSelectStates.set(select, state);
+
+                trigger.addEventListener('click', event => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    if (select.disabled) return;
+                    if (state.open) {
+                        closeAuthCustomSelect(state);
+                    } else {
+                        closeAllAuthCustomSelects(select);
+                        syncAuthCustomSelect(state);
+                        state.open = true;
+                        wrapper.classList.add('open');
+                        menu.classList.remove('hidden');
+                        trigger.setAttribute('aria-expanded', 'true');
+                    }
+                });
+
+                select.addEventListener('change', () => syncAuthCustomSelect(state));
+                select.addEventListener('input', () => syncAuthCustomSelect(state));
+                syncAuthCustomSelect(state);
+            }
+
+            function initAuthCustomSelects(root = document) {
+                if (!authCustomSelectBound) {
+                    authCustomSelectBound = true;
+                    document.addEventListener('click', event => {
+                        if (!(event.target instanceof Element)) return;
+                        if (!event.target.closest('.auth-custom-select')) {
+                            closeAllAuthCustomSelects();
+                        }
+                    });
+                    document.addEventListener('keydown', event => {
+                        if (event.key === 'Escape') closeAllAuthCustomSelects();
+                    });
+                }
+                root.querySelectorAll('select.auth-input').forEach(select => ensureAuthCustomSelect(select));
+            }
+
+            function syncAuthCustomSelectById(id) {
+                const select = document.getElementById(id);
+                if (!(select instanceof HTMLSelectElement)) return;
+                const state = authCustomSelectStates.get(select);
+                if (state) syncAuthCustomSelect(state);
+            }
 
             function setAuthMessage(msg, isError = false) {
                 const el = document.getElementById('authMessage');
@@ -5150,6 +5789,7 @@ if (!$currentAuthUser) {
                 if (!select) return;
                 const questions = authState.security_questions || {};
                 select.innerHTML = '<option value="">请选择验证问题</option>' + Object.entries(questions).map(([key, label]) => `<option value="${key}">${label}</option>`).join('') + '<option value="__custom__">自定义问题</option>';
+                syncAuthCustomSelectById('registerQuestionKey');
                 toggleCustomQuestionInput();
             }
 
@@ -5307,6 +5947,7 @@ if (!$currentAuthUser) {
 
             (async function initAuthView() {
                 try {
+                    initAuthCustomSelects(document);
                     const init = await authApi('auth/init');
                     if (init && init.success) {
                         authState = init;
@@ -5677,11 +6318,178 @@ $currentUserJson = json_encode([
         }
 
         select.input {
+            -webkit-appearance: none;
+            -moz-appearance: none;
             appearance: none;
             background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%2394a3b8' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
             background-repeat: no-repeat;
+            background-size: 12px 12px;
             background-position: right 12px center;
             padding-right: 32px;
+        }
+
+        select.input::-ms-expand {
+            display: none;
+        }
+
+        /* 自定义下拉（统一替代原生 select） */
+        .custom-select {
+            position: relative;
+            min-width: 0;
+        }
+
+        .custom-select.custom-select-block {
+            display: block;
+            width: 100%;
+        }
+
+        .custom-select.custom-select-inline {
+            display: inline-block;
+            width: auto;
+            max-width: 100%;
+        }
+
+        .custom-select-native {
+            position: absolute !important;
+            width: 1px !important;
+            height: 1px !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            border: 0 !important;
+            opacity: 0 !important;
+            pointer-events: none !important;
+            clip: rect(0, 0, 0, 0) !important;
+            clip-path: inset(50%) !important;
+            overflow: hidden !important;
+        }
+
+        .custom-select-trigger {
+            display: inline-flex;
+            align-items: center;
+            justify-content: space-between;
+            text-align: left;
+            gap: 10px;
+            cursor: pointer;
+        }
+
+        .custom-select-trigger:disabled {
+            opacity: 0.58;
+            cursor: not-allowed;
+        }
+
+        .custom-select-label {
+            display: block;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            flex: 1;
+        }
+
+        .custom-select-arrow {
+            flex-shrink: 0;
+            transition: transform 0.18s ease, color 0.18s ease;
+        }
+
+        .custom-select.is-open .custom-select-arrow {
+            transform: rotate(180deg);
+            color: #38bdf8;
+        }
+
+        .custom-select-menu {
+            position: absolute;
+            left: 0;
+            top: calc(100% + 6px);
+            min-width: 100%;
+            max-width: min(420px, calc(100vw - 24px));
+            max-height: 260px;
+            overflow: auto;
+            -webkit-overflow-scrolling: touch;
+            padding: 6px;
+            border-radius: 12px;
+            border: 1px solid rgba(148, 163, 184, 0.34);
+            background: rgba(15, 23, 42, 0.96);
+            box-shadow: 0 12px 28px rgba(2, 6, 23, 0.52);
+            z-index: 140;
+        }
+
+        .custom-select-menu.custom-select-menu-floating {
+            position: fixed;
+            top: 0;
+            left: 0;
+            z-index: 260;
+        }
+
+        .custom-select.custom-select-inline .custom-select-menu {
+            width: max-content;
+        }
+
+        .custom-select-group+.custom-select-group {
+            margin-top: 6px;
+            padding-top: 6px;
+            border-top: 1px solid rgba(148, 163, 184, 0.2);
+        }
+
+        .custom-select-group-title {
+            padding: 2px 8px 6px;
+            font-size: 11px;
+            letter-spacing: 0.02em;
+            color: #94a3b8;
+        }
+
+        .custom-select-option {
+            width: 100%;
+            border: 0;
+            border-radius: 8px;
+            padding: 8px 10px;
+            background: transparent;
+            color: #cbd5e1;
+            font-size: 13px;
+            text-align: left;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            cursor: pointer;
+            transition: background-color 0.16s ease, color 0.16s ease;
+        }
+
+        .custom-select-option:hover {
+            background: rgba(255, 255, 255, 0.08);
+        }
+
+        .custom-select-option.is-selected {
+            background: rgba(14, 165, 233, 0.22);
+            color: #7dd3fc;
+        }
+
+        .custom-select-option:disabled {
+            opacity: 0.45;
+            cursor: not-allowed;
+        }
+
+        .custom-select-option-check {
+            font-size: 14px;
+            line-height: 1;
+            opacity: 0;
+        }
+
+        .custom-select-option.is-selected .custom-select-option-check {
+            opacity: 1;
+        }
+
+        .custom-select-empty {
+            color: #64748b;
+            font-size: 12px;
+            text-align: center;
+            padding: 12px 10px;
+        }
+
+        @media (max-width: 640px) {
+            .custom-select-option {
+                font-size: 14px;
+                padding: 10px 12px;
+            }
         }
 
         /* 状态图标选择器 */
@@ -5939,7 +6747,7 @@ $currentUserJson = json_encode([
 
         .category-branch-grid {
             display: grid;
-            grid-template-columns: minmax(250px, 310px) 18px minmax(0, 1fr);
+            grid-template-columns: minmax(250px, 310px) minmax(0, 1fr);
             gap: 12px;
             align-items: start;
         }
@@ -5958,13 +6766,7 @@ $currentUserJson = json_encode([
         }
 
         .category-node-root::after {
-            content: '';
-            position: absolute;
-            right: -10px;
-            top: 27px;
-            width: 10px;
-            height: 2px;
-            background: rgba(148, 163, 184, 0.4);
+            display: none;
         }
 
         .category-node-head {
@@ -5995,19 +6797,11 @@ $currentUserJson = json_encode([
         }
 
         .category-branch-line {
-            position: relative;
-            min-height: 64px;
+            display: none;
         }
 
         .category-branch-line::before {
-            content: '';
-            position: absolute;
-            left: 7px;
-            top: 28px;
-            bottom: 20px;
-            width: 2px;
-            background: rgba(148, 163, 184, 0.4);
-            border-radius: 999px;
+            display: none;
         }
 
         .category-branch-line.is-empty::before {
@@ -6019,7 +6813,8 @@ $currentUserJson = json_encode([
             grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
             gap: 10px;
             min-width: 0;
-            padding-left: 4px;
+            padding-left: 0;
+            grid-column: 2;
         }
 
         .category-node-child {
@@ -6027,13 +6822,7 @@ $currentUserJson = json_encode([
         }
 
         .category-node-child::before {
-            content: '';
-            position: absolute;
-            left: -14px;
-            top: 24px;
-            width: 14px;
-            height: 2px;
-            background: rgba(148, 163, 184, 0.4);
+            display: none;
         }
 
         .category-children.is-empty .category-node-child::before {
@@ -6239,6 +7028,41 @@ $currentUserJson = json_encode([
             color: #64748b;
         }
 
+        body.light .custom-select-menu {
+            border-color: rgba(15, 23, 42, 0.12);
+            background: rgba(255, 255, 255, 0.98);
+            box-shadow: 0 12px 24px rgba(15, 23, 42, 0.12);
+        }
+
+        body.light .custom-select-group+.custom-select-group {
+            border-top-color: rgba(15, 23, 42, 0.08);
+        }
+
+        body.light .custom-select-group-title {
+            color: #64748b;
+        }
+
+        body.light .custom-select-option {
+            color: #334155;
+        }
+
+        body.light .custom-select-option:hover {
+            background: rgba(14, 165, 233, 0.08);
+        }
+
+        body.light .custom-select-option.is-selected {
+            background: rgba(14, 165, 233, 0.15);
+            color: #0369a1;
+        }
+
+        body.light .custom-select.is-open .custom-select-arrow {
+            color: #0369a1;
+        }
+
+        body.light .custom-select-empty {
+            color: #64748b;
+        }
+
         body.light .modal-box {
             background: #fff;
             border-color: rgba(0, 0, 0, 0.08);
@@ -6325,6 +7149,268 @@ $currentUserJson = json_encode([
             background: rgba(148, 163, 184, 0.24);
         }
 
+        /* 亮色模式配色统一优化 */
+        body.light {
+            --lm-bg: #edf3fb;
+            --lm-surface: rgba(255, 255, 255, 0.9);
+            --lm-surface-strong: #ffffff;
+            --lm-surface-soft: #f8fbff;
+            --lm-border: rgba(15, 23, 42, 0.1);
+            --lm-border-soft: rgba(15, 23, 42, 0.07);
+            --lm-text: #0f172a;
+            --lm-text-2: #1e293b;
+            --lm-text-3: #334155;
+            --lm-text-muted: #5b6b7f;
+            --lm-accent: #0284c7;
+            --lm-accent-strong: #0369a1;
+            --lm-shadow-sm: 0 8px 20px rgba(15, 23, 42, 0.06);
+            --lm-shadow-md: 0 16px 30px rgba(15, 23, 42, 0.1);
+            background: var(--lm-bg);
+            color: var(--lm-text-2);
+        }
+
+        body.light .bg-aurora {
+            background:
+                radial-gradient(ellipse at 20% 48%, rgba(14, 165, 233, 0.14), transparent 52%),
+                radial-gradient(ellipse at 78% 18%, rgba(6, 182, 212, 0.1), transparent 50%),
+                linear-gradient(180deg, #f8fbff 0%, #edf3fb 100%);
+        }
+
+        body.light .glass {
+            background: var(--lm-surface);
+            border-color: var(--lm-border);
+            box-shadow: var(--lm-shadow-sm);
+        }
+
+        body.light .glass-hover:hover {
+            background: var(--lm-surface-strong);
+            border-color: rgba(2, 132, 199, 0.26);
+            box-shadow: var(--lm-shadow-md);
+        }
+
+        body.light .sidebar {
+            background: rgba(255, 255, 255, 0.92);
+            border-right-color: var(--lm-border) !important;
+            box-shadow: 8px 0 24px rgba(15, 23, 42, 0.08);
+        }
+
+        body.light #mobileOverlay {
+            background: rgba(15, 23, 42, 0.32);
+        }
+
+        body.light .main-area>header.glass {
+            border-bottom-color: var(--lm-border) !important;
+        }
+
+        body.light .sidebar-link {
+            color: #516175;
+        }
+
+        body.light .sidebar-link:hover {
+            background: rgba(14, 165, 233, 0.12);
+            color: var(--lm-text);
+        }
+
+        body.light .sidebar-link.active {
+            background: linear-gradient(135deg, rgba(14, 165, 233, 0.17), rgba(6, 182, 212, 0.14));
+            color: var(--lm-accent-strong);
+            box-shadow: inset 0 0 0 1px rgba(2, 132, 199, 0.2);
+        }
+
+        body.light .modal-overlay {
+            background: rgba(148, 163, 184, 0.42);
+        }
+
+        body.light .modal-box {
+            background: rgba(255, 255, 255, 0.98);
+            border-color: var(--lm-border);
+            box-shadow: 0 22px 42px rgba(15, 23, 42, 0.14);
+        }
+
+        body.light .input {
+            background: var(--lm-surface-soft);
+            border-color: rgba(100, 116, 139, 0.32);
+            color: var(--lm-text);
+        }
+
+        body.light .input:focus {
+            border-color: var(--lm-accent);
+            box-shadow: 0 0 0 3px rgba(14, 165, 233, 0.18);
+            background: #fff;
+        }
+
+        body.light .input::placeholder {
+            color: #8a99ad;
+        }
+
+        body.light select.input {
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%2364758b' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+        }
+
+        body.light .btn-primary {
+            background: linear-gradient(135deg, #0284c7, #0ea5e9);
+            box-shadow: 0 8px 18px rgba(2, 132, 199, 0.28);
+        }
+
+        body.light .btn-primary:hover {
+            box-shadow: 0 12px 22px rgba(2, 132, 199, 0.3);
+        }
+
+        body.light .btn-ghost {
+            background: rgba(255, 255, 255, 0.7);
+            color: #4b5d73;
+            border-color: rgba(100, 116, 139, 0.35);
+        }
+
+        body.light .btn-ghost:hover {
+            background: rgba(224, 242, 254, 0.9);
+            border-color: rgba(2, 132, 199, 0.35);
+            color: var(--lm-text);
+        }
+
+        body.light .btn-danger {
+            background: rgba(239, 68, 68, 0.12);
+            color: #b91c1c;
+        }
+
+        body.light .btn-danger:hover {
+            background: rgba(239, 68, 68, 0.2);
+            color: #991b1b;
+        }
+
+        body.light .badge-active {
+            background: rgba(16, 185, 129, 0.14);
+            color: #047857;
+        }
+
+        body.light .badge-lent {
+            background: rgba(14, 165, 233, 0.14);
+            color: #0369a1;
+        }
+
+        body.light .badge-warning {
+            background: rgba(245, 158, 11, 0.15);
+            color: #b45309;
+        }
+
+        body.light .badge-danger {
+            background: rgba(239, 68, 68, 0.15);
+            color: #b91c1c;
+        }
+
+        body.light .badge-archived {
+            background: rgba(100, 116, 139, 0.14);
+            color: #475569;
+        }
+
+        body.light .item-card:hover {
+            box-shadow: 0 12px 26px -14px rgba(15, 23, 42, 0.26);
+        }
+
+        body.light .item-card .item-img {
+            background: #eef3f8;
+        }
+
+        body.light .item-card .item-img .placeholder-icon {
+            color: #94a3b8;
+        }
+
+        body.light .upload-zone {
+            background: rgba(248, 250, 252, 0.85);
+            border-color: rgba(100, 116, 139, 0.35);
+        }
+
+        body.light .upload-zone:hover {
+            background: rgba(224, 242, 254, 0.7);
+            border-color: rgba(2, 132, 199, 0.45);
+        }
+
+        body.light .page-btn,
+        body.light .size-btn {
+            color: #64748b;
+        }
+
+        body.light .page-btn:hover,
+        body.light .size-btn:hover {
+            background: rgba(14, 165, 233, 0.1);
+            color: #0369a1;
+        }
+
+        body.light .page-btn.active,
+        body.light .size-btn.active {
+            background: rgba(14, 165, 233, 0.18);
+            color: #0369a1;
+        }
+
+        body.light .text-slate-100,
+        body.light .text-slate-200,
+        body.light .text-white {
+            color: var(--lm-text-2);
+        }
+
+        body.light .text-slate-300 {
+            color: var(--lm-text-3);
+        }
+
+        body.light .text-slate-400 {
+            color: var(--lm-text-muted);
+        }
+
+        body.light .text-slate-500 {
+            color: #708196;
+        }
+
+        body.light .text-sky-300,
+        body.light .text-sky-400 {
+            color: #0369a1 !important;
+        }
+
+        body.light .text-cyan-300,
+        body.light .text-cyan-300\/90,
+        body.light .text-cyan-200\/90 {
+            color: #0e7490 !important;
+        }
+
+        body.light .hover\:text-white:hover {
+            color: var(--lm-text) !important;
+        }
+
+        body.light .bg-white\/5,
+        body.light .bg-white\/\[0\.03\],
+        body.light .bg-white\/\[0\.02\] {
+            background-color: rgba(15, 23, 42, 0.04) !important;
+        }
+
+        body.light .bg-white\/10,
+        body.light .bg-white\/\[0\.06\],
+        body.light .bg-white\/\[0\.04\] {
+            background-color: rgba(15, 23, 42, 0.06) !important;
+        }
+
+        body.light .bg-sky-500\/5 {
+            background-color: rgba(14, 165, 233, 0.08) !important;
+        }
+
+        body.light .bg-sky-500\/15 {
+            background-color: rgba(14, 165, 233, 0.14) !important;
+        }
+
+        body.light .border-white\/5,
+        body.light .border-white\/10,
+        body.light .border-white\/20,
+        body.light .border-white\/\[0\.04\],
+        body.light .border-white\/\[0\.06\] {
+            border-color: rgba(15, 23, 42, 0.12) !important;
+        }
+
+        body.light .hover\:bg-white\/5:hover,
+        body.light .hover\:bg-white\/\[0\.03\]:hover,
+        body.light .hover\:bg-white\/\[0\.04\]:hover,
+        body.light .hover\:bg-white\/\[0\.05\]:hover,
+        body.light .hover\:bg-white\/\[0\.06\]:hover {
+            background-color: rgba(14, 165, 233, 0.1) !important;
+        }
+
         /* 仪表盘提醒卡片（深色模式统一优化） */
         .expiry-remind-item,
         .reminder-remind-item {
@@ -6365,7 +7451,14 @@ $currentUserJson = json_encode([
         .dashboard-reminder-grid {
             display: grid;
             gap: 0.75rem;
-            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+        }
+
+        .expiry-remind-item .expiry-meta,
+        .reminder-remind-item .reminder-meta {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
         }
 
         /* 仪表盘提醒卡片（浅色模式统一优化） */
@@ -6546,6 +7639,7 @@ $currentUserJson = json_encode([
             }
 
             .category-children {
+                grid-column: auto;
                 padding-left: 0;
                 border-top: 1px dashed rgba(148, 163, 184, 0.24);
                 padding-top: 10px;
@@ -6621,7 +7715,7 @@ $currentUserJson = json_encode([
                         <i class="ri-swap-line"></i><span class="sidebar-text">数据管理</span>
                     </div>
                     <div class="sidebar-link sidebar-sub" data-view="settings" onclick="switchView('settings')">
-                        <i class="ri-sort-asc"></i><span class="sidebar-text">排序设置</span>
+                        <i class="ri-sort-asc"></i><span class="sidebar-text">通用设置</span>
                     </div>
                     <div class="sidebar-link sidebar-sub" data-view="status-settings"
                         onclick="switchView('status-settings')">
@@ -6738,8 +7832,17 @@ $currentUserJson = json_encode([
                         <select id="itemStatus" class="input"></select>
                     </div>
                     <div>
-                        <label class="block text-sm text-slate-400 mb-1.5">数量</label>
-                        <input type="number" id="itemQuantity" class="input" value="1" min="0">
+                        <div class="flex items-end gap-2">
+                            <div class="flex-1">
+                                <label class="block text-sm text-slate-400 mb-1.5">余量</label>
+                                <input type="number" id="itemRemainingCurrent" class="input !px-3 text-center" value="0" min="0" step="1" inputmode="numeric">
+                            </div>
+                            <span class="text-slate-500 text-sm font-mono pb-2 text-center">/</span>
+                            <div class="flex-1">
+                                <label class="block text-sm text-slate-400 mb-1.5">数量</label>
+                                <input type="number" id="itemQuantity" class="input !px-3 text-center" value="1" min="0" step="1" inputmode="numeric">
+                            </div>
+                        </div>
                     </div>
                     <div>
                         <label class="block text-sm text-slate-400 mb-1.5">购入价格 (¥)</label>
@@ -6770,7 +7873,7 @@ $currentUserJson = json_encode([
                                 <input type="date" id="itemReminderDate" class="input !h-10 !py-0" onchange="syncReminderFields()">
                             </div>
                             <div>
-                                <label class="block text-sm mb-1.5 invisible">循环周期</label>
+                                <label class="block text-sm text-slate-400 mb-1.5">循环频率</label>
                                 <div class="flex items-center gap-2 min-w-0">
                                     <span class="text-sm text-slate-400 whitespace-nowrap px-1">每</span>
                                     <input type="number" id="itemReminderEvery" class="input !w-[88px] !h-10 !py-0" value="1" min="1" step="1" onchange="syncReminderFields()">
@@ -7059,6 +8162,60 @@ $currentUserJson = json_encode([
             App.sortSettings = s;
         }
 
+        const DASHBOARD_SETTINGS_KEY = userScopedStorageKey('dashboard_settings');
+        const defaultDashboardSettings = {
+            expiry_past_days: null,
+            expiry_future_days: 60,
+            reminder_past_days: null,
+            reminder_future_days: 3,
+            low_stock_threshold_pct: 20,
+        };
+        function normalizeDashboardSettings(input = {}) {
+            const source = (input && typeof input === 'object') ? input : {};
+            const parseRange = (value, defaultValue) => {
+                if (value === undefined) return defaultValue;
+                if (value === null) return null;
+                const text = String(value).trim();
+                if (text === '') return null;
+                const num = Number.parseInt(text, 10);
+                if (!Number.isFinite(num)) return defaultValue;
+                return Math.max(0, num);
+            };
+            const parsePercent = (value, defaultValue) => {
+                if (value === undefined || value === null) return defaultValue;
+                const text = String(value).trim();
+                if (text === '') return defaultValue;
+                const num = Number.parseInt(text, 10);
+                if (!Number.isFinite(num)) return defaultValue;
+                return Math.max(0, Math.min(100, num));
+            };
+            return {
+                expiry_past_days: parseRange(source.expiry_past_days, defaultDashboardSettings.expiry_past_days),
+                expiry_future_days: parseRange(source.expiry_future_days, defaultDashboardSettings.expiry_future_days),
+                reminder_past_days: parseRange(source.reminder_past_days, defaultDashboardSettings.reminder_past_days),
+                reminder_future_days: parseRange(source.reminder_future_days, defaultDashboardSettings.reminder_future_days),
+                low_stock_threshold_pct: parsePercent(source.low_stock_threshold_pct, defaultDashboardSettings.low_stock_threshold_pct),
+            };
+        }
+        function loadDashboardSettings() {
+            try {
+                const saved = localStorage.getItem(DASHBOARD_SETTINGS_KEY);
+                if (!saved) return normalizeDashboardSettings(defaultDashboardSettings);
+                return normalizeDashboardSettings(JSON.parse(saved));
+            } catch {
+                return normalizeDashboardSettings(defaultDashboardSettings);
+            }
+        }
+        function saveDashboardSettings(settings) {
+            const normalized = normalizeDashboardSettings(settings);
+            localStorage.setItem(DASHBOARD_SETTINGS_KEY, JSON.stringify(normalized));
+            App.dashboardSettings = normalized;
+            return normalized;
+        }
+        function formatRangeLimitLabel(value) {
+            return value === null ? '不限制' : `${Number(value)}天`;
+        }
+
         const ITEMS_SIZE_KEY = userScopedStorageKey('items_size');
         function loadItemsSize() { return localStorage.getItem(ITEMS_SIZE_KEY) || 'large'; }
         function saveItemsSize(s) {
@@ -7202,14 +8359,15 @@ $currentUserJson = json_encode([
 
         // ---------- 状态管理 ----------
         const STATUS_KEY = userScopedStorageKey('statuses');
-        const STATUS_KEY_TO_LABEL_MAP = { active: '使用中', archived: '已归档', sold: '已转卖' };
-        const STATUS_LABEL_TO_KEY_MAP = { 使用中: 'active', 已归档: 'archived', 已转卖: 'sold' };
+        const STATUS_KEY_TO_LABEL_MAP = { active: '使用中', archived: '已归档', sold: '已转卖', used_up: '已用完' };
+        const STATUS_LABEL_TO_KEY_MAP = { 使用中: 'active', 已归档: 'archived', 已转卖: 'sold', 已用完: 'used_up' };
         const defaultStatuses = [
             { key: 'active', label: '使用中', icon: 'ri-checkbox-circle-line', color: 'text-emerald-400', badge: 'badge-active' },
-            { key: 'archived', label: '已归档', icon: 'ri-archive-line', color: 'text-slate-400', badge: 'badge-archived' },
+            { key: 'used_up', label: '已用完', icon: 'ri-close-circle-line', color: 'text-red-400', badge: 'badge-danger' },
             { key: 'sold', label: '已转卖', icon: 'ri-share-forward-line', color: 'text-sky-400', badge: 'badge-lent' },
+            { key: 'archived', label: '已归档', icon: 'ri-archive-line', color: 'text-slate-400', badge: 'badge-archived' },
         ];
-        const STATUS_ICON_OPTIONS = ['ri-checkbox-circle-line', 'ri-archive-line', 'ri-share-forward-line', 'ri-tools-line', 'ri-error-warning-line', 'ri-time-line', 'ri-shopping-bag-line', 'ri-gift-line', 'ri-heart-line', 'ri-star-line'];
+        const STATUS_ICON_OPTIONS = ['ri-checkbox-circle-line', 'ri-archive-line', 'ri-share-forward-line', 'ri-close-circle-line', 'ri-tools-line', 'ri-error-warning-line', 'ri-time-line', 'ri-shopping-bag-line', 'ri-gift-line', 'ri-heart-line', 'ri-star-line'];
         function getStatusIconLabel(icon) {
             return String(icon || '').replace('ri-', '').replace('-line', '');
         }
@@ -7300,12 +8458,41 @@ $currentUserJson = json_encode([
             }
             return normalized;
         }
+        function upgradeLegacyDefaultStatuses(statuses) {
+            const normalized = Array.isArray(statuses) ? statuses : [];
+            const keys = normalized.map(s => String(s && s.key ? s.key : '').trim());
+            const isLegacyDefault = keys.length === 3 && keys[0] === 'active' && keys[1] === 'archived' && keys[2] === 'sold';
+            const isLegacyWithUsedUp = keys.length === 4 && keys[0] === 'active' && keys[1] === 'archived' && keys[2] === 'sold' && keys[3] === 'used_up';
+            if (isLegacyWithUsedUp) {
+                const byKey = {};
+                normalized.forEach(s => { if (s && s.key) byKey[s.key] = s; });
+                return ['active', 'used_up', 'sold', 'archived']
+                    .map(k => byKey[k])
+                    .filter(Boolean)
+                    .map(s => ({ ...s }));
+            }
+            if (!isLegacyDefault) {
+                return normalized;
+            }
+            const usedUpDefault = defaultStatuses.find(s => s.key === 'used_up') || { key: 'used_up', label: '已用完', icon: 'ri-close-circle-line', color: 'text-red-400', badge: 'badge-danger' };
+            const byKey = {};
+            normalized.forEach(s => { if (s && s.key) byKey[s.key] = s; });
+            byKey.used_up = { ...usedUpDefault };
+            return ['active', 'used_up', 'sold', 'archived']
+                .map(k => byKey[k])
+                .filter(Boolean)
+                .map(s => ({ ...s }));
+        }
         function loadStatuses() {
             try {
                 const saved = localStorage.getItem(STATUS_KEY);
                 const parsed = saved ? JSON.parse(saved) : defaultStatuses.map(s => ({ ...s }));
                 const normalized = normalizeStatuses(parsed);
-                return normalized.length > 0 ? normalized : defaultStatuses.map(s => ({ ...s }));
+                const upgraded = upgradeLegacyDefaultStatuses(normalized);
+                if (saved && JSON.stringify(upgraded) !== JSON.stringify(normalized)) {
+                    localStorage.setItem(STATUS_KEY, JSON.stringify(upgraded));
+                }
+                return upgraded.length > 0 ? upgraded : defaultStatuses.map(s => ({ ...s }));
             } catch {
                 return defaultStatuses.map(s => ({ ...s }));
             }
@@ -7362,7 +8549,7 @@ $currentUserJson = json_encode([
 
         let itemFormInitialState = '';
         function getItemFormState() {
-            const ids = ['itemId', 'itemName', 'itemCategory', 'itemSubcategory', 'itemLocation', 'itemStatus', 'itemQuantity', 'itemPrice', 'itemPurchaseFrom', 'itemSharePublic', 'itemDate', 'itemExpiry', 'itemBarcode', 'itemReminderDate', 'itemReminderEvery', 'itemReminderUnit', 'itemReminderNext', 'itemReminderNote', 'itemTags', 'itemNotes', 'itemImage', 'itemSourceShoppingId'];
+            const ids = ['itemId', 'itemName', 'itemCategory', 'itemSubcategory', 'itemLocation', 'itemStatus', 'itemQuantity', 'itemRemainingCurrent', 'itemPrice', 'itemPurchaseFrom', 'itemSharePublic', 'itemDate', 'itemExpiry', 'itemBarcode', 'itemReminderDate', 'itemReminderEvery', 'itemReminderUnit', 'itemReminderNext', 'itemReminderNote', 'itemTags', 'itemNotes', 'itemImage', 'itemSourceShoppingId'];
             const state = {};
             ids.forEach(id => {
                 const el = document.getElementById(id);
@@ -7426,10 +8613,14 @@ $currentUserJson = json_encode([
             itemsOrder: 'DESC',
             itemsFilter: { search: '', category: 0, location: 0, status: '', expiryOnly: false },
             sortSettings: loadSortSettings(),
+            dashboardSettings: loadDashboardSettings(),
             operationLogsFilters: { keyword: '', actorUserId: 0, sort: 'time_desc' },
             _cachedItems: null,   // 缓存物品列表数据，避免频繁 API 请求
             _cachedTotal: 0,
-            _cachedPages: 0
+            _cachedPages: 0,
+            _baseDataLoadedAt: 0,
+            _baseDataInFlight: null,
+            _baseDataVersion: 0
         };
 
         // ---------- API 封装 ----------
@@ -7559,6 +8750,384 @@ $currentUserJson = json_encode([
             refreshDateInputPlaceholderDisplay();
         }
 
+        // ---------- 自定义下拉 ----------
+        const customSelectStates = new Map();
+        let customSelectEventsBound = false;
+        let customSelectRepositionRaf = 0;
+        let customSelectSyncRaf = 0;
+        let customSelectSyncPendingForce = false;
+        let customSelectMutationObserver = null;
+
+        function customSelectOptionText(option) {
+            return String(option?.textContent || '').replace(/\s+/g, ' ').trim();
+        }
+
+        function customSelectSignature(select) {
+            const parts = [];
+            Array.from(select.children || []).forEach(node => {
+                const tag = String(node.tagName || '').toUpperCase();
+                if (tag === 'OPTGROUP') {
+                    parts.push(`g:${String(node.label || '').trim()}`);
+                    Array.from(node.children || []).forEach(child => {
+                        if (String(child.tagName || '').toUpperCase() !== 'OPTION') return;
+                        parts.push(`o:${child.value}\u0001${customSelectOptionText(child)}\u0001${child.disabled ? 1 : 0}`);
+                    });
+                } else if (tag === 'OPTION') {
+                    parts.push(`o:${node.value}\u0001${customSelectOptionText(node)}\u0001${node.disabled ? 1 : 0}`);
+                }
+            });
+            return parts.join('\u0002');
+        }
+
+        function closeCustomSelect(state) {
+            if (!state || !state.open) return;
+            state.open = false;
+            state.wrapper.classList.remove('is-open');
+            state.menu.classList.add('hidden');
+            state.trigger.setAttribute('aria-expanded', 'false');
+            if (state.menu.parentElement !== state.wrapper) {
+                state.wrapper.appendChild(state.menu);
+            }
+            state.menu.classList.remove('custom-select-menu-floating');
+            state.menu.style.left = '';
+            state.menu.style.top = '';
+            state.menu.style.width = '';
+            state.menu.style.minWidth = '';
+            state.menu.style.maxWidth = '';
+            state.menu.style.maxHeight = '';
+            state.menu.style.visibility = '';
+        }
+
+        function closeAllCustomSelects(exceptSelect = null) {
+            customSelectStates.forEach((state, select) => {
+                if (exceptSelect && select === exceptSelect) return;
+                closeCustomSelect(state);
+            });
+        }
+
+        function renderCustomSelectOption(option, optionIndex, state) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'custom-select-option';
+            if (state.select.selectedIndex === optionIndex) btn.classList.add('is-selected');
+            btn.disabled = !!option.disabled;
+            btn.dataset.optionIndex = String(optionIndex);
+            btn.innerHTML = `<span class="truncate">${esc(customSelectOptionText(option) || option.value || '')}</span><i class="ri-check-line custom-select-option-check"></i>`;
+            btn.addEventListener('click', event => {
+                event.preventDefault();
+                event.stopPropagation();
+                if (btn.disabled) return;
+                const targetIndex = Number.parseInt(btn.dataset.optionIndex || '-1', 10);
+                if (!Number.isFinite(targetIndex) || targetIndex < 0) return;
+                const changed = state.select.selectedIndex !== targetIndex;
+                state.select.selectedIndex = targetIndex;
+                if (changed) {
+                    state.select.dispatchEvent(new Event('input', { bubbles: true }));
+                    state.select.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+                syncCustomSelectState(state, true);
+                closeCustomSelect(state);
+                state.trigger.focus();
+            });
+            return btn;
+        }
+
+        function rebuildCustomSelectMenu(state) {
+            const select = state.select;
+            const menu = state.menu;
+            menu.innerHTML = '';
+            const options = Array.from(select.options || []);
+            const indexMap = new Map(options.map((opt, idx) => [opt, idx]));
+            let hasAnyOption = false;
+
+            Array.from(select.children || []).forEach(node => {
+                const tag = String(node.tagName || '').toUpperCase();
+                if (tag === 'OPTGROUP') {
+                    const groupWrap = document.createElement('div');
+                    groupWrap.className = 'custom-select-group';
+                    const title = document.createElement('div');
+                    title.className = 'custom-select-group-title';
+                    title.textContent = String(node.label || '').trim() || '分组';
+                    groupWrap.appendChild(title);
+                    Array.from(node.children || []).forEach(child => {
+                        if (String(child.tagName || '').toUpperCase() !== 'OPTION') return;
+                        const idx = indexMap.get(child);
+                        if (!Number.isFinite(idx)) return;
+                        groupWrap.appendChild(renderCustomSelectOption(child, idx, state));
+                        hasAnyOption = true;
+                    });
+                    menu.appendChild(groupWrap);
+                    return;
+                }
+                if (tag === 'OPTION') {
+                    const idx = indexMap.get(node);
+                    if (!Number.isFinite(idx)) return;
+                    menu.appendChild(renderCustomSelectOption(node, idx, state));
+                    hasAnyOption = true;
+                }
+            });
+
+            if (!hasAnyOption) {
+                const empty = document.createElement('div');
+                empty.className = 'custom-select-empty';
+                empty.textContent = '暂无选项';
+                menu.appendChild(empty);
+            }
+        }
+
+        function updateCustomSelectTrigger(state) {
+            const select = state.select;
+            const trigger = state.trigger;
+            const selectedOption = select.options && select.selectedIndex >= 0 ? select.options[select.selectedIndex] : null;
+            const labelText = selectedOption ? customSelectOptionText(selectedOption) : '';
+            state.label.textContent = labelText || '请选择';
+            trigger.disabled = !!select.disabled;
+            trigger.classList.toggle('opacity-60', !!select.disabled);
+        }
+
+        function positionCustomSelectMenu(state) {
+            if (!state || !state.open || !state.menu || !state.trigger) return;
+            const triggerRect = state.trigger.getBoundingClientRect();
+            const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+            const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+            if (triggerRect.bottom < 0 || triggerRect.top > viewportHeight || triggerRect.right < 0 || triggerRect.left > viewportWidth) {
+                closeCustomSelect(state);
+                return;
+            }
+            const edge = 8;
+            const gap = 6;
+            const maxWidth = Math.max(180, viewportWidth - edge * 2);
+            state.menu.classList.add('custom-select-menu-floating');
+
+            if (state.inlineMode) {
+                state.menu.style.width = 'auto';
+                state.menu.style.minWidth = `${Math.min(Math.max(140, triggerRect.width), maxWidth)}px`;
+            } else {
+                const targetWidth = Math.min(Math.max(140, triggerRect.width), maxWidth);
+                state.menu.style.width = `${targetWidth}px`;
+                state.menu.style.minWidth = `${targetWidth}px`;
+            }
+            state.menu.style.maxWidth = `${maxWidth}px`;
+
+            // 先给一个临时高度约束，拿到可靠尺寸后再二次计算
+            const provisionalMaxHeight = Math.max(160, Math.min(320, Math.floor(viewportHeight * 0.5)));
+            state.menu.style.maxHeight = `${provisionalMaxHeight}px`;
+
+            let measuredRect = state.menu.getBoundingClientRect();
+            let left = triggerRect.left;
+            if (left + measuredRect.width > viewportWidth - edge) {
+                left = viewportWidth - edge - measuredRect.width;
+            }
+            if (left < edge) left = edge;
+
+            const spaceBelow = Math.max(0, viewportHeight - triggerRect.bottom - edge - gap);
+            const spaceAbove = Math.max(0, triggerRect.top - edge - gap);
+            const preferAbove = spaceBelow < Math.min(measuredRect.height, 180) && spaceAbove > spaceBelow;
+            const availableHeight = preferAbove ? spaceAbove : spaceBelow;
+            const finalMaxHeight = Math.max(140, Math.min(320, Math.floor(availableHeight)));
+            state.menu.style.maxHeight = `${finalMaxHeight}px`;
+
+            measuredRect = state.menu.getBoundingClientRect();
+            let top = preferAbove ? (triggerRect.top - measuredRect.height - gap) : (triggerRect.bottom + gap);
+            if (top + measuredRect.height > viewportHeight - edge) {
+                top = viewportHeight - edge - measuredRect.height;
+            }
+            if (top < edge) top = edge;
+
+            state.menu.style.left = `${left}px`;
+            state.menu.style.top = `${top}px`;
+        }
+
+        function requestCustomSelectReposition() {
+            if (customSelectRepositionRaf) return;
+            customSelectRepositionRaf = window.requestAnimationFrame(() => {
+                customSelectRepositionRaf = 0;
+                customSelectStates.forEach(state => {
+                    if (state.open) positionCustomSelectMenu(state);
+                });
+            });
+        }
+
+        function syncAllCustomSelectStates(force = false) {
+            customSelectStates.forEach((state, select) => {
+                if (!select.isConnected) {
+                    closeCustomSelect(state);
+                    customSelectStates.delete(select);
+                    return;
+                }
+                syncCustomSelectState(state, force);
+            });
+        }
+
+        function scheduleCustomSelectSync(force = false) {
+            if (force) customSelectSyncPendingForce = true;
+            if (customSelectSyncRaf) return;
+            customSelectSyncRaf = window.requestAnimationFrame(() => {
+                customSelectSyncRaf = 0;
+                const forceSync = customSelectSyncPendingForce;
+                customSelectSyncPendingForce = false;
+                syncAllCustomSelectStates(forceSync);
+            });
+        }
+
+        function openCustomSelect(state) {
+            if (!state || state.select.disabled) return;
+            closeAllCustomSelects(state.select);
+            syncCustomSelectState(state, true);
+            state.open = true;
+            state.wrapper.classList.add('is-open');
+            if (state.menu.parentElement !== document.body) {
+                document.body.appendChild(state.menu);
+            }
+            state.menu.style.visibility = 'hidden';
+            state.menu.classList.remove('hidden');
+            state.trigger.setAttribute('aria-expanded', 'true');
+            positionCustomSelectMenu(state);
+            state.menu.style.visibility = '';
+            const selected = state.menu.querySelector('.custom-select-option.is-selected');
+            if (selected && typeof selected.scrollIntoView === 'function') {
+                selected.scrollIntoView({ block: 'nearest' });
+            }
+        }
+
+        function syncCustomSelectState(state, force = false) {
+            if (!state || !state.select || !state.select.isConnected) return;
+            const signature = customSelectSignature(state.select);
+            const valueKey = `${state.select.selectedIndex}|${state.select.value}`;
+            const disabled = !!state.select.disabled;
+            const needsRebuild = force || signature !== state.lastSignature || valueKey !== state.lastValueKey;
+            if (needsRebuild) {
+                rebuildCustomSelectMenu(state);
+                updateCustomSelectTrigger(state);
+                state.lastSignature = signature;
+                state.lastValueKey = valueKey;
+                state.lastDisabled = disabled;
+            } else if (disabled !== state.lastDisabled) {
+                updateCustomSelectTrigger(state);
+                state.lastDisabled = disabled;
+            }
+            if (disabled && state.open) {
+                closeCustomSelect(state);
+            }
+            if (state.open) requestCustomSelectReposition();
+        }
+
+        function enhanceCustomSelect(select) {
+            if (!(select instanceof HTMLSelectElement)) return;
+            if (select.dataset.customSelectReady === '1') {
+                const existingState = customSelectStates.get(select);
+                if (existingState) syncCustomSelectState(existingState);
+                return;
+            }
+
+            const parent = select.parentElement;
+            if (!parent) return;
+            const originalClass = String(select.className || '').trim() || 'input';
+            const inlineMode = /(^|\s)!?w-auto(\s|$)/.test(originalClass);
+            const wrapper = document.createElement('div');
+            wrapper.className = `custom-select ${inlineMode ? 'custom-select-inline' : 'custom-select-block'}`;
+            parent.insertBefore(wrapper, select);
+            wrapper.appendChild(select);
+
+            select.dataset.customSelectReady = '1';
+            select.dataset.customSelectOriginalClass = originalClass;
+            select.classList.add('custom-select-native');
+
+            const trigger = document.createElement('button');
+            trigger.type = 'button';
+            trigger.className = `${originalClass} custom-select-trigger`;
+            trigger.setAttribute('aria-haspopup', 'listbox');
+            trigger.setAttribute('aria-expanded', 'false');
+            trigger.innerHTML = `<span class="custom-select-label"></span><i class="ri-arrow-down-s-line custom-select-arrow"></i>`;
+
+            const menu = document.createElement('div');
+            menu.className = 'custom-select-menu hidden';
+
+            wrapper.appendChild(trigger);
+            wrapper.appendChild(menu);
+
+            const state = {
+                select,
+                wrapper,
+                trigger,
+                menu,
+                label: trigger.querySelector('.custom-select-label'),
+                inlineMode,
+                open: false,
+                lastSignature: '',
+                lastValueKey: '',
+                lastDisabled: null
+            };
+            customSelectStates.set(select, state);
+
+            trigger.addEventListener('click', event => {
+                event.preventDefault();
+                event.stopPropagation();
+                if (state.open) closeCustomSelect(state);
+                else openCustomSelect(state);
+            });
+            trigger.addEventListener('keydown', event => {
+                if (event.key === 'Escape') {
+                    if (state.open) {
+                        event.preventDefault();
+                        closeCustomSelect(state);
+                    }
+                    return;
+                }
+                if (event.key === 'Enter' || event.key === ' ' || event.key === 'ArrowDown') {
+                    event.preventDefault();
+                    openCustomSelect(state);
+                }
+            });
+            menu.addEventListener('keydown', event => {
+                if (event.key === 'Escape') {
+                    event.preventDefault();
+                    closeCustomSelect(state);
+                    trigger.focus();
+                }
+            });
+            menu.addEventListener('click', event => event.stopPropagation());
+            select.addEventListener('change', () => syncCustomSelectState(state, true));
+            select.addEventListener('input', () => syncCustomSelectState(state, true));
+
+            syncCustomSelectState(state, true);
+        }
+
+        function enhanceCustomSelects(root = document) {
+            const scope = root || document;
+            scope.querySelectorAll('select.input, select.auth-input').forEach(select => enhanceCustomSelect(select));
+        }
+
+        function initCustomSelects() {
+            if (!customSelectEventsBound) {
+                customSelectEventsBound = true;
+                document.addEventListener('click', event => {
+                    if (!(event.target instanceof Element)) return;
+                    if (!event.target.closest('.custom-select')) closeAllCustomSelects();
+                });
+                document.addEventListener('keydown', event => {
+                    if (event.key === 'Escape') closeAllCustomSelects();
+                });
+                window.addEventListener('resize', requestCustomSelectReposition);
+                window.addEventListener('scroll', requestCustomSelectReposition, true);
+            }
+            if (!customSelectMutationObserver && document.body) {
+                customSelectMutationObserver = new MutationObserver(() => {
+                    scheduleCustomSelectSync();
+                    requestCustomSelectReposition();
+                });
+                customSelectMutationObserver.observe(document.body, {
+                    subtree: true,
+                    childList: true,
+                    characterData: true,
+                    attributes: true,
+                    attributeFilter: ['disabled']
+                });
+            }
+            enhanceCustomSelects(document);
+            scheduleCustomSelectSync(true);
+        }
+
         // ---------- 侧边栏 ----------
         function toggleSubMenu(el) {
             el.closest('.sidebar-group').classList.toggle('open');
@@ -7577,14 +9146,14 @@ $currentUserJson = json_encode([
         }
 
         // ---------- 视图切换 ----------
-        const settingsSubViews = ['import-export', 'settings', 'status-settings', 'channel-settings', 'platform-settings', 'user-management', 'operation-logs', 'changelog'];
+        const settingsSubViews = ['import-export', 'settings', 'reminder-settings', 'status-settings', 'channel-settings', 'platform-settings', 'user-management', 'operation-logs', 'changelog'];
 
         function switchView(view) {
             App.currentView = view;
             document.querySelectorAll('.sidebar-link[data-view]').forEach(el => {
                 el.classList.toggle('active', el.dataset.view === view);
             });
-            const titles = { dashboard: '仪表盘', items: '物品管理', 'shopping-list': '购物清单', 'message-board': '任务清单', 'public-channel': '公共频道', categories: '分类管理', locations: '位置管理', trash: '物品管理', 'import-export': '数据管理', settings: '排序设置', 'status-settings': '状态管理', 'channel-settings': '购入渠道管理', 'platform-settings': '平台设置', 'user-management': '用户管理', 'operation-logs': '操作日志', changelog: '更新记录' };
+            const titles = { dashboard: '仪表盘', items: '物品管理', 'shopping-list': '购物清单', 'message-board': '任务清单', 'public-channel': '公共频道', categories: '分类管理', locations: '位置管理', trash: '物品管理', 'import-export': '数据管理', settings: '设置', 'reminder-settings': '设置', 'status-settings': '状态管理', 'channel-settings': '购入渠道管理', 'platform-settings': '平台设置', 'user-management': '用户管理', 'operation-logs': '操作日志', changelog: '更新记录' };
             document.getElementById('viewTitle').textContent = titles[view] || '';
             // 回收站视图高亮物品管理侧边栏
             if (view === 'trash') document.querySelector('.sidebar-link[data-view="items"]')?.classList.add('active');
@@ -7618,6 +9187,7 @@ $currentUserJson = json_encode([
                 case 'trash': await renderTrash(c); break;
                 case 'import-export': renderImportExport(c); break;
                 case 'settings': renderSettings(c); break;
+                case 'reminder-settings': renderSettings(c); break;
                 case 'status-settings': renderStatusSettings(c); break;
                 case 'channel-settings': renderChannelSettings(c); break;
                 case 'platform-settings': await renderPlatformSettings(c); break;
@@ -7625,18 +9195,58 @@ $currentUserJson = json_encode([
                 case 'operation-logs': await renderOperationLogs(c); break;
                 case 'changelog': renderChangelog(c); break;
             }
+            enhanceCustomSelects(c);
+            scheduleCustomSelectSync();
         }
 
         // ---------- 加载基础数据 ----------
-        async function loadBaseData() {
-            const [catRes, locRes] = await Promise.all([api('categories'), api('locations')]);
-            if (catRes.success) {
-                const rows = Array.isArray(catRes.data) ? catRes.data : [];
-                App.categories = rows.map(cat => ({ ...cat, icon: normalizeEmojiValue(cat.icon, '📦') }));
+        const BASE_DATA_CACHE_TTL_MS = 30000;
+
+        function invalidateBaseDataCache() {
+            App._baseDataVersion = Number(App._baseDataVersion || 0) + 1;
+            App._baseDataLoadedAt = 0;
+            App._baseDataInFlight = null;
+        }
+
+        function hasFreshBaseData(maxAgeMs = BASE_DATA_CACHE_TTL_MS) {
+            const loadedAt = Number(App._baseDataLoadedAt || 0);
+            if (loadedAt <= 0) return false;
+            return (Date.now() - loadedAt) <= Math.max(0, Number(maxAgeMs || 0));
+        }
+
+        async function loadBaseData(options = {}) {
+            const force = !!options.force;
+            const maxAgeMsRaw = Number(options.maxAgeMs);
+            const maxAgeMs = Number.isFinite(maxAgeMsRaw) ? Math.max(0, maxAgeMsRaw) : BASE_DATA_CACHE_TTL_MS;
+            if (!force && hasFreshBaseData(maxAgeMs)) return;
+            if (!force && App._baseDataInFlight) {
+                await App._baseDataInFlight;
+                return;
             }
-            if (locRes.success) {
-                const rows = Array.isArray(locRes.data) ? locRes.data : [];
-                App.locations = rows.map(loc => ({ ...loc, icon: normalizeEmojiValue(loc.icon, '📍') }));
+
+            const requestVersion = Number(App._baseDataVersion || 0);
+            const requestPromise = (async () => {
+                const [catRes, locRes] = await Promise.all([api('categories'), api('locations')]);
+                if (requestVersion !== Number(App._baseDataVersion || 0)) return;
+                if (catRes.success) {
+                    const rows = Array.isArray(catRes.data) ? catRes.data : [];
+                    App.categories = rows.map(cat => ({ ...cat, icon: normalizeEmojiValue(cat.icon, '📦') }));
+                }
+                if (locRes.success) {
+                    const rows = Array.isArray(locRes.data) ? locRes.data : [];
+                    App.locations = rows.map(loc => ({ ...loc, icon: normalizeEmojiValue(loc.icon, '📍') }));
+                }
+                if (catRes.success || locRes.success) {
+                    App._baseDataLoadedAt = Date.now();
+                }
+            })();
+            App._baseDataInFlight = requestPromise;
+            try {
+                await requestPromise;
+            } finally {
+                if (App._baseDataInFlight === requestPromise) {
+                    App._baseDataInFlight = null;
+                }
             }
         }
 
@@ -7965,22 +9575,35 @@ $currentUserJson = json_encode([
         // 📊 仪表盘
         // ============================================================
         async function renderDashboard(container) {
-            const res = await api('dashboard');
+            const dashboardSettings = normalizeDashboardSettings(App.dashboardSettings || defaultDashboardSettings);
+            App.dashboardSettings = dashboardSettings;
+            const dashboardParams = new URLSearchParams();
+            dashboardParams.set('expiry_past_days', dashboardSettings.expiry_past_days === null ? '' : String(dashboardSettings.expiry_past_days));
+            dashboardParams.set('expiry_future_days', dashboardSettings.expiry_future_days === null ? '' : String(dashboardSettings.expiry_future_days));
+            dashboardParams.set('reminder_past_days', dashboardSettings.reminder_past_days === null ? '' : String(dashboardSettings.reminder_past_days));
+            dashboardParams.set('reminder_future_days', dashboardSettings.reminder_future_days === null ? '' : String(dashboardSettings.reminder_future_days));
+            dashboardParams.set('low_stock_threshold_pct', String(Number(dashboardSettings.low_stock_threshold_pct ?? defaultDashboardSettings.low_stock_threshold_pct)));
+            const dashboardEndpoint = dashboardParams.toString() ? `dashboard&${dashboardParams.toString()}` : 'dashboard';
+            const res = await api(dashboardEndpoint);
             if (!res.success) { container.innerHTML = '<p class="text-red-400">加载失败</p>'; return; }
             const d = res.data;
             const statusMap = getStatusMap();
             const expiringItems = Array.isArray(d.expiringItems) ? d.expiringItems : [];
             const reminderItems = Array.isArray(d.reminderItems) ? d.reminderItems : [];
             const shoppingReminderItems = Array.isArray(d.shoppingReminderItems) ? d.shoppingReminderItems : [];
+            const lowStockReminderItems = Array.isArray(d.lowStockReminderItems) ? d.lowStockReminderItems : [];
+            const lowStockThresholdPct = Number(d.lowStockThresholdPct ?? dashboardSettings.low_stock_threshold_pct ?? defaultDashboardSettings.low_stock_threshold_pct);
             const memoReminderItems = [
                 ...reminderItems.map(item => ({ ...item, _source: 'item', _dueDate: reminderDisplayDate(item) })),
-                ...shoppingReminderItems.map(item => ({ ...item, _source: 'shopping', _dueDate: item.reminder_date || '' }))
+                ...shoppingReminderItems.map(item => ({ ...item, _source: 'shopping', _dueDate: item.reminder_date || '' })),
+                ...lowStockReminderItems.map(item => ({ ...item, _source: 'stock', _dueDate: item.reminder_due_date || '' }))
             ]
                 .filter(item => item._dueDate)
                 .sort((a, b) => String(a._dueDate).localeCompare(String(b._dueDate)));
             const memoExpiredCount = memoReminderItems.filter(item => daysUntilReminder(item._dueDate) < 0).length;
             const memoCycleCount = memoReminderItems.filter(item => item._source === 'item').length;
             const memoShoppingCount = memoReminderItems.filter(item => item._source === 'shopping').length;
+            const memoStockCount = memoReminderItems.filter(item => item._source === 'stock').length;
             const dashboardStatusStats = (d.statusStats || []).filter(s => Number(s.total_qty || 0) > 0);
             const taskBoardPosts = (Array.isArray(d.messageBoardPosts) ? d.messageBoardPosts : []).filter(x => Number(x.is_completed || 0) !== 1);
             App.messageBoardTasks = taskBoardPosts;
@@ -8036,7 +9659,7 @@ $currentUserJson = json_encode([
         <div class="glass rounded-2xl p-5 mb-6 anim-up" style="animation-delay:0.04s">
             <div class="flex items-center justify-between mb-4">
                 <h3 class="font-semibold text-white flex items-center gap-2"><i class="ri-loop-right-line text-cyan-400"></i>备忘提醒</h3>
-                <span class="text-xs text-slate-500">过期 ${memoExpiredCount} 条 · 循环 ${memoCycleCount} 条 · 购物 ${memoShoppingCount} 条</span>
+                <span class="text-xs text-slate-500">过期 ${memoExpiredCount} 条 · 循环 ${memoCycleCount} 条 · 购物 ${memoShoppingCount} 条 · 余量 ${memoStockCount} 条（阈值 ${Number.isFinite(lowStockThresholdPct) ? lowStockThresholdPct : defaultDashboardSettings.low_stock_threshold_pct}%）</span>
             </div>
             ${memoReminderItems.length > 0 ? `
             <div class="dashboard-reminder-grid">
@@ -8051,20 +9674,24 @@ $currentUserJson = json_encode([
                 };
                 const textMap = { expired: 'text-red-400', urgent: 'text-amber-400', warning: 'text-yellow-400' };
                 const isItemReminder = item._source === 'item';
-                const clickAction = isItemReminder ? `showDetail(${item.id})` : `switchView('shopping-list')`;
+                const isStockReminder = item._source === 'stock';
+                const clickAction = (isItemReminder || isStockReminder) ? `showDetail(${item.id})` : `switchView('shopping-list')`;
                 const summaryNote = String(item.reminder_note || '').trim();
                 const summaryNoteHtml = summaryNote ? esc(summaryNote) : '&nbsp;';
                 const isCompleted = isItemReminder && Number(item.reminder_completed || 0) === 1;
                 const reminderId = Number(item.reminder_instance_id || 0);
+                const stockTotal = Math.max(0, Number(item.stock_total || item.remaining_total || item.quantity || 0));
+                const stockCurrent = Math.max(0, Number(item.stock_current ?? item.remaining_current ?? 0));
+                const stockRatio = stockTotal > 0 ? Math.round((stockCurrent / stockTotal) * 100) : 0;
                 return `<div class="p-3 rounded-xl border ${bgMap[urgency]} cursor-pointer hover:brightness-110 transition" onclick="${clickAction}">
                         <div class="flex items-start gap-3">
-                            <div class="w-9 h-9 rounded-lg ${isItemReminder && item.image ? '' : 'bg-slate-700/50 flex items-center justify-center text-base'} flex-shrink-0 overflow-hidden">
-                                ${isItemReminder && item.image ? `<img src="?img=${item.image}" class="w-full h-full object-cover rounded-lg">` : `<span>${isItemReminder ? (item.category_icon || '📦') : '🛒'}</span>`}
+                            <div class="w-9 h-9 rounded-lg ${(isItemReminder || isStockReminder) && item.image ? '' : 'bg-slate-700/50 flex items-center justify-center text-base'} flex-shrink-0 overflow-hidden">
+                                ${(isItemReminder || isStockReminder) && item.image ? `<img src="?img=${item.image}" class="w-full h-full object-cover rounded-lg">` : `<span>${(isItemReminder || isStockReminder) ? (item.category_icon || '📦') : '🛒'}</span>`}
                             </div>
                             <div class="min-w-0 flex-1">
                                 <p class="text-sm font-medium text-slate-200 truncate">${esc(item.name)}</p>
                                 <p class="text-xs ${textMap[urgency]} font-medium reminder-meta"><span>${dueDate}</span> · <span>${reminderDueLabel(dueDate)}</span></p>
-                                <p class="text-[11px] text-slate-500 mt-0.5">${isItemReminder ? reminderCycleLabel(item.reminder_cycle_value, item.reminder_cycle_unit) : '购物清单提醒'}</p>
+                                <p class="text-[11px] text-slate-500 mt-0.5">${isItemReminder ? reminderCycleLabel(item.reminder_cycle_value, item.reminder_cycle_unit) : (isStockReminder ? `余量提醒 · ${stockCurrent}/${stockTotal}（${stockRatio}%）` : '购物清单提醒')}</p>
                                 <p class="text-[11px] text-slate-400 mt-1 truncate h-4 leading-4">${summaryNoteHtml}</p>
                             </div>
                         </div>
@@ -8083,9 +9710,15 @@ $currentUserJson = json_encode([
                                     </button>
                                 `}
                             ` : `
-                            <button onclick="event.stopPropagation();openShoppingListAndEdit(${item.id})" class="btn btn-ghost btn-sm reminder-action-btn reminder-action-view !py-1 !px-2 text-xs text-cyan-300 hover:text-cyan-200 border-cyan-400/25 hover:border-cyan-300/40">
-                                <i class="ri-list-check"></i>查看清单
-                            </button>
+                            ${isStockReminder ? `
+                                <button onclick="event.stopPropagation();showDetail(${item.id})" class="btn btn-ghost btn-sm reminder-action-btn reminder-action-view !py-1 !px-2 text-xs text-cyan-300 hover:text-cyan-200 border-cyan-400/25 hover:border-cyan-300/40">
+                                    <i class="ri-eye-line"></i>查看物品
+                                </button>
+                            ` : `
+                                <button onclick="event.stopPropagation();openShoppingListAndEdit(${item.id})" class="btn btn-ghost btn-sm reminder-action-btn reminder-action-view !py-1 !px-2 text-xs text-cyan-300 hover:text-cyan-200 border-cyan-400/25 hover:border-cyan-300/40">
+                                    <i class="ri-list-check"></i>查看清单
+                                </button>
+                            `}
                             `}
                         </div>
                     </div>`;
@@ -8570,8 +10203,6 @@ $currentUserJson = json_encode([
 
         // ---------- 物品详情弹窗 ----------
         async function showDetail(id) {
-            const res = await api(`items&page=1&limit=1&search=&category=0&location=0&status=`);
-            // 直接单独请求该物品
             const allRes = await api(`items&page=1&limit=999`);
             if (!allRes.success) return;
             const item = allRes.data.find(i => i.id === id);
@@ -8594,10 +10225,11 @@ $currentUserJson = json_encode([
                 <div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">分类</p><p class="text-sm text-white">${item.category_icon || '📦'} ${esc(item.category_name || '未分类')}${item.subcategory_name ? ` <span class="text-slate-500">/</span> <span class="text-cyan-300">${esc(item.subcategory_name)}</span>` : ''}</p></div>
                 <div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">位置</p><p class="text-sm text-white"><i class="ri-map-pin-2-line text-xs mr-1"></i>${esc(item.location_name || '未设定')}</p></div>
                 <div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">数量</p><p class="text-sm text-white">${item.quantity}</p></div>
+                <div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">余量</p><p class="text-sm text-white">${Number(item.remaining_total || 0) > 0 ? `${Number(item.remaining_current || 0)}/${Number(item.remaining_total || 0)}` : '未设置'}</p></div>
                 <div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">价值</p><p class="text-sm text-amber-400 font-medium">¥${Number(item.purchase_price || 0).toLocaleString()}</p></div>
                 ${item.purchase_date ? `<div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">购入日期</p><p class="text-sm text-white">${item.purchase_date}</p></div>` : ''}
                 ${item.expiry_date ? `<div class="p-3 rounded-xl ${expiryBg(item.expiry_date)}"><p class="text-xs text-slate-500 mb-1">过期日期</p><p class="text-sm font-medium ${expiryColor(item.expiry_date)}">${item.expiry_date} ${expiryLabel(item.expiry_date)}</p></div>` : ''}
-                ${reminderDisplayDate(item) && item.reminder_cycle_unit ? `<div class="p-3 rounded-xl bg-cyan-500/10 border border-cyan-500/20"><p class="text-xs text-slate-500 mb-1">循环提醒</p><p class="text-sm font-medium text-cyan-300">初始：${item.reminder_date || '-'} · ${reminderCycleLabel(item.reminder_cycle_value, item.reminder_cycle_unit)} · 下次：${reminderDisplayDate(item)} ${reminderDueLabel(reminderDisplayDate(item))}</p>${item.reminder_note ? `<p class="text-xs text-slate-400 mt-1">${esc(item.reminder_note)}</p>` : ''}</div>` : ''}
+                ${reminderDisplayDate(item) && item.reminder_cycle_unit ? `<div class="p-3 rounded-xl bg-cyan-500/10 border border-cyan-500/20"><p class="text-xs text-slate-500 mb-1">循环提醒</p><p class="text-sm font-medium text-cyan-300 leading-6">初始：${item.reminder_date || '-'} <span class="text-cyan-200/90">(${reminderCycleLabel(item.reminder_cycle_value, item.reminder_cycle_unit)})</span></p><p class="text-sm font-medium text-cyan-300 leading-6">下次：${reminderDisplayDate(item)} ${reminderDueLabel(reminderDisplayDate(item))}</p>${item.reminder_note ? `<p class="text-xs text-slate-400 mt-1">${esc(item.reminder_note)}</p>` : ''}</div>` : ''}
                 ${item.purchase_from ? `<div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">购入渠道</p><p class="text-sm text-white">${esc(item.purchase_from)}</p></div>` : ''}
                 ${item.barcode ? `<div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">条码/序列号</p><p class="text-sm text-white font-mono">${esc(item.barcode)}</p></div>` : ''}
             </div>
@@ -8627,6 +10259,7 @@ $currentUserJson = json_encode([
             document.getElementById('itemSourceShoppingId').value = '';
             document.getElementById('itemSharePublic').checked = false;
             document.getElementById('itemQuantity').value = '1';
+            document.getElementById('itemRemainingCurrent').value = '0';
             document.getElementById('itemPrice').value = '0';
             document.getElementById('itemExpiry').value = '';
             document.getElementById('itemReminderDate').value = '';
@@ -8660,7 +10293,11 @@ $currentUserJson = json_encode([
             document.getElementById('itemId').value = item.id;
             document.getElementById('itemName').value = item.name;
             document.getElementById('itemSourceShoppingId').value = '';
-            document.getElementById('itemQuantity').value = item.quantity;
+            const editQty = Math.max(0, Number(item.quantity || 0), Number(item.remaining_total || 0));
+            document.getElementById('itemQuantity').value = editQty;
+            document.getElementById('itemRemainingCurrent').value = Number(item.remaining_total || 0) > 0
+                ? String(Math.min(editQty, Math.max(0, Number(item.remaining_current || 0))))
+                : '';
             document.getElementById('itemPrice').value = item.purchase_price;
             document.getElementById('itemDate').value = item.purchase_date;
             document.getElementById('itemExpiry').value = item.expiry_date || '';
@@ -8743,13 +10380,41 @@ $currentUserJson = json_encode([
             e.preventDefault();
             const id = document.getElementById('itemId').value;
             const sourceShoppingId = +document.getElementById('itemSourceShoppingId').value || 0;
+            const quantityRaw = String(document.getElementById('itemQuantity').value || '').trim();
+            if (quantityRaw !== '' && !/^\d+$/.test(quantityRaw)) {
+                toast('数量只能输入数字', 'error');
+                return false;
+            }
+            const quantity = quantityRaw === '' ? 0 : Number.parseInt(quantityRaw, 10);
+            const remainingCurrentRaw = String(document.getElementById('itemRemainingCurrent').value || '').trim();
+            const hasRemainingValue = remainingCurrentRaw !== '';
+            const parseRemainingInput = (raw, label) => {
+                if (raw === '') return 0;
+                if (!/^\d+$/.test(raw)) {
+                    toast(`${label}只能输入数字`, 'error');
+                    return null;
+                }
+                return Number.parseInt(raw, 10);
+            };
+            let remainingCurrent = 0;
+            if (hasRemainingValue) {
+                const parsedRemaining = parseRemainingInput(remainingCurrentRaw, '余量');
+                if (parsedRemaining === null) return false;
+                remainingCurrent = parsedRemaining;
+                if (remainingCurrent > quantity) {
+                    toast('余量数值不能大于数量', 'error');
+                    return false;
+                }
+            }
             const data = {
                 id: id ? +id : undefined,
                 name: document.getElementById('itemName').value.trim(),
                 category_id: +document.getElementById('itemCategory').value,
                 subcategory_id: +document.getElementById('itemSubcategory').value,
                 location_id: +document.getElementById('itemLocation').value,
-                quantity: +document.getElementById('itemQuantity').value,
+                quantity: quantity,
+                remaining_current: remainingCurrent,
+                remaining_total: hasRemainingValue ? quantity : 0,
                 purchase_price: +document.getElementById('itemPrice').value,
                 purchase_date: document.getElementById('itemDate').value,
                 expiry_date: document.getElementById('itemExpiry').value,
@@ -9561,7 +11226,9 @@ $currentUserJson = json_encode([
             document.getElementById('itemImage').value = '';
             document.getElementById('itemSourceShoppingId').value = item.id;
             document.getElementById('itemName').value = item.name || '';
-            document.getElementById('itemQuantity').value = Math.max(1, Number(item.quantity || 1));
+            const convertedQty = Math.max(1, Number(item.quantity || 1));
+            document.getElementById('itemQuantity').value = convertedQty;
+            document.getElementById('itemRemainingCurrent').value = convertedQty;
             document.getElementById('itemPrice').value = Math.max(0, Number(item.planned_price || 0));
             document.getElementById('itemDate').value = today;
             document.getElementById('itemExpiry').value = '';
@@ -9817,7 +11484,12 @@ $currentUserJson = json_encode([
             if (!data.name) { toast('请输入分类名称', 'error'); return false; }
             const endpoint = id ? 'categories/update' : 'categories';
             const res = await apiPost(endpoint, data);
-            if (res.success) { toast(id ? '分类已更新' : '分类已添加'); closeCategoryModal(); renderView(); } else toast(res.message, 'error');
+            if (res.success) {
+                invalidateBaseDataCache();
+                toast(id ? '分类已更新' : '分类已添加');
+                closeCategoryModal();
+                renderView();
+            } else toast(res.message, 'error');
             return false;
         }
 
@@ -9826,7 +11498,11 @@ $currentUserJson = json_encode([
             const childTip = Number(childCount || 0) > 0 ? `该分类下 ${childCount} 个二级分类也会被一并删除。` : '';
             if (!confirm(`确定删除分类「${name}」？${itemTip}${childTip}`)) return;
             const res = await apiPost('categories/delete', { id });
-            if (res.success) { toast('分类已删除'); renderView(); } else toast(res.message, 'error');
+            if (res.success) {
+                invalidateBaseDataCache();
+                toast('分类已删除');
+                renderView();
+            } else toast(res.message, 'error');
         }
 
         function closeCategoryModal() {
@@ -9943,14 +11619,23 @@ $currentUserJson = json_encode([
             if (!data.name) { toast('请输入位置名称', 'error'); return false; }
             const endpoint = id ? 'locations/update' : 'locations';
             const res = await apiPost(endpoint, data);
-            if (res.success) { toast(id ? '位置已更新' : '位置已添加'); closeLocationModal(); renderView(); } else toast(res.message, 'error');
+            if (res.success) {
+                invalidateBaseDataCache();
+                toast(id ? '位置已更新' : '位置已添加');
+                closeLocationModal();
+                renderView();
+            } else toast(res.message, 'error');
             return false;
         }
 
         async function deleteLocation(id, name, count) {
             if (!confirm(`确定删除位置「${name}」？${count > 0 ? `其下 ${count} 件物品将变为未设定位置。` : ''}`)) return;
             const res = await apiPost('locations/delete', { id });
-            if (res.success) { toast('位置已删除'); renderView(); } else toast(res.message, 'error');
+            if (res.success) {
+                invalidateBaseDataCache();
+                toast('位置已删除');
+                renderView();
+            } else toast(res.message, 'error');
         }
 
         function closeLocationModal() {
@@ -10122,6 +11807,7 @@ $currentUserJson = json_encode([
                 if (!confirm(`即将导入 ${importPayload.items.length} 件物品${imageHint}，确认继续？`)) return;
                 const res = await apiPost('import', importPayload);
                 if (res.success) {
+                    invalidateBaseDataCache();
                     toast(res.message);
                     renderView();
                 } else toast(res.message, 'error');
@@ -10478,7 +12164,11 @@ $currentUserJson = json_encode([
             document.getElementById('itemId').value = '';  // 无 ID = 新建
             document.getElementById('itemSourceShoppingId').value = '';
             document.getElementById('itemName').value = item.name + ' (副本)';
-            document.getElementById('itemQuantity').value = item.quantity;
+            const copyQty = Math.max(0, Number(item.quantity || 0), Number(item.remaining_total || 0));
+            document.getElementById('itemQuantity').value = copyQty;
+            document.getElementById('itemRemainingCurrent').value = Number(item.remaining_total || 0) > 0
+                ? String(Math.min(copyQty, Math.max(0, Number(item.remaining_current || 0))))
+                : '';
             document.getElementById('itemPrice').value = item.purchase_price;
             document.getElementById('itemDate').value = item.purchase_date;
             document.getElementById('itemExpiry').value = item.expiry_date || '';
@@ -10727,16 +12417,37 @@ $currentUserJson = json_encode([
         // ---------- 更新记录数据 ----------
         const CHANGELOG = [
             {
-                version: 'v1.5.2', date: '2026-02-19', title: '账号体验升级：注册双态提示 + 自定义验证问题 + Demo 覆盖增强',
+                version: 'v1.6.1', date: '2026-02-19', title: '设置体验优化 + 页面响应提升',
+                changes: [
+                    '通用设置结构重整：按“仪表盘相关 / 列表页面相关”分组展示，查找更直观',
+                    '提醒能力整合：余量提醒阈值并入通用设置，避免多入口来回切换',
+                    '设置项顺序优化：仪表盘组内按“提醒显示范围 → 分类统计排序 → 余量提醒阈值”排列',
+                    '用户操作日志优化：仅显示业务描述，不再展示“当前返回多少条”',
+                    '设置变更日志优化：只记录实际改动项，避免未改动项重复出现',
+                    '下拉筛选与编辑表单的交互更顺滑，长时间停留页面时资源占用更稳定',
+                    '分类与位置等基础数据加载策略优化，频繁切换页面时等待更少',
+                    '物品详情打开流程优化，减少无效加载带来的等待'
+                ]
+            },
+            {
+                version: 'v1.6.0', date: '2026-02-19', title: '仪表盘管理上线：提醒范围可配置 + 展示自适应优化',
+                changes: [
+                    '设置页新增“仪表盘管理”，可分别配置过期提醒与备忘提醒的显示时间范围',
+                    '过期提醒支持配置“过期 X 天到未来 X 天”；输入留空可按需改为不限制',
+                    '备忘提醒支持配置“过期 X 天到未来 X 天”；输入留空可按需改为不限制',
+                    '默认范围更新为：过期提醒“过期不限制，未来 60 天”；备忘提醒“过期不限制，未来 3 天”',
+                    '仪表盘提醒卡片网格升级为自适应铺满：仅在可容纳新卡片时自动增列，减少右侧空白',
+                    '提醒时间文案优化为单行显示，避免“已过期 X 天”在窄卡片中换行影响阅读'
+                ]
+            },
+            {
+                version: 'v1.5.2', date: '2026-02-19', title: '账号体验升级：注册双态提示 + 自定义验证问题',
                 changes: [
                     '注册页新增“开放注册/暂未开放”双态提示，登录页与注册页提示语分开显示，信息更清晰',
                     '平台关闭注册时，仍保留“注册”入口，但创建账号按钮会禁用并显示关闭说明',
                     '注册关闭时不再展示用户名、密码等注册输入框，避免无效填写',
                     '注册验证问题新增“自定义问题”，可自行填写问题与答案，找回密码时可直接显示该问题',
-                    '用户管理卡片新增每位成员的操作日志条数，便于管理员快速判断活跃度',
-                    'Demo 账号升级为自定义验证问题样例，便于演示注册与找回密码的新流程',
-                    'Demo 数据补充操作日志样例，首次进入即可覆盖日志筛选与日志查看场景',
-                    '数据导出版本号同步升级为 v1.5.2'
+                    '用户管理卡片新增每位成员的操作日志条数，便于管理员快速判断活跃度'
                 ]
             },
             {
@@ -10751,8 +12462,7 @@ $currentUserJson = json_encode([
                     '位置编辑弹窗新增分组 Emoji 选择能力，与分类编辑体验统一',
                     '公共频道“加入购物清单”流程优化，加入动作更稳定，备注文案更清晰（如“1件”）',
                     '公共频道权限体验优化：可清楚区分“仅发布者可编辑”与“其他用户可查看/评论”',
-                    '展示模式（Demo）数据升级，覆盖二级分类、共享权限差异、评论互动与加入购物清单场景',
-                    '修复展示数据串入正式账号公共频道的问题，演示与正式数据边界更清晰',
+                    '公共频道数据隔离优化，避免不同账号之间出现错误穿透',
                     '移动端体验优化：日期输入框尺寸统一，分类管理与物品管理关键操作按钮改为纵向排布'
                 ]
             },
@@ -10767,22 +12477,17 @@ $currentUserJson = json_encode([
                     '共享物品加入购物清单时会自动带上推荐理由，后续回看更直观',
                     '共享物品下架后，相关评论会同步清理，公共频道保持整洁',
                     '共享信息编辑流程更集中，维护公共频道内容更高效',
-                    '展示模式（Demo）数据升级：内置共享物品、推荐理由、公共频道评论示例（含发布者/管理员评论）',
                     '侧边栏信息架构微调：公共频道、位置管理、分类管理与设置分组顺序优化'
                 ]
             },
             {
-                version: 'v1.4.0', date: '2026-02-12', title: '多用户登录与管理 + Demo 一键体验',
+                version: 'v1.4.0', date: '2026-02-12', title: '多用户登录与管理',
                 changes: [
                     '新增账号体系：支持登录/注册/退出登录，每位用户只看到自己的物品数据',
                     '新增管理员角色与默认管理员账号（admin），支持历史账号自动升级为管理员',
                     '注册流程新增验证问题与答案，用于后续密码找回',
                     '新增“忘记密码”流程：先查询验证问题，再校验答案并重置密码',
-                    '新增管理员“用户管理”页面：查看用户、角色、物品种类数/总件数、最近登录时间，并可重置用户密码',
-                    '登录页新增 Demo 按钮，点击即可一键进入展示环境（无需预填账号密码）',
-                    'Demo 登录体验优化：首次进入也能自动准备好演示账号和数据',
-                    '展示模式覆盖状态统计、过期提醒、循环提醒、购物提醒、回收站等完整场景',
-                    '展示模式数据来源统一，演示内容更稳定一致'
+                    '新增管理员“用户管理”页面：查看用户、角色、物品种类数/总件数、最近登录时间，并可重置用户密码'
                 ]
             },
             {
@@ -10805,8 +12510,7 @@ $currentUserJson = json_encode([
                     '修复浅色模式状态管理中图标下拉菜单背景过深问题，提升可读性',
                     '优化浅色模式下“查看清单/待完成/已完成/撤销”按钮文字与边框对比',
                     '优化仪表盘过期提醒与备忘提醒卡片在深浅色模式下的配色协调性',
-                    '仪表盘备忘提醒新增分项统计（过期/循环/购物），分类统计与状态统计统一单位“件”',
-                    '展示模式补充购物清单与循环提醒示例，重置后演示环境更干净'
+                    '仪表盘备忘提醒新增分项统计（过期/循环/购物），分类统计与状态统计统一单位“件”'
                 ]
             },
             {
@@ -10815,7 +12519,6 @@ $currentUserJson = json_encode([
                     '设置菜单中的「导入/导出」统一改名为「数据管理」',
                     '新增「物品数据重置」与「恢复默认环境」两项能力',
                     '重置或恢复默认时，历史图片会先进入回收区，降低误删风险',
-                    '数据管理新增「展示模式」，可一键导入演示数据用于功能展示',
                     '新增购入渠道管理（默认：淘宝/京东/拼多多/闲鱼/线下/礼品），表单改为下拉选择',
                     '移除位置上下级功能，位置管理统一为单级结构',
                     '分类管理固定显示「未分类」、位置管理固定显示「未设定」，并支持一键查看对应物品',
@@ -10874,9 +12577,41 @@ $currentUserJson = json_encode([
         // ---------- 设置页面 ----------
         function renderSettings(container) {
             const s = App.sortSettings;
+            const d = normalizeDashboardSettings(App.dashboardSettings || defaultDashboardSettings);
             container.innerHTML = `
-        <div class="max-w-2xl mx-auto space-y-6">
-            <div class="glass rounded-2xl p-6 anim-up">
+        <div class="max-w-3xl mx-auto space-y-6">
+            <div class="px-1 anim-up">
+                <h3 class="text-sm font-semibold text-slate-200">仪表盘相关</h3>
+                <p class="text-xs text-slate-500 mt-1">先设置提醒显示与统计排序，页面展示将按这些规则更新</p>
+            </div>
+
+            <div class="glass rounded-2xl p-6 anim-up" style="animation-delay:0.02s">
+                <div class="flex items-center gap-3 mb-5">
+                    <div class="w-10 h-10 rounded-xl bg-cyan-500/10 flex items-center justify-center"><i class="ri-dashboard-3-line text-xl text-cyan-400"></i></div>
+                    <div><h3 class="font-semibold text-white">仪表盘管理 · 提醒显示范围</h3><p class="text-xs text-slate-500">可分别控制过期提醒与备忘提醒在仪表盘中的可见时间窗口</p></div>
+                </div>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                        <label class="block text-xs text-slate-500 mb-1">过期提醒：过期天数下限（天）</label>
+                        <input type="number" min="0" step="1" id="set_expiry_past_days" class="input" value="${d.expiry_past_days === null ? '' : Number(d.expiry_past_days)}" placeholder="留空=不过滤过期天数">
+                    </div>
+                    <div>
+                        <label class="block text-xs text-slate-500 mb-1">过期提醒：未来天数上限（天）</label>
+                        <input type="number" min="0" step="1" id="set_expiry_future_days" class="input" value="${d.expiry_future_days === null ? '' : Number(d.expiry_future_days)}" placeholder="默认 60，留空=不限制">
+                    </div>
+                    <div>
+                        <label class="block text-xs text-slate-500 mb-1">备忘提醒：过期天数下限（天）</label>
+                        <input type="number" min="0" step="1" id="set_reminder_past_days" class="input" value="${d.reminder_past_days === null ? '' : Number(d.reminder_past_days)}" placeholder="留空=不过滤过期天数">
+                    </div>
+                    <div>
+                        <label class="block text-xs text-slate-500 mb-1">备忘提醒：未来天数上限（天）</label>
+                        <input type="number" min="0" step="1" id="set_reminder_future_days" class="input" value="${d.reminder_future_days === null ? '' : Number(d.reminder_future_days)}" placeholder="默认 3，留空=不限制">
+                    </div>
+                </div>
+                <p class="text-xs text-slate-500 mt-4">当前默认：过期提醒（过期不限制，未来 60 天）；备忘提醒（过期不限制，未来 3 天）。输入留空表示不限制。</p>
+            </div>
+
+            <div class="glass rounded-2xl p-6 anim-up" style="animation-delay:0.04s">
                 <div class="flex items-center gap-3 mb-5">
                     <div class="w-10 h-10 rounded-xl bg-violet-500/10 flex items-center justify-center"><i class="ri-sort-asc text-xl text-violet-400"></i></div>
                     <div><h3 class="font-semibold text-white">仪表盘 · 分类统计排序</h3><p class="text-xs text-slate-500">控制仪表盘分类统计板块的显示顺序</p></div>
@@ -10888,7 +12623,29 @@ $currentUserJson = json_encode([
                 </select>
             </div>
 
-            <div class="glass rounded-2xl p-6 anim-up" style="animation-delay:0.05s">
+            <div class="glass rounded-2xl p-6 anim-up" style="animation-delay:0.06s">
+                <div class="flex items-center gap-3 mb-5">
+                    <div class="w-10 h-10 rounded-xl bg-teal-500/10 flex items-center justify-center"><i class="ri-notification-3-line text-xl text-teal-400"></i></div>
+                    <div><h3 class="font-semibold text-white">仪表盘管理 · 余量提醒阈值</h3><p class="text-xs text-slate-500">当余量/数量低于阈值时，自动在备忘提醒中生成补货提醒</p></div>
+                </div>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                        <label class="block text-xs text-slate-500 mb-1">触发阈值（%）</label>
+                        <input type="number" min="0" max="100" step="1" id="set_low_stock_threshold_pct" class="input" value="${Number(d.low_stock_threshold_pct)}" placeholder="默认 20">
+                    </div>
+                    <div class="text-xs text-slate-500 leading-6">
+                        <p>推荐值：20%</p>
+                        <p>设置为 0 表示关闭自动余量提醒。</p>
+                    </div>
+                </div>
+            </div>
+
+            <div class="px-1 pt-1 anim-up" style="animation-delay:0.08s">
+                <h3 class="text-sm font-semibold text-slate-200">列表页面相关</h3>
+                <p class="text-xs text-slate-500 mt-1">控制物品、分类、位置等管理页面的默认排序方式</p>
+            </div>
+
+            <div class="glass rounded-2xl p-6 anim-up" style="animation-delay:0.1s">
                 <div class="flex items-center gap-3 mb-5">
                     <div class="w-10 h-10 rounded-xl bg-sky-500/10 flex items-center justify-center"><i class="ri-archive-line text-xl text-sky-400"></i></div>
                     <div><h3 class="font-semibold text-white">物品管理 · 默认排序</h3><p class="text-xs text-slate-500">控制进入物品列表时的默认排序方式</p></div>
@@ -10902,7 +12659,7 @@ $currentUserJson = json_encode([
                 </select>
             </div>
 
-            <div class="glass rounded-2xl p-6 anim-up" style="animation-delay:0.1s">
+            <div class="glass rounded-2xl p-6 anim-up" style="animation-delay:0.12s">
                 <div class="flex items-center gap-3 mb-5">
                     <div class="w-10 h-10 rounded-xl bg-emerald-500/10 flex items-center justify-center"><i class="ri-price-tag-3-line text-xl text-emerald-400"></i></div>
                     <div><h3 class="font-semibold text-white">分类管理 · 列表排序</h3><p class="text-xs text-slate-500">控制分类管理页面的卡片显示顺序</p></div>
@@ -10914,7 +12671,7 @@ $currentUserJson = json_encode([
                 </select>
             </div>
 
-            <div class="glass rounded-2xl p-6 anim-up" style="animation-delay:0.15s">
+            <div class="glass rounded-2xl p-6 anim-up" style="animation-delay:0.14s">
                 <div class="flex items-center gap-3 mb-5">
                     <div class="w-10 h-10 rounded-xl bg-amber-500/10 flex items-center justify-center"><i class="ri-map-pin-line text-xl text-amber-400"></i></div>
                     <div><h3 class="font-semibold text-white">位置管理 · 列表排序</h3><p class="text-xs text-slate-500">控制位置管理页面的卡片显示顺序</p></div>
@@ -10929,6 +12686,14 @@ $currentUserJson = json_encode([
             <button onclick="applySettings()" class="btn btn-primary w-full"><i class="ri-save-line"></i>保存设置</button>
         </div>
     `;
+        }
+
+        function renderReminderSettings(container) {
+            renderSettings(container);
+        }
+
+        function saveReminderSettings() {
+            applySettings();
         }
 
         async function renderPlatformSettings(container) {
@@ -11080,7 +12845,7 @@ $currentUserJson = json_encode([
                         <div class="w-10 h-10 rounded-xl bg-cyan-500/10 flex items-center justify-center"><i class="ri-file-list-3-line text-xl text-cyan-400"></i></div>
                         <div>
                             <h3 class="font-semibold text-white">操作日志</h3>
-                            <p class="text-xs text-slate-500">仅显示当前账号最近 30 条操作记录（当前返回 ${rows.length} 条）</p>
+                            <p class="text-xs text-slate-500">仅显示当前账号最近 30 条操作记录</p>
                         </div>
                     </div>
                     <div class="flex items-center gap-2">
@@ -11165,20 +12930,121 @@ $currentUserJson = json_encode([
     `;
         }
 
+        function readOptionalRangeInput(inputId, label) {
+            const el = document.getElementById(inputId);
+            if (!el) return { ok: false, value: null };
+            const raw = String(el.value || '').trim();
+            if (raw === '') return { ok: true, value: null };
+            const value = Number.parseInt(raw, 10);
+            if (!Number.isFinite(value) || value < 0) {
+                toast(`${label}需为大于等于 0 的整数，留空表示不限制`, 'error');
+                el.focus();
+                return { ok: false, value: null };
+            }
+            return { ok: true, value };
+        }
+
         function applySettings() {
             const prev = { ...App.sortSettings };
+            const prevDashboard = normalizeDashboardSettings(App.dashboardSettings || defaultDashboardSettings);
             const s = {
                 dashboard_categories: document.getElementById('set_dashboard_categories').value,
                 items_default: document.getElementById('set_items_default').value,
                 categories_list: document.getElementById('set_categories_list').value,
                 locations_list: document.getElementById('set_locations_list').value,
             };
+            const expiryPast = readOptionalRangeInput('set_expiry_past_days', '过期提醒过期天数下限');
+            if (!expiryPast.ok) return;
+            const expiryFuture = readOptionalRangeInput('set_expiry_future_days', '过期提醒未来天数上限');
+            if (!expiryFuture.ok) return;
+            const reminderPast = readOptionalRangeInput('set_reminder_past_days', '备忘提醒过期天数下限');
+            if (!reminderPast.ok) return;
+            const reminderFuture = readOptionalRangeInput('set_reminder_future_days', '备忘提醒未来天数上限');
+            if (!reminderFuture.ok) return;
+            const lowStockInput = document.getElementById('set_low_stock_threshold_pct');
+            if (!lowStockInput) return;
+            const lowStockRaw = String(lowStockInput.value || '').trim();
+            if (lowStockRaw === '' || !/^\d+$/.test(lowStockRaw)) {
+                toast('余量提醒阈值需为 0-100 的整数', 'error');
+                lowStockInput.focus();
+                return;
+            }
+            const lowStockThresholdPct = Math.max(0, Math.min(100, Number.parseInt(lowStockRaw, 10)));
+            const nextDashboard = saveDashboardSettings({
+                expiry_past_days: expiryPast.value,
+                expiry_future_days: expiryFuture.value,
+                reminder_past_days: reminderPast.value,
+                reminder_future_days: reminderFuture.value,
+                low_stock_threshold_pct: lowStockThresholdPct,
+            });
             saveSortSettings(s);
             // 同步物品默认排序
             const [sort, order] = s.items_default.split(':');
             App.itemsSort = sort; App.itemsOrder = order;
-            const detail = `仪表盘分类排序: ${prev.dashboard_categories} -> ${s.dashboard_categories}；物品默认排序: ${prev.items_default} -> ${s.items_default}；分类列表排序: ${prev.categories_list} -> ${s.categories_list}；位置列表排序: ${prev.locations_list} -> ${s.locations_list}`;
-            logSettingEvent('settings.sort', detail);
+            const sortLabelMaps = {
+                dashboard_categories: {
+                    count_desc: '按物品种类数 多→少',
+                    total_qty_desc: '按物品总件数 多→少',
+                    name_asc: '按名称首字母 A→Z'
+                },
+                items_default: {
+                    'updated_at:DESC': '最近更新',
+                    'created_at:DESC': '最近添加',
+                    'name:ASC': '名称 A→Z',
+                    'purchase_price:DESC': '价格 高→低',
+                    'quantity:DESC': '数量 多→少'
+                },
+                categories_list: {
+                    custom: '系统默认顺序',
+                    count_desc: '按物品数量 多→少',
+                    name_asc: '按名称首字母 A→Z'
+                },
+                locations_list: {
+                    custom: '系统默认顺序',
+                    count_desc: '按物品数量 多→少',
+                    name_asc: '按名称首字母 A→Z'
+                }
+            };
+            const sortFields = [
+                ['dashboard_categories', '仪表盘分类排序'],
+                ['items_default', '物品默认排序'],
+                ['categories_list', '分类列表排序'],
+                ['locations_list', '位置列表排序']
+            ];
+            const sortChanges = [];
+            sortFields.forEach(([key, label]) => {
+                const before = String(prev[key] || '');
+                const after = String(s[key] || '');
+                if (before === after) return;
+                const beforeText = sortLabelMaps[key]?.[before] || before;
+                const afterText = sortLabelMaps[key]?.[after] || after;
+                sortChanges.push(`${label}：“${beforeText}” → “${afterText}”`);
+            });
+            if (sortChanges.length > 0) {
+                logSettingEvent('settings.sort', sortChanges.join('；'));
+            }
+
+            const rangeChanges = [];
+            if (prevDashboard.expiry_past_days !== nextDashboard.expiry_past_days) {
+                rangeChanges.push(`过期提醒过期天数下限：${formatRangeLimitLabel(prevDashboard.expiry_past_days)} → ${formatRangeLimitLabel(nextDashboard.expiry_past_days)}`);
+            }
+            if (prevDashboard.expiry_future_days !== nextDashboard.expiry_future_days) {
+                rangeChanges.push(`过期提醒未来天数上限：${formatRangeLimitLabel(prevDashboard.expiry_future_days)} → ${formatRangeLimitLabel(nextDashboard.expiry_future_days)}`);
+            }
+            if (prevDashboard.reminder_past_days !== nextDashboard.reminder_past_days) {
+                rangeChanges.push(`备忘提醒过期天数下限：${formatRangeLimitLabel(prevDashboard.reminder_past_days)} → ${formatRangeLimitLabel(nextDashboard.reminder_past_days)}`);
+            }
+            if (prevDashboard.reminder_future_days !== nextDashboard.reminder_future_days) {
+                rangeChanges.push(`备忘提醒未来天数上限：${formatRangeLimitLabel(prevDashboard.reminder_future_days)} → ${formatRangeLimitLabel(nextDashboard.reminder_future_days)}`);
+            }
+            if (rangeChanges.length > 0) {
+                logSettingEvent('settings.dashboard_ranges', rangeChanges.join('；'));
+            }
+
+            if (Number(prevDashboard.low_stock_threshold_pct) !== Number(nextDashboard.low_stock_threshold_pct)) {
+                const lowStockDetail = `余量提醒阈值：${Number(prevDashboard.low_stock_threshold_pct)}% → ${Number(nextDashboard.low_stock_threshold_pct)}%`;
+                logSettingEvent('settings.reminder_low_stock', lowStockDetail);
+            }
             toast('设置已保存');
         }
 
@@ -11200,6 +13066,7 @@ $currentUserJson = json_encode([
             if (!res.success) { toast(res.message || '恢复失败', 'error'); return; }
 
             localStorage.removeItem(SORT_SETTINGS_KEY);
+            localStorage.removeItem(DASHBOARD_SETTINGS_KEY);
             localStorage.removeItem(ITEMS_SIZE_KEY);
             localStorage.removeItem(ITEM_ATTRS_KEY);
             localStorage.removeItem(STATUS_KEY);
@@ -11211,10 +13078,14 @@ $currentUserJson = json_encode([
             App.itemsSize = 'large';
             App.itemAttrs = [...defaultItemAttrs];
             App.sortSettings = { ...defaultSortSettings };
+            App.dashboardSettings = { ...defaultDashboardSettings };
             App.itemsFilter = { search: '', category: 0, location: 0, status: '', expiryOnly: false };
             App.itemsPage = 1;
             App.itemsSort = 'updated_at';
             App.itemsOrder = 'DESC';
+            App.categories = [];
+            App.locations = [];
+            invalidateBaseDataCache();
             App.selectedItems.clear();
             App._cachedItems = null;
             App._cachedTotal = 0;
@@ -11628,6 +13499,7 @@ $currentUserJson = json_encode([
         // 🎬 初始化
         // ============================================================
         initTheme();
+        initCustomSelects();
         setupDateInputPlaceholders();
         initFormEmojiPickers();
         // 设置版本号

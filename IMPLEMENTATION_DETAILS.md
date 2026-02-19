@@ -2,7 +2,7 @@
 
 > 目标：将实现说明拆分为数据库层、API 层、UI 层，方便按职责快速定位与修改。
 >
-> 行号基于当前版本：`index.php` 约 11145 行，`README.md` 约 279 行。后续行号漂移时请用本文提供的命令重新定位。
+> 行号基于当前版本：`index.php` 约 11846 行，`README.md` 约 298 行。后续行号漂移时请用本文提供的命令重新定位。
 
 ## 目录
 
@@ -57,6 +57,9 @@ rg -n "subcategory|parent_id|category-mindmap|catEmojiPicker|locEmojiPicker|EMOJ
 
 # v1.5.2 注册与账号体验
 rg -n "question_custom|security_question_label|registerClosedPanel|updateAuthHint|allow_public_registration|operation_log_count" index.php
+
+# v1.6.0 仪表盘管理（提醒范围）
+rg -n "dashboard_settings|expiry_past_days|expiry_future_days|reminder_past_days|reminder_future_days|settings.dashboard_ranges|dashboard-reminder-grid" index.php
 
 # 日期占位相关
 rg -n "DATE_PLACEHOLDER_TEXT|data-date-placeholder|refreshDateInputPlaceholderDisplay" index.php
@@ -200,6 +203,22 @@ php -l index.php
 - 验证
 - 加载展示模式后，仪表盘可直接看到循环提醒已完成样例与购物提醒。
 - 购物清单展示“待购买/待收货”两类演示数据。
+
+### 2.5 v1.6.0：仪表盘管理（提醒范围可配置）
+
+- 代码位置
+- `index.php`：`case 'dashboard'`（读取 `expiry_* / reminder_*` 参数并动态拼装 SQL 过滤条件）
+- `index.php`：`operation-logs/client-event`（新增 `settings.dashboard_ranges` 事件映射）
+- `index.php`：`loadDemoDataIntoDb`（新增“仪表盘管理设置”操作日志样例）
+
+- 修改步骤
+1. 如要改默认窗口，先调整 `dashboard` API 的参数默认值（当前：过期未来 60 天，备忘未来 3 天）。
+2. 如要改“留空即不限制”，同时改前端 query 传参与后端解析逻辑，保持含义一致。
+3. 如要把窗口改为按账号/服务端持久化，需新增后端设置存储并替换当前前端本地存储逻辑。
+
+- 验证
+- 设置里保存范围后，仪表盘“过期提醒/备忘提醒”返回数量会同步变化。
+- 输入框留空时对应维度不限制，输入整数时按天数限制。
 
 ---
 
@@ -516,13 +535,26 @@ php -l index.php
 - `index.php`：`auth/demo-login`（Demo 账号预置自定义验证问题）
 - `index.php`：`loadDemoDataIntoDb`（补充操作日志样例，便于演示日志能力）
 
+### 4.9 v1.6.0：设置页新增“仪表盘管理” + 提醒卡片自适应网格
+
+- 代码位置
+- `index.php`：`defaultDashboardSettings / loadDashboardSettings / saveDashboardSettings`
+- `index.php`：`renderSettings`（新增 4 个范围输入项）
+- `index.php`：`applySettings`（范围校验、保存、日志埋点）
+- `index.php`：`renderDashboard`（携带范围参数请求 `dashboard`）
+- `index.php`：`.dashboard-reminder-grid` 与 `.expiry-meta/.reminder-meta`（自适应铺满 + 单行文案）
+
+- 验证
+- 设置页保存后刷新仍保留范围值。
+- 宽屏下提醒卡片自动扩列并尽量铺满，时间文案不换行。
+
 ---
 
 ## <a id="sec-release"></a>发布与文档同步
 
 - 页面内置更新记录：`index.php` 中 `const CHANGELOG = [...]`
 - 当前版本号来源：`index.php` 中 `const APP_VERSION = CHANGELOG[0].version`
-- README 版本记录：`README.md` 的“更新记录”章节（当前置顶 `v1.5.2`）
+- README 版本记录：`README.md` 的“更新记录”章节（当前置顶 `v1.6.1`）
 - README 功能总览：`README.md` 的“功能概览”章节（含公共频道）
 
 发布新功能建议同步顺序：
@@ -568,4 +600,5 @@ php -l index.php
 7. 购物状态分组：待购买/待收货分组与计数、空状态文案符合预期。
 8. 展示模式：加载后含购物清单与已完成提醒样例，重置后不会残留旧实例。
 9. 深浅色切换：中尺寸卡片按钮、状态图标下拉、提醒操作按钮视觉正常。
-10. 执行 `php -l index.php` 无语法错误。
+10. 仪表盘管理：范围留空与填值两种场景都能正确控制提醒列表。
+11. 执行 `php -l index.php` 无语法错误。
