@@ -1088,6 +1088,7 @@ function initSchema($db)
         ['运动户外', '⚽', '#14b8a6'],
         ['虚拟产品', '🧩', '#06b6d4'],
         ['食物', '🍱', '#f97316'],
+        ['一次性用品', '🧻', '#0ea5e9'],
         ['其他', '📦', '#64748b'],
     ];
     $defaultSubCategories = [
@@ -1119,10 +1120,10 @@ function initSchema($db)
             }
         }
     } else {
-        // 兼容历史版本：保底补充“虚拟产品”“食物”一级分类
+        // 兼容历史版本：保底补充“虚拟产品”“食物”“一次性用品”一级分类
         foreach ($defaultTopCategories as $cat) {
             [$name, $icon, $color] = $cat;
-            if (!in_array($name, ['虚拟产品', '食物'], true)) {
+            if (!in_array($name, ['虚拟产品', '食物', '一次性用品'], true)) {
                 continue;
             }
             $findCategoryStmt->execute([$name]);
@@ -1743,8 +1744,8 @@ function loadDemoDataIntoDb($db, $options = [])
             ['name' => '维生素 D3', 'category' => '其他', 'subcategory' => '日用杂项', 'location' => '厨房', 'quantity' => 2, 'remaining_current' => 1, 'description' => '保健品', 'barcode' => 'HEALTH-D3-01', 'purchase_date' => date('Y-m-d', strtotime('-60 days')), 'purchase_price' => 128, 'tags' => '保健,补剂', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+5 days')), 'purchase_from' => '线下', 'notes' => '还有约一周到期，优先使用'],
             ['name' => '车载灭火器', 'category' => '工具五金', 'location' => '阳台', 'quantity' => 1, 'remaining_current' => 0, 'description' => '安全应急用品', 'barcode' => 'SAFE-FIRE-01', 'purchase_date' => date('Y-m-d', strtotime('-480 days')), 'purchase_price' => 89, 'tags' => '安全,应急', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('-12 days')), 'purchase_from' => '京东', 'notes' => '已超过有效期，需尽快更换'],
             ['name' => '沐浴露补充装', 'category' => '其他', 'subcategory' => '日用杂项', 'location' => '储物间', 'quantity' => 3, 'description' => '家庭日用品', 'barcode' => 'HOME-BATH-03', 'purchase_date' => date('Y-m-d', strtotime('-30 days')), 'purchase_price' => 75, 'tags' => '日用品,家居', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+25 days')), 'purchase_from' => '拼多多', 'notes' => '本月内到期，先用旧库存'],
-            ['name' => '训练足球', 'category' => '运动户外', 'subcategory' => '球类器材', 'location' => '阳台', 'quantity' => 1, 'description' => '周末运动使用', 'barcode' => 'SPORT-BALL-01', 'purchase_date' => date('Y-m-d', strtotime('-210 days')), 'purchase_price' => 199, 'tags' => '运动,户外', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '淘宝', 'notes' => '周末固定训练用球', 'reminder_date' => date('Y-m-d', strtotime('-13 days')), 'reminder_next_date' => date('Y-m-d', strtotime('+1 day')), 'reminder_cycle_value' => 1, 'reminder_cycle_unit' => 'week', 'reminder_note' => '周末出门前检查气压'],
-            ['name' => '空气净化器滤芯', 'category' => '家具家居', 'subcategory' => '清洁收纳', 'location' => '客厅', 'quantity' => 1, 'remaining_current' => 0, 'description' => '客厅净化器维护项目', 'barcode' => 'AIR-FILTER-01', 'purchase_date' => date('Y-m-d', strtotime('-200 days')), 'purchase_price' => 169, 'tags' => '家居,维护', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '上次维护后需持续追踪更换周期', 'is_public_shared' => 1, 'public_recommend_reason' => '价格和性能平衡，适合作为常备耗材', 'reminder_date' => date('Y-m-d', strtotime('-1 day')), 'reminder_next_date' => $today, 'reminder_cycle_value' => 1, 'reminder_cycle_unit' => 'day', 'reminder_note' => '每日检查滤芯状态并记录'],
+            ['name' => '训练足球', 'category' => '运动户外', 'subcategory' => '球类器材', 'location' => '阳台', 'quantity' => 1, 'description' => '周末运动使用', 'barcode' => 'SPORT-BALL-01', 'purchase_date' => date('Y-m-d', strtotime('-210 days')), 'purchase_price' => 199, 'tags' => '运动,户外', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '淘宝', 'notes' => '周末固定训练用球', 'reminder_date' => date('Y-m-d', strtotime('-20 days')), 'reminder_next_date' => date('Y-m-d', strtotime('+1 day')), 'reminder_cycle_value' => 1, 'reminder_cycle_unit' => 'week', 'reminder_note' => '按首次训练日期每周提醒一次，出门前检查气压'],
+            ['name' => '空气净化器滤芯', 'category' => '家具家居', 'subcategory' => '清洁收纳', 'location' => '客厅', 'quantity' => 1, 'remaining_current' => 0, 'description' => '客厅净化器维护项目', 'barcode' => 'AIR-FILTER-01', 'purchase_date' => date('Y-m-d', strtotime('-200 days')), 'purchase_price' => 169, 'tags' => '家居,维护', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '上次维护后需持续追踪更换周期', 'is_public_shared' => 1, 'public_recommend_reason' => '价格和性能平衡，适合作为常备耗材', 'reminder_date' => date('Y-m-d', strtotime('-87 days')), 'reminder_next_date' => date('Y-m-d', strtotime('+3 days')), 'reminder_cycle_value' => 90, 'reminder_cycle_unit' => 'day', 'reminder_note' => '按初始维护日期每 90 天提醒一次，临近提醒时准备更换滤芯'],
             ['name' => '空气净化器滤芯（原厂）', 'category' => '家具家居', 'subcategory' => '清洁收纳', 'location' => '储物间', 'quantity' => 1, 'description' => '上一批次原厂滤芯采购记录', 'barcode' => 'AIR-FILTER-OEM-02', 'purchase_date' => date('Y-m-d', strtotime('-35 days')), 'purchase_price' => 199, 'tags' => '滤芯,原厂', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '价格较高但安装更稳', 'is_public_shared' => 1, 'public_recommend_reason' => '安装契合度高，追求稳定可优先考虑'],
             ['name' => '空气净化器滤芯（兼容款）', 'category' => '家具家居', 'subcategory' => '清洁收纳', 'location' => '储物间', 'quantity' => 2, 'description' => '兼容款滤芯采购记录', 'barcode' => 'AIR-FILTER-COMP-03', 'purchase_date' => date('Y-m-d', strtotime('-120 days')), 'purchase_price' => 129, 'tags' => '滤芯,兼容', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '拼多多', 'notes' => '单价更低，适合备货'],
             ['name' => '维生素D3滴剂', 'category' => '其他', 'subcategory' => '日用杂项', 'location' => '厨房', 'quantity' => 1, 'description' => '儿童可用滴剂版本', 'barcode' => 'HEALTH-D3-DROP-02', 'purchase_date' => date('Y-m-d', strtotime('-22 days')), 'purchase_price' => 139, 'tags' => '保健,滴剂', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+320 days')), 'purchase_from' => '淘宝', 'notes' => '最近一次补货'],
@@ -1753,7 +1754,7 @@ function loadDemoDataIntoDb($db, $options = [])
             ['name' => '车载灭火器（便携款）', 'category' => '工具五金', 'location' => '储物间', 'quantity' => 1, 'description' => '便携款采购记录', 'barcode' => 'SAFE-FIRE-MINI-03', 'purchase_date' => date('Y-m-d', strtotime('-300 days')), 'purchase_price' => 79, 'tags' => '安全,便携', 'status' => 'archived', 'expiry_date' => date('Y-m-d', strtotime('+60 days')), 'purchase_from' => '淘宝', 'notes' => '历史最低购入价记录'],
             ['name' => '设计模式（第2版）', 'category' => '书籍文档', 'subcategory' => '纸质书', 'location' => '书房', 'quantity' => 1, 'description' => '技术书籍', 'barcode' => 'BOOK-DESIGN-02', 'purchase_date' => date('Y-m-d', strtotime('-700 days')), 'purchase_price' => 88, 'tags' => '书籍,学习', 'status' => 'archived', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '已读完，暂存书架'],
             ['name' => '纪念手表', 'category' => '电子设备', 'location' => '卧室', 'quantity' => 1, 'description' => '礼品来源物品', 'barcode' => 'GIFT-WATCH-01', 'purchase_date' => date('Y-m-d', strtotime('-95 days')), 'purchase_price' => 0, 'tags' => '礼物,收藏', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '礼品', 'notes' => '生日礼物，定期保养'],
-            ['name' => '在线课程年度会员', 'category' => '虚拟产品', 'subcategory' => '会员服务', 'location' => '书房', 'quantity' => 1, 'description' => '在线学习会员服务', 'barcode' => 'VIP-COURSE-2026', 'purchase_date' => date('Y-m-d', strtotime('-20 days')), 'purchase_price' => 399, 'tags' => '会员,学习', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+340 days')), 'purchase_from' => '线下', 'notes' => '到期前一个月提醒续费', 'is_public_shared' => 1, 'public_recommend_reason' => '内容更新频率高，长期学习性价比高'],
+            ['name' => '在线课程年度会员', 'category' => '虚拟产品', 'subcategory' => '会员服务', 'location' => '书房', 'quantity' => 1, 'description' => '在线学习会员服务', 'barcode' => 'VIP-COURSE-2026', 'purchase_date' => date('Y-m-d', strtotime('-20 days')), 'purchase_price' => 399, 'tags' => '会员,学习', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+340 days')), 'purchase_from' => '线下', 'notes' => '到期前一个月提醒续费', 'is_public_shared' => 1, 'public_recommend_reason' => '内容更新频率高，长期学习性价比高', 'reminder_date' => date('Y-m-d', strtotime('-20 days')), 'reminder_next_date' => date('Y-m-d', strtotime('+345 days')), 'reminder_cycle_value' => 1, 'reminder_cycle_unit' => 'year', 'reminder_note' => '按开通日期每年提醒一次，建议到期前 30 天处理续费'],
             ['name' => '有机燕麦片', 'category' => '食物', 'subcategory' => '主食粮油', 'location' => '厨房', 'quantity' => 2, 'remaining_current' => 0, 'description' => '早餐常备食材', 'barcode' => 'FOOD-OAT-01', 'purchase_date' => date('Y-m-d', strtotime('-18 days')), 'purchase_price' => 45, 'tags' => '食物,早餐', 'status' => 'used_up', 'expiry_date' => date('Y-m-d', strtotime('+120 days')), 'purchase_from' => '京东', 'notes' => '已用完状态示例，用于覆盖状态筛选与余量提醒联动'],
             ['name' => '便携湿巾（家庭装）', 'category' => '其他', 'subcategory' => '日用杂项', 'location' => '玄关', 'quantity' => 6, 'remaining_total' => 0, 'description' => '常备清洁用品', 'barcode' => 'HOME-WIPE-06', 'purchase_date' => date('Y-m-d', strtotime('-8 days')), 'purchase_price' => 29, 'tags' => '清洁,日用品', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '线下', 'notes' => '用于演示“清空余量后不触发余量提醒”'],
             ['name' => '未分类收纳箱', 'category' => '', 'location' => '', 'quantity' => 2, 'description' => '暂未归类，等待整理', 'barcode' => 'BOX-UNCAT-01', 'purchase_date' => date('Y-m-d', strtotime('-15 days')), 'purchase_price' => 59, 'tags' => '收纳,未分类', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '线下', 'notes' => '暂放玄关，待统一收纳'],
@@ -1935,10 +1936,10 @@ function loadDemoDataIntoDb($db, $options = [])
         }
 
         $demoShoppingList = [
-            ['name' => '空气净化器滤芯（备用）', 'quantity' => 1, 'status' => 'pending_purchase', 'category' => '家具家居', 'priority' => 'high', 'planned_price' => 169, 'notes' => '与在用滤芯同型号，提前备货', 'reminder_date' => date('Y-m-d', strtotime('+1 day')), 'reminder_note' => '确认活动价后下单'],
+            ['name' => '空气净化器滤芯（90天周期备用）', 'quantity' => 1, 'status' => 'pending_purchase', 'category' => '家具家居', 'priority' => 'high', 'planned_price' => 169, 'notes' => '与在用滤芯同型号，提前备货', 'reminder_date' => date('Y-m-d', strtotime('+1 day')), 'reminder_note' => '和物品里的 90 天循环提醒同步，确认活动价后下单'],
             ['name' => '维生素 D3（补充装）', 'quantity' => 2, 'status' => 'pending_receipt', 'category' => '其他', 'priority' => 'high', 'planned_price' => 128, 'notes' => '已下单待收货，收货后放入厨房抽屉', 'reminder_date' => date('Y-m-d', strtotime('-1 day')), 'reminder_note' => '到货后核对保质期'],
             ['name' => '车载灭火器（新）', 'quantity' => 1, 'status' => 'pending_purchase', 'category' => '工具五金', 'priority' => 'high', 'planned_price' => 99, 'notes' => '替换已过期的旧灭火器', 'reminder_date' => date('Y-m-d', strtotime('+2 days')), 'reminder_note' => '确认生产日期在一年内'],
-            ['name' => '收纳箱（换季）', 'quantity' => 3, 'status' => 'pending_receipt', 'category' => '家具家居', 'priority' => 'low', 'planned_price' => 49, 'notes' => '补充衣物收纳，和现有收纳箱同尺寸', 'reminder_date' => '', 'reminder_note' => ''],
+            ['name' => '在线课程会员续费', 'quantity' => 1, 'status' => 'pending_purchase', 'category' => '虚拟产品', 'priority' => 'normal', 'planned_price' => 399, 'notes' => '用于演示年度会员的续费提醒流程', 'reminder_date' => date('Y-m-d', strtotime('+320 days')), 'reminder_note' => '到期前 30 天处理续费，避免中断使用'],
             ['name' => '机械键盘键帽套装', 'quantity' => 1, 'status' => 'pending_purchase', 'category' => '电子设备', 'priority' => 'low', 'planned_price' => 79, 'notes' => '给备用键盘更换键帽', 'reminder_date' => '', 'reminder_note' => ''],
         ];
         $insertShopping = $db->prepare("INSERT INTO shopping_list (name, quantity, status, category_id, priority, planned_price, notes, reminder_date, reminder_note, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
@@ -1991,9 +1992,9 @@ function loadDemoDataIntoDb($db, $options = [])
 
             $demoTasks = [
                 ['content' => '整理厨房抽屉里的即将到期食材', 'is_completed' => 0],
-                ['content' => '给空气净化器滤芯下单备用件', 'is_completed' => 0],
-                ['content' => '核对本周购物清单优先级与预算', 'is_completed' => 1],
-                ['content' => '盘点书房未分类物品并补充二级分类', 'is_completed' => 0],
+                ['content' => '给空气净化器滤芯下单备用件（90天周期）', 'is_completed' => 0],
+                ['content' => '在菜单里切换帮助模式，确认字段问号提示可用', 'is_completed' => 1],
+                ['content' => '检查“循环提醒初始日期 + 循环频率”是否正确推算下次提醒日期', 'is_completed' => 0],
                 ['content' => '复核备忘提醒范围设置是否符合本周计划', 'is_completed' => 1]
             ];
             $insertTaskStmt = $authDb->prepare("INSERT INTO message_board_posts
@@ -2060,6 +2061,14 @@ function loadDemoDataIntoDb($db, $options = [])
                 'method' => 'POST',
                 'details' => '提醒管理示例：余量提醒阈值设为 20%，已覆盖“余量不足自动提醒”与“余量留空不提醒”场景',
                 'created_at' => "datetime('now','-73 minutes','localtime')"
+            ],
+            [
+                'action_key' => 'settings_help_mode',
+                'action_label' => '切换帮助模式',
+                'api' => 'client-event/settings.help_mode',
+                'method' => 'POST',
+                'details' => '帮助模式示例：默认开启，字段名后的问号可直接查看用途说明',
+                'created_at' => "datetime('now','-72 minutes','localtime')"
             ],
             [
                 'action_key' => 'message_board',
@@ -6618,6 +6627,110 @@ $currentUserJson = json_encode([
             border-radius: 8px;
         }
 
+        .help-hint-icon {
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            margin-left: 6px;
+            vertical-align: middle;
+            cursor: help;
+            outline: none;
+        }
+
+        .help-hint-mark {
+            width: 15px;
+            height: 15px;
+            border-radius: 999px;
+            border: 1px solid rgba(56, 189, 248, 0.45);
+            background: rgba(14, 165, 233, 0.16);
+            color: #7dd3fc;
+            font-size: 10px;
+            line-height: 1;
+            font-weight: 700;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .help-hint-tooltip {
+            position: absolute;
+            left: 50%;
+            right: auto;
+            bottom: calc(100% + 8px);
+            transform: translateX(-50%) translateY(4px);
+            min-width: 220px;
+            max-width: min(320px, calc(100vw - 24px));
+            padding: 8px 10px;
+            border-radius: 8px;
+            border: 1px solid rgba(56, 189, 248, 0.24);
+            background: rgba(15, 23, 42, 0.98);
+            color: #cbd5e1;
+            font-size: 12px;
+            line-height: 1.5;
+            box-shadow: 0 12px 28px rgba(2, 6, 23, 0.5);
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.16s ease, transform 0.16s ease;
+            z-index: 280;
+            white-space: normal;
+            text-align: left;
+        }
+
+        .help-hint-icon.hint-align-left .help-hint-tooltip {
+            left: 0;
+            right: auto;
+            transform: translateY(4px);
+        }
+
+        .help-hint-icon.hint-align-right .help-hint-tooltip {
+            left: auto;
+            right: 0;
+            transform: translateY(4px);
+        }
+
+        .help-hint-icon.hint-below .help-hint-tooltip {
+            top: calc(100% + 8px);
+            bottom: auto;
+            transform: translateX(-50%) translateY(-4px);
+        }
+
+        .help-hint-icon.hint-below.hint-align-left .help-hint-tooltip,
+        .help-hint-icon.hint-below.hint-align-right .help-hint-tooltip {
+            transform: translateY(-4px);
+        }
+
+        .help-hint-icon:hover .help-hint-tooltip,
+        .help-hint-icon:focus .help-hint-tooltip,
+        .help-hint-icon:focus-within .help-hint-tooltip {
+            opacity: 1;
+            transform: translateX(-50%) translateY(0);
+        }
+
+        .help-hint-icon.hint-align-left:hover .help-hint-tooltip,
+        .help-hint-icon.hint-align-left:focus .help-hint-tooltip,
+        .help-hint-icon.hint-align-left:focus-within .help-hint-tooltip,
+        .help-hint-icon.hint-align-right:hover .help-hint-tooltip,
+        .help-hint-icon.hint-align-right:focus .help-hint-tooltip,
+        .help-hint-icon.hint-align-right:focus-within .help-hint-tooltip {
+            transform: translateY(0);
+        }
+
+        .help-hint-icon.hint-below:hover .help-hint-tooltip,
+        .help-hint-icon.hint-below:focus .help-hint-tooltip,
+        .help-hint-icon.hint-below:focus-within .help-hint-tooltip {
+            transform: translateX(-50%) translateY(0);
+        }
+
+        .help-hint-icon.hint-below.hint-align-left:hover .help-hint-tooltip,
+        .help-hint-icon.hint-below.hint-align-left:focus .help-hint-tooltip,
+        .help-hint-icon.hint-below.hint-align-left:focus-within .help-hint-tooltip,
+        .help-hint-icon.hint-below.hint-align-right:hover .help-hint-tooltip,
+        .help-hint-icon.hint-below.hint-align-right:focus .help-hint-tooltip,
+        .help-hint-icon.hint-below.hint-align-right:focus-within .help-hint-tooltip {
+            transform: translateY(0);
+        }
+
         /* 中尺寸物品卡片底部操作区（编辑/复制/删除） */
         .item-card-medium-actions {
             border-top: 1px solid rgba(255, 255, 255, 0.06);
@@ -7738,6 +7851,9 @@ $currentUserJson = json_encode([
                     <div class="sidebar-link sidebar-sub" data-view="operation-logs" onclick="switchView('operation-logs')">
                         <i class="ri-file-list-3-line"></i><span class="sidebar-text">操作日志</span>
                     </div>
+                    <div class="sidebar-link sidebar-sub" data-view="help-docs" onclick="switchView('help-docs')">
+                        <i class="ri-book-open-line"></i><span class="sidebar-text">帮助文档</span>
+                    </div>
                     <div class="sidebar-link sidebar-sub" data-view="changelog" onclick="switchView('changelog')">
                         <i class="ri-history-line"></i><span class="sidebar-text">更新记录</span>
                     </div>
@@ -7767,13 +7883,28 @@ $currentUserJson = json_encode([
                     <input type="text" id="globalSearch" placeholder="全局搜索物品..." class="input pl-10 !w-64 !py-2"
                         onkeyup="handleGlobalSearch(event)">
                 </div>
-                <div class="hidden lg:flex items-center gap-2 px-3 py-1.5 rounded-lg border border-white/10 text-xs text-slate-300">
-                    <i class="ri-user-3-line text-sky-400"></i>
-                    <span id="currentUserLabel"><?= htmlspecialchars(($currentAuthUser['display_name'] ?: $currentAuthUser['username']) . (isAdminUser($currentAuthUser) ? '（管理员）' : ''), ENT_QUOTES, 'UTF-8') ?></span>
+                <div id="headerMenuWrap" class="relative">
+                    <button type="button" onclick="toggleHeaderMenu()" class="btn btn-ghost !py-2 !px-3 text-xs text-slate-300 border border-white/10">
+                        <i class="ri-menu-4-line"></i><span id="headerMenuButtonName" class="max-w-[110px] truncate"><?= htmlspecialchars($currentAuthUser['username'] ?? '', ENT_QUOTES, 'UTF-8') ?></span><i id="headerMenuArrow" class="ri-arrow-down-s-line transition-transform duration-200"></i>
+                    </button>
+                    <div id="headerMenuPanel" class="hidden absolute right-0 mt-2 w-56 rounded-xl border border-white/10 bg-slate-900/95 shadow-2xl overflow-hidden z-50"
+                        style="backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);">
+                        <div class="px-3 py-2.5 border-b border-white/10">
+                            <p class="text-[11px] text-slate-500">当前登录</p>
+                            <p class="text-sm text-slate-200 mt-1 truncate flex items-center gap-2">
+                                <i class="ri-user-3-line text-sky-400"></i>
+                                <span id="currentUserLabel"><?= htmlspecialchars($currentAuthUser['username'] ?? '', ENT_QUOTES, 'UTF-8') ?></span>
+                            </p>
+                        </div>
+                        <button type="button" onclick="toggleHelpMode()" class="w-full text-left px-3 py-2.5 text-sm text-slate-200 hover:bg-white/5 transition flex items-center justify-between gap-2 border-b border-white/10">
+                            <span class="inline-flex items-center gap-2"><i id="helpModeIcon" class="ri-question-line text-cyan-300"></i><span>帮助模式</span></span>
+                            <span id="helpModeStatus" class="text-[11px] text-emerald-300">已开启</span>
+                        </button>
+                        <button type="button" onclick="logout()" class="w-full text-left px-3 py-2.5 text-sm text-red-300 hover:bg-red-500/10 transition flex items-center gap-2">
+                            <i class="ri-logout-box-r-line"></i><span>退出登录</span>
+                        </button>
+                    </div>
                 </div>
-                <button onclick="logout()" class="btn btn-ghost !py-2 !px-3 text-xs text-slate-300 hover:text-red-300 border border-white/10 hover:border-red-400/30">
-                    <i class="ri-logout-box-r-line"></i><span class="hidden sm:inline">退出</span>
-                </button>
                 <button onclick="openAddItem()" class="btn btn-primary"><i class="ri-add-line"></i><span
                         class="hidden sm:inline">添加物品</span></button>
             </div>
@@ -8141,6 +8272,245 @@ $currentUserJson = json_encode([
             return `item_manager_u${uid}_${name}`;
         }
         const THEME_KEY = userScopedStorageKey('theme');
+        const HELP_MODE_KEY = userScopedStorageKey('help_mode');
+
+        const HELP_HINTS_BY_FIELD_ID = {
+            itemName: '填这件物品的名字，建议用你平时最容易搜索到的叫法。',
+            itemCategory: '选择物品的大类，后续查找和统计会更方便。',
+            itemSubcategory: '在大类下再细分一层，不需要时可以不选。',
+            itemLocation: '填写物品放在哪里，例如“厨房上柜”“书房抽屉”。',
+            itemStatus: '表示当前情况，例如“使用中”“已归档”“已转卖”。',
+            itemRemainingCurrent: '当前还剩多少。比如买了 10 个还剩 3 个，这里填 3。',
+            itemQuantity: '总共买了多少。比如一共买了 10 个，这里填 10。',
+            itemPrice: '购买价格，可用于后续比价和预算回顾。',
+            itemPurchaseFrom: '在哪里买的，例如京东、淘宝、线下门店。',
+            itemDate: '购买日期，不确定时可以留空。',
+            itemExpiry: '到期日期。填写后会在仪表盘里自动出现到期提醒。',
+            itemBarcode: '商品条码或序列号，用于盘点、对账或售后。',
+            itemReminderDate: '循环提醒从哪一天开始算。留空表示不启用循环提醒。',
+            itemReminderEvery: '这是提醒频率数字，会基于“循环提醒初始日期”计算下次提醒日期。',
+            itemReminderUnit: '这是提醒频率单位（天/周/年），与上面的数字一起决定提醒周期。',
+            itemReminderNext: '到这个日期的时候，系统会自动创建一条提醒显示在仪表盘中。日期为自动生成和更新，也可以手动更改。',
+            itemReminderNote: '提醒弹出时要做什么，例如“更换滤芯”“会员续费”。',
+            itemTags: '关键词标签，多个标签用逗号分隔，方便以后搜索。',
+            itemNotes: '其他补充说明，想记什么都可以写这里。',
+            itemSharePublic: '打开后，这件物品会显示到公共频道给其他用户参考。',
+            shoppingName: '写你准备购买的商品名称。',
+            shoppingQty: '计划买几件。',
+            shoppingStatus: '采购进度：待购买=还没下单；待收货=已下单等待到货。',
+            shoppingPriority: '紧急程度。高优先会更醒目，便于先处理。',
+            shoppingPrice: '预计单价，用来估算总预算，可不填。',
+            shoppingReminderDate: '到这个日期会提醒你处理这条清单。',
+            shoppingReminderNote: '提醒时想看到的说明，例如“今晚活动结束”。',
+            shoppingNotes: '采购补充信息，如品牌、型号、链接、比价结果。',
+            catName: '分类名称，建议用你日常会搜索的词。',
+            catParentId: '不选就是一级分类；选择后会变成该分类下的二级分类。',
+            catColor: '分类显示颜色，只影响界面展示。',
+            locName: '位置名称，建议写具体一些（如“卧室衣柜上层”）。',
+            locDesc: '补充位置说明，方便自己或家人快速找到。',
+            publicSharedEditName: '公开给其他用户看到的物品名称。',
+            publicSharedEditCategory: '公开信息所属分类，便于别人筛选。',
+            publicSharedEditPrice: '分享给他人的参考价格，不填也可以。',
+            publicSharedEditPurchaseFrom: '分享给他人的购买渠道信息。',
+            publicSharedEditReason: '告诉别人你为什么推荐它、适合谁买。',
+            set_expiry_past_days: '定义“过期提醒”时间窗口下界（过去天数）。留空表示不限制。',
+            set_expiry_future_days: '定义“过期提醒”时间窗口上界（未来天数）。留空表示不限制。',
+            set_reminder_past_days: '定义“备忘提醒”时间窗口下界（过去天数）。留空表示不限制。',
+            set_reminder_future_days: '定义“备忘提醒”时间窗口上界（未来天数）。留空表示不限制。',
+            set_low_stock_threshold_pct: '低余量触发阈值（0-100）。余量占比低于阈值时生成补货提醒；0 表示禁用。',
+            set_dashboard_categories: '仪表盘“分类统计”默认排序策略。',
+            set_items_default: '物品管理页面默认排序策略。',
+            set_categories_list: '分类管理页面默认排序策略。',
+            set_locations_list: '位置管理页面默认排序策略。',
+            platformAllowRegistration: '平台注册策略开关。启用后允许自助注册；关闭后仅既有账号可登录。'
+        };
+
+        const HELP_HINTS_BY_TEXT = {
+            物品名称: '填你最容易识别和搜索到的物品名称。',
+            分类: '给物品分组，后续筛选和统计会更方便。',
+            二级分类: '在一级分类下继续细分，不选也可以。',
+            位置: '记录这件物品放在哪里。',
+            状态: '表示当前情况，如使用中、已归档。',
+            余量: '当前剩余可用数量。',
+            数量: '这件物品的总数量。',
+            购入价格: '购买价格，可用于比价和预算回看。',
+            购入渠道: '在哪里购买的，例如京东、淘宝、线下。',
+            购入日期: '购买日期，不确定可以留空。',
+            过期日期: '设置后会自动进入到期提醒。',
+            条码序列号: '用于盘点、对账或售后。',
+            循环提醒初始日期: '循环提醒从这一天开始计算。',
+            循环频率: '这是基于“循环提醒初始日期”来计算下次提醒日期的频率。',
+            下次提醒日期: '到这个日期的时候，系统会自动创建一条提醒显示在仪表盘中。日期为自动生成和更新，也可以手动更改。',
+            循环提醒备注: '提醒触发时要做什么。',
+            标签逗号分隔: '可填写多个关键词，便于搜索。',
+            备注: '其他补充说明。',
+            共享到公共频道: '开启后会把物品基础信息共享到公共频道。',
+            开放注册: '平台注册策略开关。启用后允许自助注册；关闭后仅既有账号可登录。'
+        };
+
+        function loadHelpMode() {
+            try {
+                const saved = localStorage.getItem(HELP_MODE_KEY);
+                if (saved === null)
+                    return true; // 默认开启：仅首次无配置时生效
+                return saved === '1';
+            } catch {
+                return true;
+            }
+        }
+
+        function saveHelpMode(enabled) {
+            const on = !!enabled;
+            localStorage.setItem(HELP_MODE_KEY, on ? '1' : '0');
+            App.helpMode = on;
+        }
+
+        function normalizeHelpLabelText(text) {
+            return String(text || '')
+                .replace(/\s+/g, '')
+                .replace(/[：:（）()【】\[\]、，,。.!！\*\/\-]/g, '')
+                .trim();
+        }
+
+        function findHelpFieldIdFromLabel(labelEl) {
+            if (!labelEl)
+                return '';
+            if (labelEl.htmlFor)
+                return String(labelEl.htmlFor);
+            const innerControl = labelEl.querySelector ? labelEl.querySelector('input[id],select[id],textarea[id]') : null;
+            if (innerControl && innerControl.id)
+                return String(innerControl.id || '');
+            const parent = labelEl.parentElement;
+            if (parent) {
+                const directControl = Array.from(parent.children).find(el => /^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName) && el.id);
+                if (directControl)
+                    return String(directControl.id || '');
+            }
+            let sib = labelEl.nextElementSibling;
+            while (sib) {
+                if (/^(INPUT|SELECT|TEXTAREA)$/.test(sib.tagName) && sib.id)
+                    return String(sib.id || '');
+                const nested = sib.querySelector ? sib.querySelector('input[id],select[id],textarea[id]') : null;
+                if (nested && nested.id)
+                    return String(nested.id || '');
+                if (sib.tagName === 'LABEL')
+                    break;
+                sib = sib.nextElementSibling;
+            }
+            return '';
+        }
+
+        function resolveHelpHintForLabel(labelEl) {
+            const fieldId = findHelpFieldIdFromLabel(labelEl);
+            if (fieldId && HELP_HINTS_BY_FIELD_ID[fieldId]) {
+                return HELP_HINTS_BY_FIELD_ID[fieldId];
+            }
+            const normalizedText = normalizeHelpLabelText(labelEl?.textContent || '');
+            if (!normalizedText)
+                return '';
+            if (HELP_HINTS_BY_TEXT[normalizedText]) {
+                return HELP_HINTS_BY_TEXT[normalizedText];
+            }
+            const keys = Object.keys(HELP_HINTS_BY_TEXT);
+            const matched = keys.find(k => normalizedText.includes(k) || k.includes(normalizedText));
+            return matched ? HELP_HINTS_BY_TEXT[matched] : '';
+        }
+
+        function buildHelpHintNode(helpText) {
+            const wrap = document.createElement('span');
+            wrap.className = 'help-hint-icon';
+            wrap.setAttribute('tabindex', '0');
+            wrap.setAttribute('aria-label', '字段说明');
+
+            const mark = document.createElement('span');
+            mark.className = 'help-hint-mark';
+            mark.textContent = '?';
+
+            const tip = document.createElement('span');
+            tip.className = 'help-hint-tooltip';
+            tip.textContent = String(helpText || '');
+
+            wrap.appendChild(mark);
+            wrap.appendChild(tip);
+            return wrap;
+        }
+
+        function clearHelpHints(root = document) {
+            const scope = root && root.querySelectorAll ? root : document;
+            scope.querySelectorAll('.help-hint-icon').forEach(el => el.remove());
+        }
+
+        function applyHelpModeHints(root = document) {
+            if (!(App && App.helpMode))
+                return;
+            const scope = root && root.querySelectorAll ? root : document;
+            const labels = scope.querySelectorAll('label');
+            labels.forEach(labelEl => {
+                if (labelEl.querySelector('.help-hint-icon'))
+                    return;
+                const hint = resolveHelpHintForLabel(labelEl);
+                if (!hint)
+                    return;
+                labelEl.appendChild(buildHelpHintNode(hint));
+            });
+            updateHelpHintPlacements(scope);
+        }
+
+        function updateHelpHintPlacements(root = document) {
+            const scope = root && root.querySelectorAll ? root : document;
+            scope.querySelectorAll('.help-hint-icon').forEach(icon => {
+                icon.classList.remove('hint-align-left', 'hint-align-right', 'hint-below');
+                const tip = icon.querySelector('.help-hint-tooltip');
+                if (!tip)
+                    return;
+
+                const clipHost = icon.closest('.modal-box');
+                const hostRect = clipHost ? clipHost.getBoundingClientRect() : { left: 0, right: window.innerWidth };
+                const iconRect = icon.getBoundingClientRect();
+                const tipRect = tip.getBoundingClientRect();
+                const tipWidth = Math.max(220, Math.min(320, Number(tipRect.width || 280)));
+
+                const leftSpace = iconRect.left - hostRect.left;
+                const rightSpace = hostRect.right - iconRect.right;
+                const halfNeed = tipWidth / 2 + 10;
+
+                if (leftSpace < halfNeed) {
+                    icon.classList.add('hint-align-left');
+                } else if (rightSpace < halfNeed) {
+                    icon.classList.add('hint-align-right');
+                }
+
+                const topSpace = iconRect.top - hostRect.top;
+                if (topSpace < 88) {
+                    icon.classList.add('hint-below');
+                }
+            });
+        }
+
+        function updateHelpModeMenuUI() {
+            const on = !!(App && App.helpMode);
+            const statusEl = document.getElementById('helpModeStatus');
+            const iconEl = document.getElementById('helpModeIcon');
+            if (statusEl) {
+                statusEl.textContent = on ? '已开启' : '已关闭';
+                statusEl.className = on ? 'text-[11px] text-emerald-300' : 'text-[11px] text-slate-400';
+            }
+            if (iconEl) {
+                iconEl.className = on ? 'ri-question-line text-emerald-300' : 'ri-question-line text-cyan-300';
+            }
+        }
+
+        function toggleHelpMode() {
+            const next = !(App && App.helpMode);
+            saveHelpMode(next);
+            updateHelpModeMenuUI();
+            if (next) {
+                applyHelpModeHints(document);
+            } else {
+                clearHelpHints(document);
+            }
+            toast(next ? '帮助模式已开启' : '帮助模式已关闭');
+        }
 
         // ---------- 排序设置 ----------
         const SORT_SETTINGS_KEY = userScopedStorageKey('sort_settings');
@@ -8427,6 +8797,16 @@ $currentUserJson = json_encode([
             if (!e.target.closest('.emoji-picker')) {
                 hideEmojiPickerMenus();
             }
+            if (!e.target.closest('#headerMenuWrap')) {
+                closeHeaderMenu();
+            }
+        });
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape')
+                closeHeaderMenu();
+        });
+        window.addEventListener('resize', () => {
+            if (localStorage.getItem(HELP_MODE_KEY) === '1') updateHelpHintPlacements(document);
         });
         function normalizeStatuses(arr) {
             const source = Array.isArray(arr) ? arr : [];
@@ -8518,7 +8898,7 @@ $currentUserJson = json_encode([
 
         // ---------- 购入渠道管理 ----------
         const CHANNEL_KEY = userScopedStorageKey('purchase_channels');
-        const defaultPurchaseChannels = ['淘宝', '京东', '拼多多', '闲鱼', '线下', '礼品'];
+        const defaultPurchaseChannels = ['淘宝', '京东', '拼多多', '闲鱼', '官方渠道', '线下', '礼品'];
         function normalizeChannels(arr) {
             const seen = new Set();
             const normalized = [];
@@ -8614,6 +8994,7 @@ $currentUserJson = json_encode([
             itemsFilter: { search: '', category: 0, location: 0, status: '', expiryOnly: false },
             sortSettings: loadSortSettings(),
             dashboardSettings: loadDashboardSettings(),
+            helpMode: loadHelpMode(),
             operationLogsFilters: { keyword: '', actorUserId: 0, sort: 'time_desc' },
             _cachedItems: null,   // 缓存物品列表数据，避免频繁 API 请求
             _cachedTotal: 0,
@@ -8668,6 +9049,32 @@ $currentUserJson = json_encode([
                 await apiPost('auth/logout', {});
             } finally {
                 location.reload();
+            }
+        }
+
+        function closeHeaderMenu() {
+            const panel = document.getElementById('headerMenuPanel');
+            const arrow = document.getElementById('headerMenuArrow');
+            if (panel)
+                panel.classList.add('hidden');
+            if (arrow)
+                arrow.classList.remove('rotate-180');
+        }
+
+        function toggleHeaderMenu() {
+            const panel = document.getElementById('headerMenuPanel');
+            const arrow = document.getElementById('headerMenuArrow');
+            if (!panel)
+                return;
+            const willOpen = panel.classList.contains('hidden');
+            if (willOpen) {
+                panel.classList.remove('hidden');
+                if (arrow)
+                    arrow.classList.add('rotate-180');
+            } else {
+                panel.classList.add('hidden');
+                if (arrow)
+                    arrow.classList.remove('rotate-180');
             }
         }
 
@@ -9146,14 +9553,15 @@ $currentUserJson = json_encode([
         }
 
         // ---------- 视图切换 ----------
-        const settingsSubViews = ['import-export', 'settings', 'reminder-settings', 'status-settings', 'channel-settings', 'platform-settings', 'user-management', 'operation-logs', 'changelog'];
+        const settingsSubViews = ['import-export', 'settings', 'reminder-settings', 'status-settings', 'channel-settings', 'platform-settings', 'user-management', 'operation-logs', 'help-docs', 'changelog'];
 
         function switchView(view) {
             App.currentView = view;
+            closeHeaderMenu();
             document.querySelectorAll('.sidebar-link[data-view]').forEach(el => {
                 el.classList.toggle('active', el.dataset.view === view);
             });
-            const titles = { dashboard: '仪表盘', items: '物品管理', 'shopping-list': '购物清单', 'message-board': '任务清单', 'public-channel': '公共频道', categories: '分类管理', locations: '位置管理', trash: '物品管理', 'import-export': '数据管理', settings: '设置', 'reminder-settings': '设置', 'status-settings': '状态管理', 'channel-settings': '购入渠道管理', 'platform-settings': '平台设置', 'user-management': '用户管理', 'operation-logs': '操作日志', changelog: '更新记录' };
+            const titles = { dashboard: '仪表盘', items: '物品管理', 'shopping-list': '购物清单', 'message-board': '任务清单', 'public-channel': '公共频道', categories: '分类管理', locations: '位置管理', trash: '物品管理', 'import-export': '数据管理', settings: '设置', 'reminder-settings': '设置', 'status-settings': '状态管理', 'channel-settings': '购入渠道管理', 'platform-settings': '平台设置', 'user-management': '用户管理', 'operation-logs': '操作日志', 'help-docs': '帮助文档', changelog: '更新记录' };
             document.getElementById('viewTitle').textContent = titles[view] || '';
             // 回收站视图高亮物品管理侧边栏
             if (view === 'trash') document.querySelector('.sidebar-link[data-view="items"]')?.classList.add('active');
@@ -9193,10 +9601,12 @@ $currentUserJson = json_encode([
                 case 'platform-settings': await renderPlatformSettings(c); break;
                 case 'user-management': await renderUserManagement(c); break;
                 case 'operation-logs': await renderOperationLogs(c); break;
+                case 'help-docs': renderHelpDocs(c); break;
                 case 'changelog': renderChangelog(c); break;
             }
             enhanceCustomSelects(c);
             scheduleCustomSelectSync();
+            applyHelpModeHints(c);
         }
 
         // ---------- 加载基础数据 ----------
@@ -12413,9 +12823,20 @@ $currentUserJson = json_encode([
             const res = await apiPost('trash/empty', {});
             if (res.success) { toast('回收站已清空'); renderView(); }
         }
-
+ 
         // ---------- 更新记录数据 ----------
         const CHANGELOG = [
+            {
+                version: 'v1.6.2', date: '2026-02-20', title: '帮助模式默认开启',
+                changes: [
+                    '帮助模式改为默认开启：首次进入即可在字段名后看到问号提示，降低上手门槛',
+                    '顶部“菜单”展示当前登录用户名，并统一承载帮助模式开关与退出登录',
+                    '帮助提示定位与换行策略优化，编辑物品左侧字段提示不再溢出遮挡',
+                    '帮助文案改为更适合零基础用户的混合版表达，字段解释更直白',
+                    '设置二级菜单中“帮助文档”持续位于“更新记录”上方，查阅路径更稳定',
+                    '提醒相关示例统一强调“循环提醒初始日期 + 循环频率 = 下次提醒日期”'
+                ]
+            },
             {
                 version: 'v1.6.1', date: '2026-02-19', title: '设置体验优化 + 页面响应提升',
                 changes: [
@@ -12519,7 +12940,7 @@ $currentUserJson = json_encode([
                     '设置菜单中的「导入/导出」统一改名为「数据管理」',
                     '新增「物品数据重置」与「恢复默认环境」两项能力',
                     '重置或恢复默认时，历史图片会先进入回收区，降低误删风险',
-                    '新增购入渠道管理（默认：淘宝/京东/拼多多/闲鱼/线下/礼品），表单改为下拉选择',
+                    '新增购入渠道管理（默认：淘宝/京东/拼多多/闲鱼/官方渠道/线下/礼品），表单改为下拉选择',
                     '移除位置上下级功能，位置管理统一为单级结构',
                     '分类管理固定显示「未分类」、位置管理固定显示「未设定」，并支持一键查看对应物品',
                     '物品管理过滤器新增「未分类 / 未设定」选项，便于筛出未绑定分类或位置的物品',
@@ -12573,6 +12994,173 @@ $currentUserJson = json_encode([
             }
         ];
         const APP_VERSION = CHANGELOG[0].version;
+        const HELP_DOC_QUICK_START = [
+            '右上角用户名菜单里的「帮助模式」默认已开启，看到字段名后的 ?，鼠标悬停即可查看说明。',
+            '先进入「分类管理」和「位置管理」，补齐你家里常用的分类与存放位置。',
+            '在「状态管理」「购入渠道管理」里先把常用选项配好，后续录入会更快。',
+            '点击右上角「添加物品」，建议按“名称 → 分类/位置 → 余量/数量 → 价格/渠道”顺序填写。',
+            '要用循环提醒时，先填「循环提醒初始日期」，再填「循环频率」，系统会自动算出「下次提醒日期」。',
+            '需要采购时先记到「购物清单」，买完后点「已购买入库」可直接转成物品。',
+            '多人协作时勾选「共享到公共频道」，其他成员可查看、评论并加入自己的购物清单。',
+            '定期到「数据管理」做导出备份，重置或恢复默认环境前先备份。'
+        ];
+        const HELP_DOC_FEATURES = [
+            { name: '仪表盘', desc: '查看总量、分类统计、过期提醒、备忘提醒和低余量提醒。' },
+            { name: '物品管理', desc: '添加、编辑、删除物品，支持筛选、排序、复制和回收站。' },
+            { name: '购物清单', desc: '记录待买和待收货商品，设置优先级、预算和提醒，并可一键入库。' },
+            { name: '任务清单', desc: '多人任务协作，支持待办/完成切换、编辑、删除。' },
+            { name: '公共频道', desc: '分享推荐物品、填写推荐理由、评论互动，并可加入自己的购物清单。' },
+            { name: '分类管理', desc: '维护一级/二级分类、图标和颜色，方便统一管理。' },
+            { name: '位置管理', desc: '维护存放位置、图标与描述，支持按位置追踪物品。' },
+            { name: '数据管理', desc: '支持导入导出、批量模板导入、重置物品数据、恢复默认环境。' },
+            { name: '帮助模式', desc: '默认开启，字段名后会显示问号，悬停即可查看该字段的用途说明。' },
+            { name: '设置中心', desc: '统一设置排序、提醒范围、余量阈值、状态、渠道与平台配置。' }
+        ];
+        const HELP_DOC_FIELD_GROUPS = [
+            {
+                title: '物品字段（物品管理 / 添加物品）',
+                icon: 'ri-archive-line',
+                fields: [
+                    { name: '物品名称（必填）', desc: '给物品起一个你一眼能认出的名字。' },
+                    { name: '分类 / 二级分类', desc: '先选大类，再按需要选小类；不选二级分类也可以。' },
+                    { name: '位置', desc: '填物品放在哪里，例如“厨房上柜”“书房抽屉”。' },
+                    { name: '状态', desc: '表示当前情况，例如“使用中”“已归档”。' },
+                    { name: '余量 / 数量', desc: '数量=总共有多少，余量=现在还剩多少；例如买 10 个还剩 3 个，就填 3 / 10。' },
+                    { name: '购入价格', desc: '购买价格，方便后续比价和预算回顾。' },
+                    { name: '购入渠道', desc: '在哪里买的，方便下次复购。' },
+                    { name: '购入日期', desc: '什么时候买的，不确定可留空。' },
+                    { name: '过期日期', desc: '填写后会自动进入到期提醒。' },
+                    { name: '条码/序列号', desc: '用于盘点、对账或售后，可不填。' },
+                    { name: '循环提醒初始日期', desc: '第一次提醒从哪一天开始算；留空=不开启循环提醒（例如填“滤芯安装日”）。' },
+                    { name: '循环频率（每 X 天/周/年）', desc: '这个频率是基于“循环提醒初始日期”来计算下次提醒日期的。' },
+                    { name: '下次提醒日期', desc: '本次即将提醒的日期，通常由系统自动生成和更新，也可以手动改。' },
+                    { name: '循环提醒备注', desc: '提醒弹出时要做什么，例如“更换滤芯”。' },
+                    { name: '标签（逗号分隔）', desc: '多个关键词用逗号分隔，便于快速搜索。' },
+                    { name: '备注', desc: '其他补充信息都可以写这里。' },
+                    { name: '图片', desc: '上传物品照片或票据，方便识别和回看。' },
+                    { name: '共享到公共频道', desc: '勾选后会分享给其他成员查看。' }
+                ]
+            },
+            {
+                title: '购物清单字段（购物清单 / 添加清单）',
+                icon: 'ri-shopping-cart-2-line',
+                fields: [
+                    { name: '名称（必填）', desc: '写你准备购买的商品名称。' },
+                    { name: '计划数量', desc: '计划买几件。' },
+                    { name: '状态', desc: '待购买=还没下单；待收货=已下单但还没到货。' },
+                    { name: '优先级', desc: '高优先表示更急，建议先买。' },
+                    { name: '预算单价', desc: '预计单价，用来估算总预算。' },
+                    { name: '提醒日期', desc: '到了这一天系统会提醒你处理这条清单。' },
+                    { name: '提醒备注', desc: '提醒时显示的补充说明。' },
+                    { name: '备注', desc: '可记录品牌、型号、链接、比价结论。' }
+                ]
+            },
+            {
+                title: '分类与位置字段',
+                icon: 'ri-price-tag-3-line',
+                fields: [
+                    { name: '分类名称（必填）', desc: '分类显示名称，建议用常用叫法。' },
+                    { name: '上级分类', desc: '不选是一级分类；选了就是该上级下的二级分类。' },
+                    { name: '分类图标 / 颜色', desc: '只影响界面显示，方便快速识别。' },
+                    { name: '位置名称（必填）', desc: '存放地点名称，建议尽量具体。' },
+                    { name: '位置图标', desc: '用于界面展示和筛选识别。' },
+                    { name: '位置描述', desc: '补充说明位置细节，例如“柜子第二层右侧”。' }
+                ]
+            },
+            {
+                title: '公共频道字段',
+                icon: 'ri-broadcast-line',
+                fields: [
+                    { name: '物品名称 / 分类', desc: '共享后别人先看到的基础信息。' },
+                    { name: '购入价格 / 购入渠道', desc: '给其他成员做比价和购买参考。' },
+                    { name: '推荐理由', desc: '说明你为什么推荐这件物品。' },
+                    { name: '评论内容', desc: '成员交流用，评论者本人或管理员可删除评论。' }
+                ]
+            },
+            {
+                title: '设置字段（通用设置 / 平台设置）',
+                icon: 'ri-settings-3-line',
+                fields: [
+                    { name: '过期提醒范围：过期天数下限/未来天数上限', desc: '定义仪表盘“过期提醒”的时间窗口边界（过去/未来天数）。' },
+                    { name: '备忘提醒范围：过期天数下限/未来天数上限', desc: '定义仪表盘“备忘提醒”的时间窗口边界（过去/未来天数）。' },
+                    { name: '余量提醒阈值（%）', desc: '低余量触发阈值。余量占比低于该值时生成补货提醒；0 表示禁用。' },
+                    { name: '仪表盘/物品/分类/位置排序项', desc: '各页面的默认排序策略配置。' },
+                    { name: '状态管理：名称/图标/颜色', desc: '状态字典维护，影响表单可选项与卡片展示。' },
+                    { name: '购入渠道管理：渠道名称', desc: '渠道字典维护，用于统一录入来源渠道。' },
+                    { name: '平台设置：开放注册（管理员）', desc: '平台注册策略开关：启用自助注册或仅允许既有账号登录。' }
+                ]
+            }
+        ];
+        const HELP_DOC_SYSTEM_FIELDS = [
+            { name: 'id', desc: '主键编号，系统自动生成。' },
+            { name: 'created_at', desc: '创建时间，系统自动记录。' },
+            { name: 'updated_at', desc: '更新时间，系统自动刷新。' },
+            { name: 'deleted_at', desc: '软删除时间（回收站场景），仅系统维护。' },
+            { name: 'source_shared_id', desc: '购物清单来源共享记录 ID，来自公共频道时自动写入。' }
+        ];
+
+        function renderChangelogHelp() {
+            return `
+            <div class="glass rounded-2xl p-6 anim-up">
+                <div class="flex items-center gap-3 mb-5">
+                    <div class="w-10 h-10 rounded-xl bg-emerald-500/10 flex items-center justify-center"><i class="ri-book-open-line text-xl text-emerald-400"></i></div>
+                    <div>
+                        <h3 class="font-semibold text-white">使用帮助文档</h3>
+                        <p class="text-xs text-slate-500">快速上手、字段说明与模块功能导航</p>
+                    </div>
+                </div>
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                    <div class="rounded-xl border border-white/10 bg-white/[0.02] p-4">
+                        <h4 class="text-sm font-semibold text-white mb-3 flex items-center gap-2"><i class="ri-rocket-line text-cyan-400"></i>快速上手</h4>
+                        <ol class="space-y-2">
+                            ${HELP_DOC_QUICK_START.map((step, idx) => `
+                                <li class="text-xs text-slate-400 flex items-start gap-2">
+                                    <span class="w-5 h-5 rounded-full bg-white/10 text-[11px] text-slate-200 flex items-center justify-center flex-shrink-0 mt-0.5">${idx + 1}</span>
+                                    <span>${esc(step)}</span>
+                                </li>
+                            `).join('')}
+                        </ol>
+                    </div>
+                    <div class="rounded-xl border border-white/10 bg-white/[0.02] p-4">
+                        <h4 class="text-sm font-semibold text-white mb-3 flex items-center gap-2"><i class="ri-compass-3-line text-violet-400"></i>功能导航</h4>
+                        <div class="space-y-2">
+                            ${HELP_DOC_FEATURES.map(feature => `
+                                <div class="text-xs text-slate-400 leading-5">
+                                    <span class="inline-flex px-2 py-0.5 rounded-md bg-white/5 text-slate-200 font-medium mr-2">${esc(feature.name)}</span>
+                                    <span>${esc(feature.desc)}</span>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                </div>
+                <div class="mt-4 space-y-3">
+                    ${HELP_DOC_FIELD_GROUPS.map(group => `
+                        <div class="rounded-xl border border-white/10 bg-white/[0.02] p-4">
+                            <h4 class="text-sm font-semibold text-white mb-3 flex items-center gap-2"><i class="${esc(group.icon)} text-sky-400"></i>${esc(group.title)}</h4>
+                            <div class="space-y-2">
+                                ${group.fields.map(field => `
+                                    <div class="text-xs text-slate-400 md:flex md:items-start md:gap-3">
+                                        <span class="inline-flex px-2 py-0.5 rounded-md bg-white/5 text-slate-200 font-mono md:w-56 md:flex-shrink-0">${esc(field.name)}</span>
+                                        <span class="block mt-1 md:mt-0">${esc(field.desc)}</span>
+                                    </div>
+                                `).join('')}
+                            </div>
+                        </div>
+                    `).join('')}
+                    <div class="rounded-xl border border-white/10 bg-white/[0.02] p-4">
+                        <h4 class="text-sm font-semibold text-white mb-3 flex items-center gap-2"><i class="ri-database-2-line text-amber-400"></i>系统自动字段（无需手动填写）</h4>
+                        <div class="space-y-2">
+                            ${HELP_DOC_SYSTEM_FIELDS.map(field => `
+                                <div class="text-xs text-slate-400 md:flex md:items-start md:gap-3">
+                                    <span class="inline-flex px-2 py-0.5 rounded-md bg-white/5 text-slate-200 font-mono md:w-48 md:flex-shrink-0">${esc(field.name)}</span>
+                                    <span class="block mt-1 md:mt-0">${esc(field.desc)}</span>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+        }
 
         // ---------- 设置页面 ----------
         function renderSettings(container) {
@@ -12904,6 +13492,14 @@ $currentUserJson = json_encode([
         }
 
         // ---------- 更新记录页面 ----------
+        function renderHelpDocs(container) {
+            container.innerHTML = `
+        <div class="max-w-5xl mx-auto space-y-6">
+            ${renderChangelogHelp()}
+        </div>
+    `;
+        }
+
         function renderChangelog(container) {
             container.innerHTML = `
         <div class="max-w-2xl mx-auto space-y-6">
@@ -13502,6 +14098,9 @@ $currentUserJson = json_encode([
         initCustomSelects();
         setupDateInputPlaceholders();
         initFormEmojiPickers();
+        updateHelpModeMenuUI();
+        if (App.helpMode)
+            applyHelpModeHints(document);
         // 设置版本号
         document.getElementById('appVersion').textContent = APP_VERSION;
         // 应用默认排序设置
