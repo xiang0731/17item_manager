@@ -2,7 +2,7 @@
 
 > 目标：将实现说明拆分为数据库层、API 层、UI 层，方便按职责快速定位与修改。
 >
-> 行号基于当前版本：`index.php` 约 11846 行，`README.md` 约 298 行。后续行号漂移时请用本文提供的命令重新定位。
+> 行号基于当前版本：`index.php` 约 14300 行，`README.md` 约 330 行。后续行号漂移时请用本文提供的命令重新定位。
 
 ## 目录
 
@@ -36,6 +36,9 @@ nl -ba index.php | sed -n '2800,3005p'
 
 # 提醒相关
 rg -n "item_reminder_instances|complete-reminder|undo-reminder" index.php
+
+# 保质期与过期日期联动（v1.6.3）
+rg -n "production_date|shelf_life|syncShelfLifeFields|calcShelfLifeExpiryDate|normalizeItemDateShelfFields" index.php
 
 # 购物清单相关
 rg -n "shopping-list|openShoppingListAndEdit|convertShoppingItem" index.php
@@ -240,19 +243,22 @@ php -l index.php
 - `index.php:4217-4264`：保存提交
 - `index.php:4293-4301`：关闭拦截
 
-### 2.1 条码/序列号在过期日期后
+### 2.1 条码/生产日期/保质期/过期日期布局与联动（v1.6.3）
 
-- 代码位置
-- `index.php:2854-2860`
-- `index.php:4166-4173`
-- `index.php:4229-4231`
+- 代码位置（建议用命令定位）
+- `rg -n "itemProductionDate|itemShelfLifeValue|itemShelfLifeUnit|syncShelfLifeFields" index.php`
+- `rg -n "normalizeItemDateShelfFields|calcExpiryFromShelfLife|production_date|shelf_life_value|shelf_life_unit" index.php`
 
 - 修改步骤
-1. 只动 DOM 顺序，不改输入框 `id`。
-2. 如更换字段名，要同步 `editItem()` / `saveItem()` / 后端 SQL。
+1. 表单布局保持顺序：`购入日期 -> 条码/序列号 -> 生产日期 + 保质期 + 过期日期`，不要修改字段 `id`。
+2. 保质期输入维持“数字 + 单位（天/周/月/年）”双控件，并保持组合宽度铺满列宽。
+3. 前端通过 `syncShelfLifeFields()` 联动过期日期；后端通过 `normalizeItemDateShelfFields()` 兜底计算，避免仅前端联动导致数据不一致。
+4. “编辑物品 / 已购买入库 / 复制物品”三条路径都要同步重置、回填和提交这三个新字段。
 
 - 验证
-- 字段顺序正确，保存回填正常。
+- 只填过期日期可正常保存；填“生产日期 + 保质期”时过期日期会自动更新。
+- 进入“已购买入库”后，生产日期/保质期为默认空值，填写后可联动并入库成功。
+- 同一物品再次编辑时，生产日期与保质期能正确回填。
 
 ### 2.2 关闭弹窗前提醒保存（忽略修改 / 保存修改）
 
@@ -467,7 +473,7 @@ php -l index.php
 - `index.php:4843-4872`：点击后调用 `shopping-list/update-status`
 
 - 修改步骤
-1. 按钮文案由目标状态驱动：当前待购买 -> 按钮显示“已购买”；当前待收货 -> 按钮显示“待购买”。
+1. 按钮文案由目标状态驱动：当前待购买 -> 按钮显示“转为已购买”；当前待收货 -> 按钮显示“转为待购买”。
 2. 切换后同步更新本地 `App.shoppingList`，并执行 `closeShoppingModal(); renderView();`。
 
 - 验证
@@ -554,7 +560,7 @@ php -l index.php
 
 - 页面内置更新记录：`index.php` 中 `const CHANGELOG = [...]`
 - 当前版本号来源：`index.php` 中 `const APP_VERSION = CHANGELOG[0].version`
-- README 版本记录：`README.md` 的“更新记录”章节（当前置顶 `v1.6.1`）
+- README 版本记录：`README.md` 的“更新记录”章节（当前置顶 `v1.6.4`）
 - README 功能总览：`README.md` 的“功能概览”章节（含公共频道）
 
 发布新功能建议同步顺序：

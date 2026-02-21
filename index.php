@@ -850,6 +850,30 @@ function initSchema($db)
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )");
 
+    $db->exec("CREATE TABLE IF NOT EXISTS collection_lists (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        description TEXT DEFAULT '',
+        notes TEXT DEFAULT '',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )");
+
+    $db->exec("CREATE TABLE IF NOT EXISTS collection_list_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        collection_id INTEGER NOT NULL,
+        item_id INTEGER NOT NULL,
+        sort_order INTEGER DEFAULT 0,
+        flagged INTEGER DEFAULT 0,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(collection_id, item_id),
+        FOREIGN KEY (collection_id) REFERENCES collection_lists(id) ON DELETE CASCADE,
+        FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
+    )");
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_collection_list_items_collection ON collection_list_items(collection_id, sort_order, id)");
+    $db->exec("CREATE INDEX IF NOT EXISTS idx_collection_list_items_item ON collection_list_items(item_id)");
+
     $db->exec("CREATE TABLE IF NOT EXISTS items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
@@ -863,6 +887,9 @@ function initSchema($db)
         image TEXT DEFAULT '',
         barcode TEXT DEFAULT '',
         purchase_date TEXT DEFAULT '',
+        production_date TEXT DEFAULT '',
+        shelf_life_value INTEGER DEFAULT 0,
+        shelf_life_unit TEXT DEFAULT '',
         purchase_price REAL DEFAULT 0,
         tags TEXT DEFAULT '',
         status TEXT DEFAULT 'active',
@@ -889,10 +916,31 @@ function initSchema($db)
     $db->exec("CREATE INDEX IF NOT EXISTS idx_item_reminder_instances_item ON item_reminder_instances(item_id)");
     $db->exec("CREATE INDEX IF NOT EXISTS idx_item_reminder_instances_due ON item_reminder_instances(due_date, is_completed)");
 
+    try {
+        $db->exec("ALTER TABLE collection_list_items ADD COLUMN flagged INTEGER DEFAULT 0");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("ALTER TABLE collection_lists ADD COLUMN notes TEXT DEFAULT ''");
+    } catch (Exception $e) {
+    }
+
     // 数据库迁移：为旧数据库添加 expiry_date 字段
     try {
         $db->exec("ALTER TABLE items ADD COLUMN expiry_date TEXT DEFAULT ''");
     } catch (Exception $e) { /* 字段已存在则忽略 */
+    }
+    try {
+        $db->exec("ALTER TABLE items ADD COLUMN production_date TEXT DEFAULT ''");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("ALTER TABLE items ADD COLUMN shelf_life_value INTEGER DEFAULT 0");
+    } catch (Exception $e) {
+    }
+    try {
+        $db->exec("ALTER TABLE items ADD COLUMN shelf_life_unit TEXT DEFAULT ''");
+    } catch (Exception $e) {
     }
 
     // 数据库迁移：为旧数据库添加 deleted_at 字段（回收站软删除）
@@ -1336,6 +1384,83 @@ function normalizeDateYmd($dateStr)
     return sprintf('%04d-%02d-%02d', $y, $mon, $day);
 }
 
+function normalizeShelfLifeUnit($unit)
+{
+    $u = strtolower(trim((string) $unit));
+    if ($u === 'day' || $u === 'days' || $u === 'd' || $u === '天')
+        return 'day';
+    if ($u === 'week' || $u === 'weeks' || $u === 'w' || $u === '周')
+        return 'week';
+    if ($u === 'month' || $u === 'months' || $u === 'm' || $u === '月')
+        return 'month';
+    if ($u === 'year' || $u === 'years' || $u === 'y' || $u === '年')
+        return 'year';
+    return '';
+}
+
+function normalizeShelfLifeValue($value, $unit)
+{
+    $u = normalizeShelfLifeUnit($unit);
+    if ($u === '')
+        return 0;
+    $v = intval($value);
+    if ($v < 1)
+        $v = 1;
+    if ($v > 36500)
+        $v = 36500;
+    return $v;
+}
+
+function calcExpiryFromShelfLife($productionDate, $shelfLifeValue, $shelfLifeUnit)
+{
+    $baseDate = normalizeDateYmd($productionDate);
+    $unit = normalizeShelfLifeUnit($shelfLifeUnit);
+    $value = normalizeShelfLifeValue($shelfLifeValue, $unit);
+    if ($baseDate === null || $baseDate === '' || $unit === '' || $value < 1)
+        return '';
+
+    $dt = DateTime::createFromFormat('Y-m-d', $baseDate);
+    if (!$dt)
+        return '';
+    if ($unit === 'day')
+        $dt->modify('+' . $value . ' day');
+    elseif ($unit === 'week')
+        $dt->modify('+' . $value . ' week');
+    elseif ($unit === 'month')
+        $dt->modify('+' . $value . ' month');
+    else
+        $dt->modify('+' . $value . ' year');
+    return $dt->format('Y-m-d');
+}
+
+function normalizeItemDateShelfFields($purchaseDateRaw, $productionDateRaw, $shelfLifeValueRaw, $shelfLifeUnitRaw, $expiryDateRaw)
+{
+    $purchaseDate = normalizeDateYmd($purchaseDateRaw);
+    if ($purchaseDate === null) {
+        return ['', '', 0, '', '', '购入日期格式错误，应为 YYYY-MM-DD'];
+    }
+    $productionDate = normalizeDateYmd($productionDateRaw);
+    if ($productionDate === null) {
+        return ['', '', 0, '', '', '生产日期格式错误，应为 YYYY-MM-DD'];
+    }
+    $manualExpiryDate = normalizeDateYmd($expiryDateRaw);
+    if ($manualExpiryDate === null) {
+        return ['', '', 0, '', '', '过期日期格式错误，应为 YYYY-MM-DD'];
+    }
+
+    $shelfLifeUnit = normalizeShelfLifeUnit($shelfLifeUnitRaw);
+    $shelfLifeValue = normalizeShelfLifeValue($shelfLifeValueRaw, $shelfLifeUnit);
+    if ($shelfLifeUnit === '' || $shelfLifeValue <= 0) {
+        $shelfLifeUnit = '';
+        $shelfLifeValue = 0;
+    }
+
+    $derivedExpiry = calcExpiryFromShelfLife($productionDate, $shelfLifeValue, $shelfLifeUnit);
+    $expiryDate = $derivedExpiry !== '' ? $derivedExpiry : ($manualExpiryDate ?? '');
+
+    return [$purchaseDate ?? '', $productionDate ?? '', $shelfLifeValue, $shelfLifeUnit, $expiryDate, null];
+}
+
 function isValidDateYmd($dateStr)
 {
     return normalizeDateYmd($dateStr) !== null;
@@ -1689,6 +1814,8 @@ function loadDemoDataIntoDb($db, $options = [])
 
     $db->beginTransaction();
     try {
+        $db->exec("DELETE FROM collection_list_items");
+        $db->exec("DELETE FROM collection_lists");
         $db->exec("DELETE FROM items");
         $db->exec("DELETE FROM item_reminder_instances");
         $db->exec("DELETE FROM shopping_list");
@@ -1696,7 +1823,7 @@ function loadDemoDataIntoDb($db, $options = [])
         $db->exec("DELETE FROM locations");
         $db->exec("DELETE FROM operation_logs");
         try {
-            $db->exec("DELETE FROM sqlite_sequence WHERE name IN ('items','item_reminder_instances','shopping_list','categories','locations','operation_logs')");
+            $db->exec("DELETE FROM sqlite_sequence WHERE name IN ('collection_list_items','collection_lists','items','item_reminder_instances','shopping_list','categories','locations','operation_logs')");
         } catch (Exception $e) {
         }
 
@@ -1741,32 +1868,33 @@ function loadDemoDataIntoDb($db, $options = [])
             ['name' => '机械键盘', 'category' => '电子设备', 'subcategory' => '电脑外设', 'location' => '书桌抽屉', 'quantity' => 1, 'description' => '备用键盘', 'barcode' => 'KB-RED-87', 'purchase_date' => date('Y-m-d', strtotime('-540 days')), 'purchase_price' => 399, 'tags' => '键盘,外设', 'status' => 'archived', 'expiry_date' => '', 'purchase_from' => '拼多多', 'notes' => '近期未使用，已归档保存'],
             ['name' => '二手显示器', 'category' => '电子设备', 'subcategory' => '电脑外设', 'location' => '储物间', 'quantity' => 1, 'description' => '已转卖物品', 'barcode' => 'MON-USED-24', 'purchase_date' => date('Y-m-d', strtotime('-800 days')), 'purchase_price' => 1200, 'tags' => '显示器,转卖', 'status' => 'sold', 'expiry_date' => '', 'purchase_from' => '闲鱼', 'notes' => '已完成交易，保留记录'],
             ['name' => '胶囊咖啡机', 'category' => '厨房用品', 'subcategory' => '厨房小电', 'location' => '厨房', 'quantity' => 1, 'description' => '家用咖啡机', 'barcode' => 'COFFEE-01', 'purchase_date' => date('Y-m-d', strtotime('-320 days')), 'purchase_price' => 899, 'tags' => '咖啡,厨房', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '线下', 'notes' => '常用设备', 'is_public_shared' => 1, 'public_recommend_reason' => '稳定耐用，家用入门友好，维护成本低', 'reminder_date' => date('Y-m-d', strtotime('-28 days')), 'reminder_next_date' => date('Y-m-d', strtotime('+2 days')), 'reminder_cycle_value' => 30, 'reminder_cycle_unit' => 'day', 'reminder_note' => '需要清洗水箱并补充咖啡胶囊'],
-            ['name' => '维生素 D3', 'category' => '其他', 'subcategory' => '日用杂项', 'location' => '厨房', 'quantity' => 2, 'remaining_current' => 1, 'description' => '保健品', 'barcode' => 'HEALTH-D3-01', 'purchase_date' => date('Y-m-d', strtotime('-60 days')), 'purchase_price' => 128, 'tags' => '保健,补剂', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+5 days')), 'purchase_from' => '线下', 'notes' => '还有约一周到期，优先使用'],
-            ['name' => '车载灭火器', 'category' => '工具五金', 'location' => '阳台', 'quantity' => 1, 'remaining_current' => 0, 'description' => '安全应急用品', 'barcode' => 'SAFE-FIRE-01', 'purchase_date' => date('Y-m-d', strtotime('-480 days')), 'purchase_price' => 89, 'tags' => '安全,应急', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('-12 days')), 'purchase_from' => '京东', 'notes' => '已超过有效期，需尽快更换'],
-            ['name' => '沐浴露补充装', 'category' => '其他', 'subcategory' => '日用杂项', 'location' => '储物间', 'quantity' => 3, 'description' => '家庭日用品', 'barcode' => 'HOME-BATH-03', 'purchase_date' => date('Y-m-d', strtotime('-30 days')), 'purchase_price' => 75, 'tags' => '日用品,家居', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+25 days')), 'purchase_from' => '拼多多', 'notes' => '本月内到期，先用旧库存'],
+            ['name' => '维生素 D3', 'category' => '其他', 'subcategory' => '日用杂项', 'location' => '厨房', 'quantity' => 2, 'remaining_current' => 1, 'description' => '保健品', 'barcode' => 'HEALTH-D3-01', 'purchase_date' => date('Y-m-d', strtotime('-60 days')), 'production_date' => date('Y-m-d', strtotime('-360 days')), 'shelf_life_value' => 1, 'shelf_life_unit' => 'year', 'purchase_price' => 128, 'tags' => '保健,补剂', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+5 days')), 'purchase_from' => '线下', 'notes' => '还有约一周到期，优先使用'],
+            ['name' => '车载灭火器', 'category' => '工具五金', 'location' => '阳台', 'quantity' => 1, 'remaining_current' => 0, 'description' => '安全应急用品', 'barcode' => 'SAFE-FIRE-01', 'purchase_date' => date('Y-m-d', strtotime('-480 days')), 'production_date' => date('Y-m-d', strtotime('-742 days')), 'shelf_life_value' => 2, 'shelf_life_unit' => 'year', 'purchase_price' => 89, 'tags' => '安全,应急', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('-12 days')), 'purchase_from' => '京东', 'notes' => '已超过有效期，需尽快更换'],
+            ['name' => '沐浴露补充装', 'category' => '其他', 'subcategory' => '日用杂项', 'location' => '储物间', 'quantity' => 3, 'description' => '家庭日用品', 'barcode' => 'HOME-BATH-03', 'purchase_date' => date('Y-m-d', strtotime('-30 days')), 'production_date' => date('Y-m-d', strtotime('-340 days')), 'shelf_life_value' => 1, 'shelf_life_unit' => 'year', 'purchase_price' => 75, 'tags' => '日用品,家居', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+25 days')), 'purchase_from' => '拼多多', 'notes' => '本月内到期，先用旧库存'],
             ['name' => '训练足球', 'category' => '运动户外', 'subcategory' => '球类器材', 'location' => '阳台', 'quantity' => 1, 'description' => '周末运动使用', 'barcode' => 'SPORT-BALL-01', 'purchase_date' => date('Y-m-d', strtotime('-210 days')), 'purchase_price' => 199, 'tags' => '运动,户外', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '淘宝', 'notes' => '周末固定训练用球', 'reminder_date' => date('Y-m-d', strtotime('-20 days')), 'reminder_next_date' => date('Y-m-d', strtotime('+1 day')), 'reminder_cycle_value' => 1, 'reminder_cycle_unit' => 'week', 'reminder_note' => '按首次训练日期每周提醒一次，出门前检查气压'],
             ['name' => '空气净化器滤芯', 'category' => '家具家居', 'subcategory' => '清洁收纳', 'location' => '客厅', 'quantity' => 1, 'remaining_current' => 0, 'description' => '客厅净化器维护项目', 'barcode' => 'AIR-FILTER-01', 'purchase_date' => date('Y-m-d', strtotime('-200 days')), 'purchase_price' => 169, 'tags' => '家居,维护', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '上次维护后需持续追踪更换周期', 'is_public_shared' => 1, 'public_recommend_reason' => '价格和性能平衡，适合作为常备耗材', 'reminder_date' => date('Y-m-d', strtotime('-87 days')), 'reminder_next_date' => date('Y-m-d', strtotime('+3 days')), 'reminder_cycle_value' => 90, 'reminder_cycle_unit' => 'day', 'reminder_note' => '按初始维护日期每 90 天提醒一次，临近提醒时准备更换滤芯'],
             ['name' => '空气净化器滤芯（原厂）', 'category' => '家具家居', 'subcategory' => '清洁收纳', 'location' => '储物间', 'quantity' => 1, 'description' => '上一批次原厂滤芯采购记录', 'barcode' => 'AIR-FILTER-OEM-02', 'purchase_date' => date('Y-m-d', strtotime('-35 days')), 'purchase_price' => 199, 'tags' => '滤芯,原厂', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '价格较高但安装更稳', 'is_public_shared' => 1, 'public_recommend_reason' => '安装契合度高，追求稳定可优先考虑'],
             ['name' => '空气净化器滤芯（兼容款）', 'category' => '家具家居', 'subcategory' => '清洁收纳', 'location' => '储物间', 'quantity' => 2, 'description' => '兼容款滤芯采购记录', 'barcode' => 'AIR-FILTER-COMP-03', 'purchase_date' => date('Y-m-d', strtotime('-120 days')), 'purchase_price' => 129, 'tags' => '滤芯,兼容', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '拼多多', 'notes' => '单价更低，适合备货'],
-            ['name' => '维生素D3滴剂', 'category' => '其他', 'subcategory' => '日用杂项', 'location' => '厨房', 'quantity' => 1, 'description' => '儿童可用滴剂版本', 'barcode' => 'HEALTH-D3-DROP-02', 'purchase_date' => date('Y-m-d', strtotime('-22 days')), 'purchase_price' => 139, 'tags' => '保健,滴剂', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+320 days')), 'purchase_from' => '淘宝', 'notes' => '最近一次补货'],
-            ['name' => '维生素 D3 软胶囊', 'category' => '其他', 'location' => '厨房', 'quantity' => 1, 'description' => '成人常规补充版本', 'barcode' => 'HEALTH-D3-CAPS-03', 'purchase_date' => date('Y-m-d', strtotime('-180 days')), 'purchase_price' => 109, 'tags' => '保健,胶囊', 'status' => 'archived', 'expiry_date' => date('Y-m-d', strtotime('+120 days')), 'purchase_from' => '京东', 'notes' => '旧批次价格较低'],
-            ['name' => '车载灭火器（标准版）', 'category' => '工具五金', 'location' => '阳台', 'quantity' => 1, 'description' => '上一代标准版灭火器', 'barcode' => 'SAFE-FIRE-STD-02', 'purchase_date' => date('Y-m-d', strtotime('-90 days')), 'purchase_price' => 109, 'tags' => '安全,应急', 'status' => 'archived', 'expiry_date' => date('Y-m-d', strtotime('+280 days')), 'purchase_from' => '线下', 'notes' => '作为价格对比记录'],
-            ['name' => '车载灭火器（便携款）', 'category' => '工具五金', 'location' => '储物间', 'quantity' => 1, 'description' => '便携款采购记录', 'barcode' => 'SAFE-FIRE-MINI-03', 'purchase_date' => date('Y-m-d', strtotime('-300 days')), 'purchase_price' => 79, 'tags' => '安全,便携', 'status' => 'archived', 'expiry_date' => date('Y-m-d', strtotime('+60 days')), 'purchase_from' => '淘宝', 'notes' => '历史最低购入价记录'],
+            ['name' => '维生素D3滴剂', 'category' => '其他', 'subcategory' => '日用杂项', 'location' => '厨房', 'quantity' => 1, 'description' => '儿童可用滴剂版本', 'barcode' => 'HEALTH-D3-DROP-02', 'purchase_date' => date('Y-m-d', strtotime('-22 days')), 'production_date' => date('Y-m-d', strtotime('-45 days')), 'shelf_life_value' => 1, 'shelf_life_unit' => 'year', 'purchase_price' => 139, 'tags' => '保健,滴剂', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+320 days')), 'purchase_from' => '淘宝', 'notes' => '最近一次补货'],
+            ['name' => '维生素 D3 软胶囊', 'category' => '其他', 'location' => '厨房', 'quantity' => 1, 'description' => '成人常规补充版本', 'barcode' => 'HEALTH-D3-CAPS-03', 'purchase_date' => date('Y-m-d', strtotime('-180 days')), 'production_date' => date('Y-m-d', strtotime('-245 days')), 'shelf_life_value' => 1, 'shelf_life_unit' => 'year', 'purchase_price' => 109, 'tags' => '保健,胶囊', 'status' => 'archived', 'expiry_date' => date('Y-m-d', strtotime('+120 days')), 'purchase_from' => '京东', 'notes' => '旧批次价格较低'],
+            ['name' => '车载灭火器（标准版）', 'category' => '工具五金', 'location' => '阳台', 'quantity' => 1, 'description' => '上一代标准版灭火器', 'barcode' => 'SAFE-FIRE-STD-02', 'purchase_date' => date('Y-m-d', strtotime('-90 days')), 'production_date' => date('Y-m-d', strtotime('-450 days')), 'shelf_life_value' => 2, 'shelf_life_unit' => 'year', 'purchase_price' => 109, 'tags' => '安全,应急', 'status' => 'archived', 'expiry_date' => date('Y-m-d', strtotime('+280 days')), 'purchase_from' => '线下', 'notes' => '作为价格对比记录'],
+            ['name' => '车载灭火器（便携款）', 'category' => '工具五金', 'location' => '储物间', 'quantity' => 1, 'description' => '便携款采购记录', 'barcode' => 'SAFE-FIRE-MINI-03', 'purchase_date' => date('Y-m-d', strtotime('-300 days')), 'production_date' => date('Y-m-d', strtotime('-670 days')), 'shelf_life_value' => 2, 'shelf_life_unit' => 'year', 'purchase_price' => 79, 'tags' => '安全,便携', 'status' => 'archived', 'expiry_date' => date('Y-m-d', strtotime('+60 days')), 'purchase_from' => '淘宝', 'notes' => '历史最低购入价记录'],
             ['name' => '设计模式（第2版）', 'category' => '书籍文档', 'subcategory' => '纸质书', 'location' => '书房', 'quantity' => 1, 'description' => '技术书籍', 'barcode' => 'BOOK-DESIGN-02', 'purchase_date' => date('Y-m-d', strtotime('-700 days')), 'purchase_price' => 88, 'tags' => '书籍,学习', 'status' => 'archived', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '已读完，暂存书架'],
             ['name' => '纪念手表', 'category' => '电子设备', 'location' => '卧室', 'quantity' => 1, 'description' => '礼品来源物品', 'barcode' => 'GIFT-WATCH-01', 'purchase_date' => date('Y-m-d', strtotime('-95 days')), 'purchase_price' => 0, 'tags' => '礼物,收藏', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '礼品', 'notes' => '生日礼物，定期保养'],
             ['name' => '在线课程年度会员', 'category' => '虚拟产品', 'subcategory' => '会员服务', 'location' => '书房', 'quantity' => 1, 'description' => '在线学习会员服务', 'barcode' => 'VIP-COURSE-2026', 'purchase_date' => date('Y-m-d', strtotime('-20 days')), 'purchase_price' => 399, 'tags' => '会员,学习', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+340 days')), 'purchase_from' => '线下', 'notes' => '到期前一个月提醒续费', 'is_public_shared' => 1, 'public_recommend_reason' => '内容更新频率高，长期学习性价比高', 'reminder_date' => date('Y-m-d', strtotime('-20 days')), 'reminder_next_date' => date('Y-m-d', strtotime('+345 days')), 'reminder_cycle_value' => 1, 'reminder_cycle_unit' => 'year', 'reminder_note' => '按开通日期每年提醒一次，建议到期前 30 天处理续费'],
-            ['name' => '有机燕麦片', 'category' => '食物', 'subcategory' => '主食粮油', 'location' => '厨房', 'quantity' => 2, 'remaining_current' => 0, 'description' => '早餐常备食材', 'barcode' => 'FOOD-OAT-01', 'purchase_date' => date('Y-m-d', strtotime('-18 days')), 'purchase_price' => 45, 'tags' => '食物,早餐', 'status' => 'used_up', 'expiry_date' => date('Y-m-d', strtotime('+120 days')), 'purchase_from' => '京东', 'notes' => '已用完状态示例，用于覆盖状态筛选与余量提醒联动'],
+            ['name' => '有机燕麦片', 'category' => '食物', 'subcategory' => '主食粮油', 'location' => '厨房', 'quantity' => 2, 'remaining_current' => 0, 'description' => '早餐常备食材', 'barcode' => 'FOOD-OAT-01', 'purchase_date' => date('Y-m-d', strtotime('-18 days')), 'production_date' => date('Y-m-d', strtotime('-245 days')), 'shelf_life_value' => 1, 'shelf_life_unit' => 'year', 'purchase_price' => 45, 'tags' => '食物,早餐', 'status' => 'used_up', 'expiry_date' => date('Y-m-d', strtotime('+120 days')), 'purchase_from' => '京东', 'notes' => '已用完状态示例，用于覆盖状态筛选与余量提醒联动'],
             ['name' => '便携湿巾（家庭装）', 'category' => '其他', 'subcategory' => '日用杂项', 'location' => '玄关', 'quantity' => 6, 'remaining_total' => 0, 'description' => '常备清洁用品', 'barcode' => 'HOME-WIPE-06', 'purchase_date' => date('Y-m-d', strtotime('-8 days')), 'purchase_price' => 29, 'tags' => '清洁,日用品', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '线下', 'notes' => '用于演示“清空余量后不触发余量提醒”'],
             ['name' => '未分类收纳箱', 'category' => '', 'location' => '', 'quantity' => 2, 'description' => '暂未归类，等待整理', 'barcode' => 'BOX-UNCAT-01', 'purchase_date' => date('Y-m-d', strtotime('-15 days')), 'purchase_price' => 59, 'tags' => '收纳,未分类', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '线下', 'notes' => '暂放玄关，待统一收纳'],
         ];
 
-        $insertItem = $db->prepare("INSERT INTO items (name, category_id, subcategory_id, location_id, quantity, remaining_current, remaining_total, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, is_public_shared, public_recommend_reason, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        $insertItem = $db->prepare("INSERT INTO items (name, category_id, subcategory_id, location_id, quantity, remaining_current, remaining_total, description, image, barcode, purchase_date, production_date, shelf_life_value, shelf_life_unit, purchase_price, tags, status, expiry_date, purchase_from, notes, is_public_shared, public_recommend_reason, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
         $created = 0;
         $subcategoryBoundCount = 0;
         $sharedCount = 0;
         $publicCommentCreated = 0;
         $usedUpCount = 0;
         $remainingUnsetCount = 0;
+        $itemIdByName = [];
         if ($authDb && $ownerUserId > 0) {
             removePublicSharedItemsByOwner($authDb, $ownerUserId);
         }
@@ -1809,6 +1937,9 @@ function loadDemoDataIntoDb($db, $options = [])
                 '',
                 $item['barcode'] ?? '',
                 normalizeDateYmd($item['purchase_date'] ?? '') ?? '',
+                normalizeDateYmd($item['production_date'] ?? '') ?? '',
+                normalizeShelfLifeValue($item['shelf_life_value'] ?? 0, $item['shelf_life_unit'] ?? ''),
+                normalizeShelfLifeUnit($item['shelf_life_unit'] ?? ''),
                 floatval($item['purchase_price'] ?? 0),
                 $item['tags'] ?? '',
                 $itemStatus,
@@ -1823,12 +1954,18 @@ function loadDemoDataIntoDb($db, $options = [])
                 normalizeReminderCycleUnit($item['reminder_cycle_unit'] ?? ''),
                 trim((string) ($item['reminder_note'] ?? ''))
             ]);
+            $newItemId = intval($db->lastInsertId());
             $created++;
+            if ($newItemId > 0) {
+                $itemNameKey = trim((string) ($item['name'] ?? ''));
+                if ($itemNameKey !== '') {
+                    $itemIdByName[$itemNameKey] = $newItemId;
+                }
+            }
             if ($subcategoryId > 0) {
                 $subcategoryBoundCount++;
             }
             if ($authDb && $ownerUserId > 0 && $isPublicShared === 1) {
-                $newItemId = intval($db->lastInsertId());
                 syncPublicSharedItem($authDb, $db, $ownerUserId, $newItemId, 1);
                 $sharedCount++;
             }
@@ -1936,8 +2073,8 @@ function loadDemoDataIntoDb($db, $options = [])
         }
 
         $demoShoppingList = [
-            ['name' => '空气净化器滤芯（90天周期备用）', 'quantity' => 1, 'status' => 'pending_purchase', 'category' => '家具家居', 'priority' => 'high', 'planned_price' => 169, 'notes' => '与在用滤芯同型号，提前备货', 'reminder_date' => date('Y-m-d', strtotime('+1 day')), 'reminder_note' => '和物品里的 90 天循环提醒同步，确认活动价后下单'],
-            ['name' => '维生素 D3（补充装）', 'quantity' => 2, 'status' => 'pending_receipt', 'category' => '其他', 'priority' => 'high', 'planned_price' => 128, 'notes' => '已下单待收货，收货后放入厨房抽屉', 'reminder_date' => date('Y-m-d', strtotime('-1 day')), 'reminder_note' => '到货后核对保质期'],
+            ['name' => '空气净化器滤芯（90天周期备用）', 'quantity' => 1, 'status' => 'pending_purchase', 'category' => '家具家居', 'priority' => 'high', 'planned_price' => 169, 'notes' => '与在用滤芯同型号，提前备货', 'reminder_date' => date('Y-m-d', strtotime('+1 day')), 'reminder_note' => '和物品里的 90 天循环提醒同步，确认活动价后下单；下单后可点“转为已购买”'],
+            ['name' => '维生素 D3（补充装）', 'quantity' => 2, 'status' => 'pending_receipt', 'category' => '其他', 'priority' => 'high', 'planned_price' => 128, 'notes' => '已下单待收货，收货后放入厨房抽屉', 'reminder_date' => date('Y-m-d', strtotime('-1 day')), 'reminder_note' => '到货后核对保质期；若取消订单可在编辑里点“转为待购买”'],
             ['name' => '车载灭火器（新）', 'quantity' => 1, 'status' => 'pending_purchase', 'category' => '工具五金', 'priority' => 'high', 'planned_price' => 99, 'notes' => '替换已过期的旧灭火器', 'reminder_date' => date('Y-m-d', strtotime('+2 days')), 'reminder_note' => '确认生产日期在一年内'],
             ['name' => '在线课程会员续费', 'quantity' => 1, 'status' => 'pending_purchase', 'category' => '虚拟产品', 'priority' => 'normal', 'planned_price' => 399, 'notes' => '用于演示年度会员的续费提醒流程', 'reminder_date' => date('Y-m-d', strtotime('+320 days')), 'reminder_note' => '到期前 30 天处理续费，避免中断使用'],
             ['name' => '机械键盘键帽套装', 'quantity' => 1, 'status' => 'pending_purchase', 'category' => '电子设备', 'priority' => 'low', 'planned_price' => 79, 'notes' => '给备用键盘更换键帽', 'reminder_date' => '', 'reminder_note' => ''],
@@ -1958,6 +2095,79 @@ function loadDemoDataIntoDb($db, $options = [])
                 trim((string) ($row['reminder_note'] ?? '')),
             ]);
             $shoppingCreated++;
+        }
+
+        $demoCollections = [
+            [
+                'name' => '上班要带',
+                'description' => '工作日通勤前检查',
+                'notes' => '旗标可表示今天已经装包，出门前核对一次。',
+                'items' => [
+                    ['name' => 'MacBook Air M2', 'flagged' => 1],
+                    ['name' => 'AirPods Pro', 'flagged' => 1],
+                    ['name' => '纪念手表', 'flagged' => 0],
+                ]
+            ],
+            [
+                'name' => '周末露营要带',
+                'description' => '轻量露营基础装备',
+                'notes' => '周五晚上统一检查，易忘品优先打旗标提醒。',
+                'items' => [
+                    ['name' => '训练足球', 'flagged' => 0],
+                    ['name' => '空气净化器滤芯（兼容款）', 'flagged' => 1],
+                    ['name' => '便携湿巾（家庭装）', 'flagged' => 0],
+                ]
+            ],
+            [
+                'name' => '大扫除要买',
+                'description' => '集中补货的家居耗材',
+                'notes' => '标记为旗标的物品优先购买，避免断档。',
+                'items' => [
+                    ['name' => '空气净化器滤芯', 'flagged' => 1],
+                    ['name' => '沐浴露补充装', 'flagged' => 0],
+                ]
+            ]
+        ];
+        $collectionCreated = 0;
+        $collectionLinkedItems = 0;
+        $insertCollection = $db->prepare("INSERT INTO collection_lists (name, description, notes, created_at, updated_at) VALUES (?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
+        $insertCollectionItem = $db->prepare("INSERT OR IGNORE INTO collection_list_items (collection_id, item_id, sort_order, flagged, created_at, updated_at) VALUES (?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
+        foreach ($demoCollections as $collectionRow) {
+            $collectionName = trim((string) ($collectionRow['name'] ?? ''));
+            if ($collectionName === '') {
+                continue;
+            }
+            $insertCollection->execute([
+                $collectionName,
+                trim((string) ($collectionRow['description'] ?? '')),
+                trim((string) ($collectionRow['notes'] ?? ''))
+            ]);
+            $collectionId = intval($db->lastInsertId());
+            if ($collectionId <= 0) {
+                continue;
+            }
+            $collectionCreated++;
+            $itemsInCollection = is_array($collectionRow['items'] ?? null) ? $collectionRow['items'] : [];
+            $sortOrder = 1;
+            foreach ($itemsInCollection as $itemRow) {
+                $itemName = '';
+                $flagged = 0;
+                if (is_array($itemRow)) {
+                    $itemName = trim((string) ($itemRow['name'] ?? ''));
+                    $flagged = intval($itemRow['flagged'] ?? 0) === 1 ? 1 : 0;
+                } else {
+                    $itemName = trim((string) $itemRow);
+                }
+                $itemId = intval($itemIdByName[$itemName] ?? 0);
+                if ($itemId <= 0) {
+                    continue;
+                }
+                $insertCollectionItem->execute([$collectionId, $itemId, $sortOrder, $flagged]);
+                if ($insertCollectionItem->rowCount() > 0) {
+                    $collectionLinkedItems++;
+                    $sortOrder++;
+                }
+            }
         }
 
         $peerSharedCount = 0;
@@ -2045,6 +2255,14 @@ function loadDemoDataIntoDb($db, $options = [])
                 'method' => 'POST',
                 'details' => '购物清单初始化：新增 ' . $shoppingCreated . ' 条待办',
                 'created_at' => "datetime('now','-80 minutes','localtime')"
+            ],
+            [
+                'action_key' => 'collection_lists',
+                'action_label' => '新增集合清单',
+                'api' => 'collection-lists',
+                'method' => 'POST',
+                'details' => '集合清单初始化：新增 ' . $collectionCreated . ' 组，关联物品 ' . $collectionLinkedItems . ' 条',
+                'created_at' => "datetime('now','-78 minutes','localtime')"
             ],
             [
                 'action_key' => 'settings_dashboard_ranges',
@@ -2154,6 +2372,9 @@ function loadDemoDataIntoDb($db, $options = [])
         if ($remainingUnsetCount > 0) {
             $message .= "，含 $remainingUnsetCount 件“余量未设置”示例";
         }
+        if ($collectionCreated > 0) {
+            $message .= "，含 $collectionCreated 组集合清单（关联 $collectionLinkedItems 条物品）";
+        }
         if ($totalSharedCount > 0) {
             $message .= "，含 $totalSharedCount 条公共频道共享物品";
         }
@@ -2182,6 +2403,8 @@ function loadDemoDataIntoDb($db, $options = [])
             'used_up_seeded' => $usedUpCount,
             'remaining_unset_seeded' => $remainingUnsetCount,
             'shopping_created' => $shoppingCreated,
+            'collection_created' => $collectionCreated,
+            'collection_linked_items' => $collectionLinkedItems,
             'shared_created' => $totalSharedCount,
             'public_comment_created' => $totalPublicCommentCreated,
             'operation_log_seeded' => $operationLogSeeded,
@@ -2890,6 +3113,7 @@ if (isset($_GET['api'])) {
                             OR i.purchase_from LIKE ?
                             OR i.notes LIKE ?
                             OR i.purchase_date LIKE ?
+                            OR i.production_date LIKE ?
                             OR i.expiry_date LIKE ?
                             OR i.reminder_date LIKE ?
                             OR i.reminder_next_date LIKE ?
@@ -2906,7 +3130,7 @@ if (isset($_GET['api'])) {
                             OR (CASE i.status WHEN 'active' THEN '使用中' WHEN 'archived' THEN '已归档' WHEN 'sold' THEN '已转卖' WHEN 'used_up' THEN '已用完' ELSE i.status END) LIKE ?
                         )";
                         $s = "%$search%";
-                        $params = array_merge($params, [$s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s]);
+                        $params = array_merge($params, [$s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s, $s]);
                     }
                     if ($category !== 0) {
                         if ($category === -1) {
@@ -2983,6 +3207,17 @@ if (isset($_GET['api'])) {
                         $result = ['success' => false, 'message' => '物品名称不能为空'];
                         break;
                     }
+                    [$purchaseDate, $productionDate, $shelfLifeValue, $shelfLifeUnit, $expiryDate, $dateShelfError] = normalizeItemDateShelfFields(
+                        $data['purchase_date'] ?? '',
+                        $data['production_date'] ?? '',
+                        $data['shelf_life_value'] ?? 0,
+                        $data['shelf_life_unit'] ?? '',
+                        $data['expiry_date'] ?? ''
+                    );
+                    if ($dateShelfError) {
+                        $result = ['success' => false, 'message' => $dateShelfError];
+                        break;
+                    }
                     $reminderDate = normalizeReminderDateValue($data['reminder_date'] ?? '');
                     $reminderNextDate = normalizeReminderDateValue($data['reminder_next_date'] ?? '');
                     $reminderUnit = normalizeReminderCycleUnit($data['reminder_cycle_unit'] ?? '');
@@ -3014,7 +3249,7 @@ if (isset($_GET['api'])) {
                         $result = ['success' => false, 'message' => $categoryError];
                         break;
                     }
-                    $stmt = $db->prepare("INSERT INTO items (name, category_id, subcategory_id, location_id, quantity, remaining_current, remaining_total, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, is_public_shared, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+                    $stmt = $db->prepare("INSERT INTO items (name, category_id, subcategory_id, location_id, quantity, remaining_current, remaining_total, description, image, barcode, purchase_date, production_date, shelf_life_value, shelf_life_unit, purchase_price, tags, status, expiry_date, purchase_from, notes, is_public_shared, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
                     $stmt->execute([
                         $data['name'],
                         $categoryId,
@@ -3026,11 +3261,14 @@ if (isset($_GET['api'])) {
                         $data['description'] ?? '',
                         $data['image'] ?? '',
                         $data['barcode'] ?? '',
-                        $data['purchase_date'] ?? '',
+                        $purchaseDate,
+                        $productionDate,
+                        $shelfLifeValue,
+                        $shelfLifeUnit,
                         floatval($data['purchase_price'] ?? 0),
                         $data['tags'] ?? '',
                         normalizeStatusValue($data['status'] ?? 'active'),
-                        $data['expiry_date'] ?? '',
+                        $expiryDate,
                         $data['purchase_from'] ?? '',
                         $data['notes'] ?? '',
                         $shareFlag,
@@ -3067,6 +3305,9 @@ if (isset($_GET['api'])) {
                             $operationDetails .= '；位置: ' . $locName;
                         }
                     }
+                    if ($productionDate !== '' && $shelfLifeValue > 0 && $shelfLifeUnit !== '') {
+                        $operationDetails .= '；保质期: ' . $productionDate . ' + ' . $shelfLifeValue . $shelfLifeUnit;
+                    }
                     if ($shareFlag === 1) {
                         $operationDetails .= '；已共享到公共频道';
                     }
@@ -3079,6 +3320,17 @@ if (isset($_GET['api'])) {
                     $data = json_decode(file_get_contents('php://input'), true);
                     if (empty($data['id'])) {
                         $result = ['success' => false, 'message' => '缺少物品ID'];
+                        break;
+                    }
+                    [$purchaseDate, $productionDate, $shelfLifeValue, $shelfLifeUnit, $expiryDate, $dateShelfError] = normalizeItemDateShelfFields(
+                        $data['purchase_date'] ?? '',
+                        $data['production_date'] ?? '',
+                        $data['shelf_life_value'] ?? 0,
+                        $data['shelf_life_unit'] ?? '',
+                        $data['expiry_date'] ?? ''
+                    );
+                    if ($dateShelfError) {
+                        $result = ['success' => false, 'message' => $dateShelfError];
                         break;
                     }
                     $reminderDate = normalizeReminderDateValue($data['reminder_date'] ?? '');
@@ -3112,7 +3364,7 @@ if (isset($_GET['api'])) {
                         $result = ['success' => false, 'message' => $categoryError];
                         break;
                     }
-                    $stmt = $db->prepare("UPDATE items SET name=?, category_id=?, subcategory_id=?, location_id=?, quantity=?, remaining_current=?, remaining_total=?, description=?, image=?, barcode=?, purchase_date=?, purchase_price=?, tags=?, status=?, expiry_date=?, purchase_from=?, notes=?, is_public_shared=?, reminder_date=?, reminder_next_date=?, reminder_cycle_value=?, reminder_cycle_unit=?, reminder_note=?, updated_at=CURRENT_TIMESTAMP WHERE id=?");
+                    $stmt = $db->prepare("UPDATE items SET name=?, category_id=?, subcategory_id=?, location_id=?, quantity=?, remaining_current=?, remaining_total=?, description=?, image=?, barcode=?, purchase_date=?, production_date=?, shelf_life_value=?, shelf_life_unit=?, purchase_price=?, tags=?, status=?, expiry_date=?, purchase_from=?, notes=?, is_public_shared=?, reminder_date=?, reminder_next_date=?, reminder_cycle_value=?, reminder_cycle_unit=?, reminder_note=?, updated_at=CURRENT_TIMESTAMP WHERE id=?");
                     $stmt->execute([
                         $data['name'],
                         $categoryId,
@@ -3124,11 +3376,14 @@ if (isset($_GET['api'])) {
                         $data['description'] ?? '',
                         $data['image'] ?? '',
                         $data['barcode'] ?? '',
-                        $data['purchase_date'] ?? '',
+                        $purchaseDate,
+                        $productionDate,
+                        $shelfLifeValue,
+                        $shelfLifeUnit,
                         floatval($data['purchase_price'] ?? 0),
                         $data['tags'] ?? '',
                         normalizeStatusValue($data['status'] ?? 'active'),
-                        $data['expiry_date'] ?? '',
+                        $expiryDate,
                         $data['purchase_from'] ?? '',
                         $data['notes'] ?? '',
                         $shareFlag,
@@ -3165,6 +3420,9 @@ if (isset($_GET['api'])) {
                         if ($locName !== '') {
                             $operationDetails .= '；位置: ' . $locName;
                         }
+                    }
+                    if ($productionDate !== '' && $shelfLifeValue > 0 && $shelfLifeUnit !== '') {
+                        $operationDetails .= '；保质期: ' . $productionDate . ' + ' . $shelfLifeValue . $shelfLifeUnit;
                     }
                     if ($shareFlag === 1) {
                         $operationDetails .= '；共享状态: 开启';
@@ -3420,7 +3678,7 @@ if (isset($_GET['api'])) {
 
                     $db->beginTransaction();
                     try {
-                        $stmt = $db->prepare("INSERT INTO items (name, category_id, subcategory_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, reminder_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+                        $stmt = $db->prepare("INSERT INTO items (name, category_id, subcategory_id, location_id, quantity, description, image, barcode, purchase_date, production_date, shelf_life_value, shelf_life_unit, purchase_price, tags, status, expiry_date, purchase_from, notes, reminder_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
                         $created = 0;
                         $skipped = 0;
                         $errors = [];
@@ -3439,12 +3697,17 @@ if (isset($_GET['api'])) {
                                 continue;
                             }
 
-                            $purchaseDate = normalizeDateYmd($row['purchase_date'] ?? '');
-                            $expiryDate = normalizeDateYmd($row['expiry_date'] ?? '');
-                            if ($purchaseDate === null || $expiryDate === null) {
+                            [$purchaseDate, $productionDate, $shelfLifeValue, $shelfLifeUnit, $expiryDate, $itemDateError] = normalizeItemDateShelfFields(
+                                $row['purchase_date'] ?? '',
+                                $row['production_date'] ?? '',
+                                $row['shelf_life_value'] ?? 0,
+                                $row['shelf_life_unit'] ?? '',
+                                $row['expiry_date'] ?? ''
+                            );
+                            if ($itemDateError) {
                                 $skipped++;
                                 if (count($errors) < 20)
-                                    $errors[] = '第 ' . ($idx + 2) . ' 行：日期格式错误，应为 YYYY-MM-DD 或 YYYY/MM/DD（如 2026/2/9）';
+                                    $errors[] = '第 ' . ($idx + 2) . ' 行：' . $itemDateError;
                                 continue;
                             }
 
@@ -3471,6 +3734,9 @@ if (isset($_GET['api'])) {
                                     '',
                                     trim((string) ($row['barcode'] ?? '')),
                                     $purchaseDate,
+                                    $productionDate,
+                                    $shelfLifeValue,
+                                    $shelfLifeUnit,
                                     floatval($row['purchase_price'] ?? 0),
                                     trim((string) ($row['tags'] ?? '')),
                                     normalizeStatusValue($row['status'] ?? 'active'),
@@ -3512,12 +3778,15 @@ if (isset($_GET['api'])) {
                 if ($method === 'POST') {
                     $itemKindsBefore = intval($db->query("SELECT COUNT(*) FROM items")->fetchColumn() ?: 0);
                     $shoppingBefore = intval($db->query("SELECT COUNT(*) FROM shopping_list")->fetchColumn() ?: 0);
+                    $collectionBefore = intval($db->query("SELECT COUNT(*) FROM collection_lists")->fetchColumn() ?: 0);
                     $categoryBefore = intval($db->query("SELECT COUNT(*) FROM categories")->fetchColumn() ?: 0);
                     $locationBefore = intval($db->query("SELECT COUNT(*) FROM locations")->fetchColumn() ?: 0);
                     $moved = moveUploadFilesToTrash($db);
 
                     $db->beginTransaction();
                     try {
+                        $db->exec("DELETE FROM collection_list_items");
+                        $db->exec("DELETE FROM collection_lists");
                         $db->exec("DELETE FROM items");
                         $db->exec("DELETE FROM categories");
                         $db->exec("DELETE FROM locations");
@@ -3525,7 +3794,7 @@ if (isset($_GET['api'])) {
                         $db->exec("DELETE FROM operation_logs");
                         removePublicSharedItemsByOwner($authDb, intval($currentUser['id']));
                         try {
-                            $db->exec("DELETE FROM sqlite_sequence WHERE name IN ('items','categories','locations','shopping_list','operation_logs')");
+                            $db->exec("DELETE FROM sqlite_sequence WHERE name IN ('collection_list_items','collection_lists','items','categories','locations','shopping_list','operation_logs')");
                         } catch (Exception $e) { /* 某些 SQLite 版本可能无该表 */ }
                         $db->commit();
                     } catch (Exception $e) {
@@ -3536,7 +3805,7 @@ if (isset($_GET['api'])) {
 
                     // 重新注入默认分类和默认位置
                     initSchema($db);
-                    $operationDetails = '重置前: 物品' . $itemKindsBefore . '种、购物清单' . $shoppingBefore . '条、分类' . $categoryBefore . '个、位置' . $locationBefore . '个；迁移图片: ' . $moved;
+                    $operationDetails = '重置前: 物品' . $itemKindsBefore . '种、购物清单' . $shoppingBefore . '条、集合清单' . $collectionBefore . '组、分类' . $categoryBefore . '个、位置' . $locationBefore . '个；迁移图片: ' . $moved;
                     $result = ['success' => true, 'message' => '已恢复默认环境，上传目录文件已移入 trash 目录', 'moved_images' => $moved];
                 }
                 break;
@@ -3546,6 +3815,8 @@ if (isset($_GET['api'])) {
                     $demoLoad = loadDemoDataIntoDb($db, ['move_images' => true, 'auth_db' => $authDb, 'owner_user_id' => intval($currentUser['id'])]);
                     $operationDetails = '物品: ' . intval($demoLoad['created'] ?? 0)
                         . '；购物清单: ' . intval($demoLoad['shopping_created'] ?? 0)
+                        . '；集合清单: ' . intval($demoLoad['collection_created'] ?? 0)
+                        . '；集合关联: ' . intval($demoLoad['collection_linked_items'] ?? 0)
                         . '；任务: ' . intval($demoLoad['task_seeded'] ?? 0)
                         . '；共享物品: ' . intval($demoLoad['shared_created'] ?? 0)
                         . '；评论: ' . intval($demoLoad['public_comment_created'] ?? 0)
@@ -4315,7 +4586,415 @@ if (isset($_GET['api'])) {
                 }
                 break;
 
-            // ---------- 公共频道 ----------
+            // ---------- 集合清单 ----------
+            case 'collection-lists':
+                if ($method === 'GET') {
+                    $rows = $db->query("SELECT
+                            cl.*,
+                            COALESCE((
+                                SELECT COUNT(*)
+                                FROM collection_list_items cli
+                                INNER JOIN items i ON i.id=cli.item_id
+                                WHERE cli.collection_id=cl.id AND i.deleted_at IS NULL
+                            ), 0) AS item_count
+                        FROM collection_lists cl
+                        ORDER BY cl.updated_at DESC, cl.id DESC")->fetchAll();
+                    $result = ['success' => true, 'data' => $rows];
+                } elseif ($method === 'POST') {
+                    $data = json_decode(file_get_contents('php://input'), true);
+                    $name = trim((string) ($data['name'] ?? ''));
+                    if ($name === '') {
+                        $result = ['success' => false, 'message' => '集合名称不能为空'];
+                        break;
+                    }
+                    if (function_exists('mb_substr')) {
+                        $name = mb_substr($name, 0, 60, 'UTF-8');
+                    } else {
+                        $name = substr($name, 0, 60);
+                    }
+                    $description = trim((string) ($data['description'] ?? ''));
+                    if (function_exists('mb_substr')) {
+                        $description = mb_substr($description, 0, 200, 'UTF-8');
+                    } else {
+                        $description = substr($description, 0, 200);
+                    }
+                    $notes = trim((string) ($data['notes'] ?? ''));
+                    if (function_exists('mb_substr')) {
+                        $notes = mb_substr($notes, 0, 500, 'UTF-8');
+                    } else {
+                        $notes = substr($notes, 0, 500);
+                    }
+                    $insertStmt = $db->prepare("INSERT INTO collection_lists (name, description, notes, created_at, updated_at)
+                        VALUES (?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
+                    $insertStmt->execute([$name, $description, $notes]);
+                    $newCollectionId = intval($db->lastInsertId());
+                    $operationDetails = '集合: ' . $name . '（ID:' . $newCollectionId . '）'
+                        . ($description !== '' ? ('；说明: ' . $description) : '')
+                        . ($notes !== '' ? ('；备注: ' . $notes) : '');
+                    $result = ['success' => true, 'message' => '集合已创建', 'id' => $newCollectionId];
+                }
+                break;
+
+            case 'collection-lists/update':
+                if ($method === 'POST') {
+                    $data = json_decode(file_get_contents('php://input'), true);
+                    $id = intval($data['id'] ?? 0);
+                    if ($id <= 0) {
+                        $result = ['success' => false, 'message' => '缺少集合ID'];
+                        break;
+                    }
+                    $name = trim((string) ($data['name'] ?? ''));
+                    if ($name === '') {
+                        $result = ['success' => false, 'message' => '集合名称不能为空'];
+                        break;
+                    }
+                    if (function_exists('mb_substr')) {
+                        $name = mb_substr($name, 0, 60, 'UTF-8');
+                    } else {
+                        $name = substr($name, 0, 60);
+                    }
+                    $description = trim((string) ($data['description'] ?? ''));
+                    if (function_exists('mb_substr')) {
+                        $description = mb_substr($description, 0, 200, 'UTF-8');
+                    } else {
+                        $description = substr($description, 0, 200);
+                    }
+                    $notes = trim((string) ($data['notes'] ?? ''));
+                    if (function_exists('mb_substr')) {
+                        $notes = mb_substr($notes, 0, 500, 'UTF-8');
+                    } else {
+                        $notes = substr($notes, 0, 500);
+                    }
+                    $oldStmt = $db->prepare("SELECT name, description, notes FROM collection_lists WHERE id=? LIMIT 1");
+                    $oldStmt->execute([$id]);
+                    $oldRow = $oldStmt->fetch();
+                    if (!$oldRow) {
+                        $result = ['success' => false, 'message' => '集合不存在'];
+                        break;
+                    }
+                    $updateStmt = $db->prepare("UPDATE collection_lists
+                        SET name=?, description=?, notes=?, updated_at=datetime('now','localtime')
+                        WHERE id=?");
+                    $updateStmt->execute([$name, $description, $notes, $id]);
+                    $operationDetails = '集合ID: ' . $id
+                        . '；名称: ' . trim((string) ($oldRow['name'] ?? '')) . ' -> ' . $name
+                        . '；说明: ' . trim((string) ($oldRow['description'] ?? '')) . ' -> ' . $description
+                        . '；备注: ' . trim((string) ($oldRow['notes'] ?? '')) . ' -> ' . $notes;
+                    $result = ['success' => true, 'message' => '集合已更新'];
+                }
+                break;
+
+            case 'collection-lists/delete':
+                if ($method === 'POST') {
+                    $data = json_decode(file_get_contents('php://input'), true);
+                    $id = intval($data['id'] ?? 0);
+                    if ($id <= 0) {
+                        $result = ['success' => false, 'message' => '缺少集合ID'];
+                        break;
+                    }
+                    $oldStmt = $db->prepare("SELECT name FROM collection_lists WHERE id=? LIMIT 1");
+                    $oldStmt->execute([$id]);
+                    $oldName = trim((string) ($oldStmt->fetchColumn() ?: ''));
+                    if ($oldName === '') {
+                        $result = ['success' => false, 'message' => '集合不存在'];
+                        break;
+                    }
+                    $delStmt = $db->prepare("DELETE FROM collection_lists WHERE id=?");
+                    $delStmt->execute([$id]);
+                    $operationDetails = '删除集合: ' . $oldName . '（ID:' . $id . '）';
+                    $result = ['success' => true, 'message' => '集合已删除'];
+                }
+                break;
+
+            case 'collection-lists/items':
+                if ($method === 'GET') {
+                    $collectionId = intval($_GET['collection_id'] ?? 0);
+                    if ($collectionId <= 0) {
+                        $result = ['success' => false, 'message' => '缺少集合ID'];
+                        break;
+                    }
+                    $existsStmt = $db->prepare("SELECT id FROM collection_lists WHERE id=? LIMIT 1");
+                    $existsStmt->execute([$collectionId]);
+                    if (!$existsStmt->fetchColumn()) {
+                        $result = ['success' => false, 'message' => '集合不存在'];
+                        break;
+                    }
+                    $stmt = $db->prepare("SELECT
+                            cli.collection_id,
+                            cli.item_id,
+                            cli.sort_order,
+                            COALESCE(cli.flagged,0) AS flagged,
+                            cli.created_at,
+                            i.name,
+                            i.status,
+                            i.quantity,
+                            i.remaining_current,
+                            i.remaining_total,
+                            i.image,
+                            i.expiry_date,
+                            c.name AS category_name,
+                            c.icon AS category_icon,
+                            l.name AS location_name
+                        FROM collection_list_items cli
+                        INNER JOIN items i ON i.id=cli.item_id AND i.deleted_at IS NULL
+                        LEFT JOIN categories c ON i.category_id=c.id
+                        LEFT JOIN locations l ON i.location_id=l.id
+                        WHERE cli.collection_id=?
+                        ORDER BY cli.sort_order ASC, cli.id ASC");
+                    $stmt->execute([$collectionId]);
+                    $result = ['success' => true, 'data' => $stmt->fetchAll()];
+                }
+                break;
+
+            case 'collection-lists/items/add':
+                if ($method === 'POST') {
+                    $data = json_decode(file_get_contents('php://input'), true);
+                    $collectionId = intval($data['collection_id'] ?? 0);
+                    $itemId = intval($data['item_id'] ?? 0);
+                    if ($collectionId <= 0 || $itemId <= 0) {
+                        $result = ['success' => false, 'message' => '参数不完整'];
+                        break;
+                    }
+                    $collectionStmt = $db->prepare("SELECT name FROM collection_lists WHERE id=? LIMIT 1");
+                    $collectionStmt->execute([$collectionId]);
+                    $collectionName = trim((string) ($collectionStmt->fetchColumn() ?: ''));
+                    if ($collectionName === '') {
+                        $result = ['success' => false, 'message' => '集合不存在'];
+                        break;
+                    }
+                    $itemStmt = $db->prepare("SELECT name FROM items WHERE id=? AND deleted_at IS NULL LIMIT 1");
+                    $itemStmt->execute([$itemId]);
+                    $itemName = trim((string) ($itemStmt->fetchColumn() ?: ''));
+                    if ($itemName === '') {
+                        $result = ['success' => false, 'message' => '物品不存在或已删除'];
+                        break;
+                    }
+                    $maxSortStmt = $db->prepare("SELECT COALESCE(MAX(sort_order), 0) FROM collection_list_items WHERE collection_id=?");
+                    $maxSortStmt->execute([$collectionId]);
+                    $nextSort = intval($maxSortStmt->fetchColumn() ?: 0) + 1;
+                    $insertStmt = $db->prepare("INSERT OR IGNORE INTO collection_list_items
+                        (collection_id, item_id, sort_order, created_at, updated_at)
+                        VALUES (?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
+                    $insertStmt->execute([$collectionId, $itemId, $nextSort]);
+                    $touchStmt = $db->prepare("UPDATE collection_lists SET updated_at=datetime('now','localtime') WHERE id=?");
+                    $touchStmt->execute([$collectionId]);
+                    $operationDetails = '集合: ' . $collectionName . '（ID:' . $collectionId . '）'
+                        . '；加入物品: ' . $itemName . '（ID:' . $itemId . '）';
+                    if ($insertStmt->rowCount() > 0) {
+                        $result = ['success' => true, 'message' => '已加入集合'];
+                    } else {
+                        $result = ['success' => true, 'message' => '该物品已在集合中'];
+                    }
+                }
+                break;
+
+            case 'collection-lists/items/add-batch':
+                if ($method === 'POST') {
+                    $data = json_decode(file_get_contents('php://input'), true);
+                    $collectionId = intval($data['collection_id'] ?? 0);
+                    $itemIdsRaw = is_array($data['item_ids'] ?? null) ? $data['item_ids'] : [];
+                    if ($collectionId <= 0 || count($itemIdsRaw) === 0) {
+                        $result = ['success' => false, 'message' => '参数不完整'];
+                        break;
+                    }
+                    $collectionStmt = $db->prepare("SELECT name FROM collection_lists WHERE id=? LIMIT 1");
+                    $collectionStmt->execute([$collectionId]);
+                    $collectionName = trim((string) ($collectionStmt->fetchColumn() ?: ''));
+                    if ($collectionName === '') {
+                        $result = ['success' => false, 'message' => '集合不存在'];
+                        break;
+                    }
+                    $itemIds = [];
+                    $seenItemIds = [];
+                    foreach ($itemIdsRaw as $rawId) {
+                        $id = intval($rawId);
+                        if ($id <= 0 || isset($seenItemIds[$id])) {
+                            continue;
+                        }
+                        $seenItemIds[$id] = 1;
+                        $itemIds[] = $id;
+                    }
+                    if (count($itemIds) === 0) {
+                        $result = ['success' => false, 'message' => '未选择有效物品'];
+                        break;
+                    }
+                    $placeholders = implode(',', array_fill(0, count($itemIds), '?'));
+                    $validStmt = $db->prepare("SELECT id FROM items WHERE deleted_at IS NULL AND id IN ($placeholders)");
+                    $validStmt->execute($itemIds);
+                    $validIds = array_map('intval', $validStmt->fetchAll(PDO::FETCH_COLUMN));
+                    $validSet = [];
+                    foreach ($validIds as $id) {
+                        if ($id > 0) {
+                            $validSet[$id] = 1;
+                        }
+                    }
+                    $orderedValidIds = [];
+                    foreach ($itemIds as $id) {
+                        if (isset($validSet[$id])) {
+                            $orderedValidIds[] = $id;
+                        }
+                    }
+                    if (count($orderedValidIds) === 0) {
+                        $result = ['success' => false, 'message' => '所选物品不存在或已删除'];
+                        break;
+                    }
+
+                    $db->beginTransaction();
+                    try {
+                        $maxSortStmt = $db->prepare("SELECT COALESCE(MAX(sort_order), 0) FROM collection_list_items WHERE collection_id=?");
+                        $maxSortStmt->execute([$collectionId]);
+                        $sortCursor = intval($maxSortStmt->fetchColumn() ?: 0);
+                        $insertStmt = $db->prepare("INSERT OR IGNORE INTO collection_list_items
+                            (collection_id, item_id, sort_order, created_at, updated_at)
+                            VALUES (?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
+                        $inserted = 0;
+                        foreach ($orderedValidIds as $id) {
+                            $nextSort = $sortCursor + 1;
+                            $insertStmt->execute([$collectionId, $id, $nextSort]);
+                            if ($insertStmt->rowCount() > 0) {
+                                $sortCursor = $nextSort;
+                                $inserted++;
+                            }
+                        }
+                        $touchStmt = $db->prepare("UPDATE collection_lists SET updated_at=datetime('now','localtime') WHERE id=?");
+                        $touchStmt->execute([$collectionId]);
+                        $db->commit();
+
+                        $operationDetails = '集合: ' . $collectionName . '（ID:' . $collectionId . '）'
+                            . '；批量加入: 请求 ' . count($itemIds) . ' 件'
+                            . '，有效 ' . count($orderedValidIds) . ' 件'
+                            . '，新增 ' . $inserted . ' 件';
+                        if ($inserted > 0) {
+                            $result = ['success' => true, 'message' => '已批量加入 ' . $inserted . ' 件物品', 'inserted' => $inserted];
+                        } else {
+                            $result = ['success' => true, 'message' => '所选物品已在集合中', 'inserted' => 0];
+                        }
+                    } catch (Exception $e) {
+                        if ($db->inTransaction()) {
+                            $db->rollBack();
+                        }
+                        throw $e;
+                    }
+                }
+                break;
+
+            case 'collection-lists/items/remove':
+                if ($method === 'POST') {
+                    $data = json_decode(file_get_contents('php://input'), true);
+                    $collectionId = intval($data['collection_id'] ?? 0);
+                    $itemId = intval($data['item_id'] ?? 0);
+                    if ($collectionId <= 0 || $itemId <= 0) {
+                        $result = ['success' => false, 'message' => '参数不完整'];
+                        break;
+                    }
+                    $collectionStmt = $db->prepare("SELECT name FROM collection_lists WHERE id=? LIMIT 1");
+                    $collectionStmt->execute([$collectionId]);
+                    $collectionName = trim((string) ($collectionStmt->fetchColumn() ?: ''));
+                    if ($collectionName === '') {
+                        $result = ['success' => false, 'message' => '集合不存在'];
+                        break;
+                    }
+                    $itemNameStmt = $db->prepare("SELECT name FROM items WHERE id=? LIMIT 1");
+                    $itemNameStmt->execute([$itemId]);
+                    $itemName = trim((string) ($itemNameStmt->fetchColumn() ?: ('#' . $itemId)));
+                    $delStmt = $db->prepare("DELETE FROM collection_list_items WHERE collection_id=? AND item_id=?");
+                    $delStmt->execute([$collectionId, $itemId]);
+                    if ($delStmt->rowCount() <= 0) {
+                        $result = ['success' => false, 'message' => '该物品不在集合中'];
+                        break;
+                    }
+                    $touchStmt = $db->prepare("UPDATE collection_lists SET updated_at=datetime('now','localtime') WHERE id=?");
+                    $touchStmt->execute([$collectionId]);
+                    $operationDetails = '集合: ' . $collectionName . '（ID:' . $collectionId . '）'
+                        . '；移除物品: ' . $itemName . '（ID:' . $itemId . '）';
+                    $result = ['success' => true, 'message' => '已从集合移除'];
+                }
+                break;
+
+            case 'collection-lists/items/flag':
+                if ($method === 'POST') {
+                    $data = json_decode(file_get_contents('php://input'), true);
+                    $collectionId = intval($data['collection_id'] ?? 0);
+                    $itemId = intval($data['item_id'] ?? 0);
+                    $flagged = intval($data['flagged'] ?? 0) === 1 ? 1 : 0;
+                    if ($collectionId <= 0 || $itemId <= 0) {
+                        $result = ['success' => false, 'message' => '参数不完整'];
+                        break;
+                    }
+                    $collectionStmt = $db->prepare("SELECT name FROM collection_lists WHERE id=? LIMIT 1");
+                    $collectionStmt->execute([$collectionId]);
+                    $collectionName = trim((string) ($collectionStmt->fetchColumn() ?: ''));
+                    if ($collectionName === '') {
+                        $result = ['success' => false, 'message' => '集合不存在'];
+                        break;
+                    }
+                    $itemNameStmt = $db->prepare("SELECT name FROM items WHERE id=? LIMIT 1");
+                    $itemNameStmt->execute([$itemId]);
+                    $itemName = trim((string) ($itemNameStmt->fetchColumn() ?: ('#' . $itemId)));
+                    $existStmt = $db->prepare("SELECT flagged FROM collection_list_items WHERE collection_id=? AND item_id=? LIMIT 1");
+                    $existStmt->execute([$collectionId, $itemId]);
+                    $existingFlagged = $existStmt->fetchColumn();
+                    if ($existingFlagged === false) {
+                        $result = ['success' => false, 'message' => '该物品不在集合中'];
+                        break;
+                    }
+                    $updateStmt = $db->prepare("UPDATE collection_list_items
+                        SET flagged=?, updated_at=datetime('now','localtime')
+                        WHERE collection_id=? AND item_id=?");
+                    $updateStmt->execute([$flagged, $collectionId, $itemId]);
+                    $touchStmt = $db->prepare("UPDATE collection_lists SET updated_at=datetime('now','localtime') WHERE id=?");
+                    $touchStmt->execute([$collectionId]);
+                    $operationDetails = '集合: ' . $collectionName . '（ID:' . $collectionId . '）'
+                        . '；旗标: ' . $itemName . '（ID:' . $itemId . '）'
+                        . ' -> ' . ($flagged === 1 ? '已标记' : '未标记');
+                    $result = ['success' => true, 'message' => ($flagged === 1 ? '已标记旗标' : '已取消旗标'), 'flagged' => $flagged];
+                }
+                break;
+
+            case 'collection-lists/item-options':
+                if ($method === 'GET') {
+                    $keyword = trim((string) ($_GET['keyword'] ?? ''));
+                    $limit = max(20, min(500, intval($_GET['limit'] ?? 300)));
+                    if ($keyword === '') {
+                        $stmt = $db->prepare("SELECT
+                                i.id,
+                                i.name,
+                                i.status,
+                                i.quantity,
+                                i.image,
+                                c.name AS category_name,
+                                c.icon AS category_icon
+                            FROM items i
+                            LEFT JOIN categories c ON i.category_id=c.id
+                            WHERE i.deleted_at IS NULL
+                            ORDER BY i.updated_at DESC, i.id DESC
+                            LIMIT ?");
+                        $stmt->bindValue(1, $limit, PDO::PARAM_INT);
+                    } else {
+                        $escaped = str_replace(['\\', '%', '_'], ['\\\\', '\\%', '\\_'], $keyword);
+                        $stmt = $db->prepare("SELECT
+                                i.id,
+                                i.name,
+                                i.status,
+                                i.quantity,
+                                i.image,
+                                c.name AS category_name,
+                                c.icon AS category_icon
+                            FROM items i
+                            LEFT JOIN categories c ON i.category_id=c.id
+                            WHERE i.deleted_at IS NULL
+                              AND i.name LIKE ? ESCAPE '\\'
+                            ORDER BY i.updated_at DESC, i.id DESC
+                            LIMIT ?");
+                        $stmt->bindValue(1, '%' . $escaped . '%', PDO::PARAM_STR);
+                        $stmt->bindValue(2, $limit, PDO::PARAM_INT);
+                    }
+                    $stmt->execute();
+                    $result = ['success' => true, 'data' => $stmt->fetchAll()];
+                }
+                break;
+
+            // ---------- 任务清单 ----------
             case 'message-board':
                 if ($method === 'GET') {
                     $limit = max(1, min(100, intval($_GET['limit'] ?? 40)));
@@ -5047,7 +5726,25 @@ if (isset($_GET['api'])) {
                 $categories = $db->query("SELECT * FROM categories ORDER BY id")->fetchAll();
                 $locations = $db->query("SELECT * FROM locations ORDER BY id")->fetchAll();
                 $shoppingList = $db->query("SELECT s.*, c.name as category_name FROM shopping_list s LEFT JOIN categories c ON s.category_id=c.id ORDER BY s.id")->fetchAll();
-                $result = ['success' => true, 'data' => ['items' => $items, 'categories' => $categories, 'locations' => $locations, 'shopping_list' => $shoppingList, 'exported_at' => date('Y-m-d H:i:s'), 'version' => '1.6.1']];
+                $collectionLists = $db->query("SELECT * FROM collection_lists ORDER BY id")->fetchAll();
+                $collectionListItems = $db->query("SELECT
+                        cli.*,
+                        cl.name AS collection_name,
+                        i.name AS item_name
+                    FROM collection_list_items cli
+                    LEFT JOIN collection_lists cl ON cli.collection_id=cl.id
+                    LEFT JOIN items i ON cli.item_id=i.id
+                    ORDER BY cli.id")->fetchAll();
+                $result = ['success' => true, 'data' => [
+                    'items' => $items,
+                    'categories' => $categories,
+                    'locations' => $locations,
+                    'shopping_list' => $shoppingList,
+                    'collection_lists' => $collectionLists,
+                    'collection_list_items' => $collectionListItems,
+                    'exported_at' => date('Y-m-d H:i:s'),
+                    'version' => '1.9.3'
+                ]];
                 break;
 
             // ---------- 数据导入 ----------
@@ -5100,7 +5797,10 @@ if (isset($_GET['api'])) {
                         }
 
                         $imported = 0;
-                        $stmtItem = $db->prepare("INSERT INTO items (name, category_id, subcategory_id, location_id, quantity, description, image, barcode, purchase_date, purchase_price, tags, status, expiry_date, purchase_from, notes, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+                        $itemIdMap = [];
+                        $importedCollection = 0;
+                        $importedCollectionItems = 0;
+                        $stmtItem = $db->prepare("INSERT INTO items (name, category_id, subcategory_id, location_id, quantity, description, image, barcode, purchase_date, production_date, shelf_life_value, shelf_life_unit, purchase_price, tags, status, expiry_date, purchase_from, notes, reminder_date, reminder_next_date, reminder_cycle_value, reminder_cycle_unit, reminder_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
                         foreach ($data['items'] as $item) {
                             $categoryCandidate = 0;
                             $subcategoryCandidate = 0;
@@ -5138,6 +5838,21 @@ if (isset($_GET['api'])) {
                                     $imageName = $oldImageName;
                                 }
                             }
+                            [$purchaseDate, $productionDate, $shelfLifeValue, $shelfLifeUnit, $expiryDate, $itemDateError] = normalizeItemDateShelfFields(
+                                $item['purchase_date'] ?? '',
+                                $item['production_date'] ?? '',
+                                $item['shelf_life_value'] ?? 0,
+                                $item['shelf_life_unit'] ?? '',
+                                $item['expiry_date'] ?? ''
+                            );
+                            if ($itemDateError) {
+                                // 兼容旧导出：日期异常时回退为空，避免整批导入失败
+                                $purchaseDate = '';
+                                $productionDate = '';
+                                $shelfLifeValue = 0;
+                                $shelfLifeUnit = '';
+                                $expiryDate = '';
+                            }
                             $reminderDate = normalizeReminderDateValue($item['reminder_date'] ?? '');
                             $reminderNextDate = normalizeReminderDateValue($item['reminder_next_date'] ?? '');
                             $reminderUnit = normalizeReminderCycleUnit($item['reminder_cycle_unit'] ?? '');
@@ -5160,11 +5875,14 @@ if (isset($_GET['api'])) {
                                 $item['description'] ?? '',
                                 $imageName,
                                 $item['barcode'] ?? '',
-                                $item['purchase_date'] ?? '',
+                                $purchaseDate,
+                                $productionDate,
+                                $shelfLifeValue,
+                                $shelfLifeUnit,
                                 floatval($item['purchase_price'] ?? 0),
                                 $item['tags'] ?? '',
                                 normalizeStatusValue($item['status'] ?? 'active'),
-                                $item['expiry_date'] ?? '',
+                                $expiryDate,
                                 $item['purchase_from'] ?? '',
                                 $item['notes'] ?? '',
                                 $reminderDate,
@@ -5173,6 +5891,11 @@ if (isset($_GET['api'])) {
                                 $reminderUnit,
                                 $reminderNote
                             ]);
+                            $oldItemId = intval($item['id'] ?? 0);
+                            $newItemId = intval($db->lastInsertId());
+                            if ($oldItemId > 0 && $newItemId > 0) {
+                                $itemIdMap[$oldItemId] = $newItemId;
+                            }
                             $imported++;
                         }
 
@@ -5209,9 +5932,106 @@ if (isset($_GET['api'])) {
                                 $importedShopping++;
                             }
                         }
+
+                        $collectionIdMap = [];
+                        $collectionNameMap = [];
+                        if (!empty($data['collection_lists']) && is_array($data['collection_lists'])) {
+                            $stmtCollection = $db->prepare("INSERT INTO collection_lists (name, description, notes, created_at, updated_at)
+                                VALUES (?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
+                            foreach ($data['collection_lists'] as $row) {
+                                if (!is_array($row)) {
+                                    continue;
+                                }
+                                $name = trim((string) ($row['name'] ?? ''));
+                                if ($name === '') {
+                                    continue;
+                                }
+                                $description = trim((string) ($row['description'] ?? ''));
+                                $notes = trim((string) ($row['notes'] ?? ''));
+                                if (function_exists('mb_substr')) {
+                                    $name = mb_substr($name, 0, 60, 'UTF-8');
+                                    $description = mb_substr($description, 0, 200, 'UTF-8');
+                                    $notes = mb_substr($notes, 0, 500, 'UTF-8');
+                                } else {
+                                    $name = substr($name, 0, 60);
+                                    $description = substr($description, 0, 200);
+                                    $notes = substr($notes, 0, 500);
+                                }
+                                $stmtCollection->execute([$name, $description, $notes]);
+                                $newCollectionId = intval($db->lastInsertId());
+                                if ($newCollectionId <= 0) {
+                                    continue;
+                                }
+                                $oldCollectionId = intval($row['id'] ?? 0);
+                                if ($oldCollectionId > 0) {
+                                    $collectionIdMap[$oldCollectionId] = $newCollectionId;
+                                }
+                                $collectionNameMap[$name] = $newCollectionId;
+                                $importedCollection++;
+                            }
+                        }
+
+                        if (!empty($data['collection_list_items']) && is_array($data['collection_list_items'])) {
+                            $stmtCollectionItem = $db->prepare("INSERT OR IGNORE INTO collection_list_items
+                                (collection_id, item_id, sort_order, flagged, created_at, updated_at)
+                                VALUES (?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))");
+                            foreach ($data['collection_list_items'] as $row) {
+                                if (!is_array($row)) {
+                                    continue;
+                                }
+                                $newCollectionId = 0;
+                                $oldCollectionId = intval($row['collection_id'] ?? 0);
+                                if ($oldCollectionId > 0 && isset($collectionIdMap[$oldCollectionId])) {
+                                    $newCollectionId = intval($collectionIdMap[$oldCollectionId]);
+                                } else {
+                                    $collectionName = trim((string) ($row['collection_name'] ?? ''));
+                                    if ($collectionName !== '' && isset($collectionNameMap[$collectionName])) {
+                                        $newCollectionId = intval($collectionNameMap[$collectionName]);
+                                    }
+                                }
+                                if ($newCollectionId <= 0) {
+                                    continue;
+                                }
+                                $newItemId = 0;
+                                $oldItemId = intval($row['item_id'] ?? 0);
+                                if ($oldItemId > 0 && isset($itemIdMap[$oldItemId])) {
+                                    $newItemId = intval($itemIdMap[$oldItemId]);
+                                } else {
+                                    $itemName = trim((string) ($row['item_name'] ?? ''));
+                                    if ($itemName !== '') {
+                                        $lookupItemStmt = $db->prepare("SELECT id FROM items WHERE name=? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1");
+                                        $lookupItemStmt->execute([$itemName]);
+                                        $newItemId = intval($lookupItemStmt->fetchColumn() ?: 0);
+                                    }
+                                }
+                                if ($newItemId <= 0) {
+                                    continue;
+                                }
+                                $sortOrder = max(0, intval($row['sort_order'] ?? 0));
+                                $flagged = intval($row['flagged'] ?? 0) === 1 ? 1 : 0;
+                                $stmtCollectionItem->execute([$newCollectionId, $newItemId, $sortOrder, $flagged]);
+                                if ($stmtCollectionItem->rowCount() > 0) {
+                                    $importedCollectionItems++;
+                                }
+                            }
+                        }
+
                         $db->commit();
-                        $operationDetails = '导入物品: ' . $imported . '；导入购物清单: ' . $importedShopping;
-                        $result = ['success' => true, 'message' => "成功导入 $imported 件物品" . ($importedShopping > 0 ? "，购物清单 $importedShopping 条" : '')];
+                        $operationDetails = '导入物品: ' . $imported
+                            . '；导入购物清单: ' . $importedShopping
+                            . '；导入集合清单: ' . $importedCollection
+                            . '；导入集合关联: ' . $importedCollectionItems;
+                        $resultMessage = "成功导入 $imported 件物品";
+                        if ($importedShopping > 0) {
+                            $resultMessage .= "，购物清单 $importedShopping 条";
+                        }
+                        if ($importedCollection > 0) {
+                            $resultMessage .= "，集合清单 $importedCollection 组";
+                            if ($importedCollectionItems > 0) {
+                                $resultMessage .= "（关联 $importedCollectionItems 条物品）";
+                            }
+                        }
+                        $result = ['success' => true, 'message' => $resultMessage];
                     } catch (Exception $e) {
                         $db->rollBack();
                         $result = ['success' => false, 'message' => '导入失败: ' . $e->getMessage()];
@@ -5247,6 +6067,13 @@ if (isset($_GET['api'])) {
             'shopping-list/update-status' => '切换购物清单状态',
             'shopping-list/delete' => '删除购物清单',
             'shopping-list/convert' => '购物清单入库',
+            'collection-lists' => '新增集合清单',
+            'collection-lists/update' => '编辑集合清单',
+            'collection-lists/delete' => '删除集合清单',
+            'collection-lists/items/add' => '集合清单添加物品',
+            'collection-lists/items/add-batch' => '集合清单批量添加物品',
+            'collection-lists/items/remove' => '集合清单移除物品',
+            'collection-lists/items/flag' => '集合清单旗标切换',
             'message-board' => '新增任务',
             'message-board/update' => '编辑任务',
             'message-board/delete' => '删除任务',
@@ -6326,6 +7153,77 @@ $currentUserJson = json_encode([
             height: 40px;
             box-sizing: border-box;
             line-height: 1.2;
+        }
+
+        .date-input-wrap {
+            position: relative;
+            width: 100%;
+        }
+
+        .date-input-wrap>input.input[data-date-input="1"] {
+            padding-right: 46px;
+        }
+
+        .date-input-wrap>input.input[data-date-input="1"].date-picker-temp-open::-webkit-calendar-picker-indicator {
+            opacity: 0;
+            pointer-events: none;
+        }
+
+        .date-input-wrap>input.input[data-date-input="1"].date-picker-temp-open::-webkit-clear-button,
+        .date-input-wrap>input.input[data-date-input="1"].date-picker-temp-open::-webkit-inner-spin-button {
+            display: none;
+        }
+
+        .date-picker-btn {
+            position: absolute;
+            right: 8px;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 28px;
+            height: 28px;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 8px;
+            border: 1px solid rgba(148, 163, 184, 0.25);
+            background: rgba(15, 23, 42, 0.65);
+            color: #94a3b8;
+            cursor: pointer;
+            transition: all 0.2s;
+            z-index: 2;
+        }
+
+        .date-picker-btn:hover {
+            color: #e2e8f0;
+            border-color: rgba(56, 189, 248, 0.35);
+            background: rgba(30, 41, 59, 0.88);
+        }
+
+        .date-picker-btn:focus-visible {
+            outline: none;
+            box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.2);
+            border-color: rgba(56, 189, 248, 0.55);
+        }
+
+        body.light .date-picker-btn {
+            background: rgba(255, 255, 255, 0.88);
+            color: #64748b;
+            border-color: rgba(100, 116, 139, 0.35);
+        }
+
+        body.light .date-picker-btn:hover {
+            background: #fff;
+            color: #0f172a;
+            border-color: rgba(14, 165, 233, 0.45);
+        }
+
+        .date-picker-proxy {
+            position: fixed;
+            left: -9999px;
+            top: -9999px;
+            width: 1px;
+            height: 1px;
+            opacity: 0;
         }
 
         .input:focus {
@@ -7839,6 +8737,9 @@ $currentUserJson = json_encode([
             <div class="sidebar-link" data-view="message-board" onclick="switchView('message-board')">
                 <i class="ri-chat-check-line"></i><span class="sidebar-text">任务清单</span>
             </div>
+            <div class="sidebar-link" data-view="collection-lists" onclick="switchView('collection-lists')">
+                <i class="ri-layout-grid-line"></i><span class="sidebar-text">集合清单</span>
+            </div>
             <div class="sidebar-link" data-view="public-channel" onclick="switchView('public-channel')">
                 <i class="ri-broadcast-line"></i><span class="sidebar-text">公共频道</span>
             </div>
@@ -8023,11 +8924,7 @@ $currentUserJson = json_encode([
                     </div>
                     <div>
                         <label class="block text-sm text-slate-400 mb-1.5">购入日期</label>
-                        <input type="date" id="itemDate" class="input">
-                    </div>
-                    <div>
-                        <label class="block text-sm text-slate-400 mb-1.5">过期日期</label>
-                        <input type="date" id="itemExpiry" class="input">
+                        <input type="text" id="itemDate" class="input" data-date-input="1" placeholder="____年/__月/__日">
                     </div>
                     <div>
                         <label class="block text-sm text-slate-400 mb-1.5">条码/序列号</label>
@@ -8036,15 +8933,39 @@ $currentUserJson = json_encode([
                     <div class="sm:col-span-2 md:col-span-3">
                         <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
                             <div>
+                                <label class="block text-sm text-slate-400 mb-1.5">生产日期</label>
+                                <input type="text" id="itemProductionDate" class="input" data-date-input="1" placeholder="____年/__月/__日" onchange="syncShelfLifeFields()">
+                            </div>
+                            <div>
+                                <label class="block text-sm text-slate-400 mb-1.5">保质期</label>
+                                <div class="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2 w-full">
+                                    <input type="number" id="itemShelfLifeValue" class="input w-full min-w-0 !h-10 !py-0 text-center" value="" min="1" step="1" inputmode="numeric" placeholder="数字" onchange="syncShelfLifeFields()">
+                                    <select id="itemShelfLifeUnit" class="input !w-[92px] min-w-0 !h-10 !py-0" onchange="syncShelfLifeFields()">
+                                        <option value="day">天</option>
+                                        <option value="week">周</option>
+                                        <option value="month" selected>月</option>
+                                        <option value="year">年</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div>
+                                <label class="block text-sm text-slate-400 mb-1.5">过期日期</label>
+                                <input type="text" id="itemExpiry" class="input" data-date-input="1" placeholder="____年/__月/__日">
+                            </div>
+                        </div>
+                    </div>
+                    <div class="sm:col-span-2 md:col-span-3">
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <div>
                                 <label class="block text-sm text-slate-400 mb-1.5">循环提醒初始日期</label>
-                                <input type="date" id="itemReminderDate" class="input !h-10 !py-0" onchange="syncReminderFields()">
+                                <input type="text" id="itemReminderDate" class="input !h-10 !py-0" data-date-input="1" placeholder="____年/__月/__日" onchange="syncReminderFields(true)">
                             </div>
                             <div>
                                 <label class="block text-sm text-slate-400 mb-1.5">循环频率</label>
-                                <div class="flex items-center gap-2 min-w-0">
+                                <div class="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 w-full">
                                     <span class="text-sm text-slate-400 whitespace-nowrap px-1">每</span>
-                                    <input type="number" id="itemReminderEvery" class="input !w-[88px] !h-10 !py-0" value="1" min="1" step="1" onchange="syncReminderFields()">
-                                    <select id="itemReminderUnit" class="input flex-1 min-w-0 !h-10 !py-0" onchange="syncReminderFields()">
+                                    <input type="number" id="itemReminderEvery" class="input w-full min-w-0 !h-10 !py-0" value="1" min="1" step="1" onchange="syncReminderFields(true)">
+                                    <select id="itemReminderUnit" class="input !w-[92px] min-w-0 !h-10 !py-0" onchange="syncReminderFields(true)">
                                         <option value="day">天</option>
                                         <option value="week">周</option>
                                         <option value="year">年</option>
@@ -8053,7 +8974,7 @@ $currentUserJson = json_encode([
                             </div>
                             <div>
                                 <label class="block text-sm text-slate-400 mb-1.5">下次提醒日期</label>
-                                <input type="date" id="itemReminderNext" class="input !h-10 !py-0">
+                                <input type="text" id="itemReminderNext" class="input !h-10 !py-0" data-date-input="1" placeholder="____年/__月/__日">
                             </div>
                         </div>
                     </div>
@@ -8084,9 +9005,12 @@ $currentUserJson = json_encode([
                             onchange="handleImageUpload(this)">
                     </div>
                 </div>
-                <div class="modal-form-actions flex justify-end gap-3 mt-6 pt-4 border-t border-white/5">
-                    <button type="button" onclick="closeItemModal()" class="btn btn-ghost">取消</button>
-                    <button type="submit" class="btn btn-primary"><i class="ri-save-line"></i><span id="itemSubmitLabel">保存</span></button>
+                <div class="modal-form-actions flex items-center justify-between gap-3 mt-6 pt-4 border-t border-white/5">
+                    <div id="itemFormDateError" class="text-sm text-red-400 hidden"></div>
+                    <div class="flex items-center gap-3 ml-auto">
+                        <button type="button" onclick="closeItemModal()" class="btn btn-ghost">取消</button>
+                        <button type="submit" class="btn btn-primary"><i class="ri-save-line"></i><span id="itemSubmitLabel">保存</span></button>
+                    </div>
                 </div>
             </form>
         </div>
@@ -8146,7 +9070,7 @@ $currentUserJson = json_encode([
                     <div class="sm:col-span-2 grid grid-cols-[170px_minmax(0,1fr)] gap-4">
                         <div>
                             <label class="block text-sm text-slate-400 mb-1.5">提醒日期</label>
-                            <input type="date" id="shoppingReminderDate" class="input">
+                            <input type="text" id="shoppingReminderDate" class="input" data-date-input="1" placeholder="____年/__月/__日">
                         </div>
                         <div>
                             <label class="block text-sm text-slate-400 mb-1.5">提醒备注</label>
@@ -8173,11 +9097,14 @@ $currentUserJson = json_encode([
                             class="btn btn-primary hidden"><i class="ri-shopping-bag-3-line"></i>已购买入库</button>
                         <button type="button" id="shoppingToggleStatusBtn" onclick="toggleCurrentShoppingStatus()"
                             class="btn btn-ghost hidden"><i class="ri-refresh-line"></i><span
-                                id="shoppingToggleStatusLabel">已购买</span></button>
+                                id="shoppingToggleStatusLabel">转为已购买</span></button>
                     </div>
                     <div class="flex items-center gap-3 ml-auto">
-                        <button type="button" onclick="closeShoppingModal()" class="btn btn-ghost">取消</button>
-                        <button type="submit" class="btn btn-primary"><i class="ri-save-line"></i>保存</button>
+                        <div id="shoppingFormDateError" class="text-sm text-red-400 hidden"></div>
+                        <div class="flex items-center gap-3">
+                            <button type="button" onclick="closeShoppingModal()" class="btn btn-ghost">取消</button>
+                            <button type="submit" class="btn btn-primary"><i class="ri-save-line"></i>保存</button>
+                        </div>
                     </div>
                 </div>
             </form>
@@ -8243,6 +9170,38 @@ $currentUserJson = json_encode([
                 </div>
                 <div class="flex justify-end gap-3 mt-6 pt-4 border-t border-white/5">
                     <button type="button" onclick="closeLocationModal()" class="btn btn-ghost">取消</button>
+                    <button type="submit" class="btn btn-primary"><i class="ri-save-line"></i>保存</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- 集合编辑弹窗 -->
+    <div id="collectionEditModal" class="modal-overlay" onclick="if(event.target===this)closeCollectionEditModal()">
+        <div class="modal-box p-6" style="max-width:560px">
+            <div class="flex items-center justify-between mb-6">
+                <h3 class="text-xl font-bold text-white">编辑集合</h3>
+                <button onclick="closeCollectionEditModal()" class="text-slate-400 hover:text-white transition"><i
+                        class="ri-close-line text-2xl"></i></button>
+            </div>
+            <form id="collectionEditForm" onsubmit="return saveCollectionEdit(event)">
+                <input type="hidden" id="collectionEditId">
+                <div class="space-y-4">
+                    <div>
+                        <label class="block text-sm text-slate-400 mb-1.5">集合名称 <span class="text-red-400">*</span></label>
+                        <input type="text" id="collectionEditName" class="input" maxlength="60" required>
+                    </div>
+                    <div>
+                        <label class="block text-sm text-slate-400 mb-1.5">集合说明</label>
+                        <input type="text" id="collectionEditDescription" class="input" maxlength="200" placeholder="可选">
+                    </div>
+                    <div>
+                        <label class="block text-sm text-slate-400 mb-1.5">集合备注</label>
+                        <textarea id="collectionEditNotes" class="input" rows="4" maxlength="500" placeholder="可选"></textarea>
+                    </div>
+                </div>
+                <div class="flex justify-end gap-3 mt-6 pt-4 border-t border-white/5">
+                    <button type="button" onclick="closeCollectionEditModal()" class="btn btn-ghost">取消</button>
                     <button type="submit" class="btn btn-primary"><i class="ri-save-line"></i>保存</button>
                 </div>
             </form>
@@ -8320,23 +9279,26 @@ $currentUserJson = json_encode([
             itemQuantity: '总共买了多少。比如一共买了 10 个，这里填 10。留空会按 0 处理。',
             itemPrice: '购买价格，可用于后续比价和预算回顾。留空会按 0 处理。',
             itemPurchaseFrom: '在哪里买的，例如京东、淘宝、线下门店。留空则记为未设置。',
-            itemDate: '购买日期，不确定时可以留空。',
-            itemExpiry: '到期日期。填写后会在仪表盘里自动出现到期提醒；留空则不提醒。',
+            itemDate: '购买日期，不确定时可以留空。日期支持 6-8 位数字：8位 YYYYMMDD、7位 YYYYMDD、6位 YYMMDD（自动转 20YY），失焦后会标准化为 YYYY-MM-DD；也可点右侧日历按钮选择。',
+            itemProductionDate: '生产日期。与保质期一起填写时，系统会自动更新过期日期。日期支持 6-8 位数字：8位 YYYYMMDD、7位 YYYYMDD、6位 YYMMDD（自动转 20YY），并会标准化为 YYYY-MM-DD。',
+            itemShelfLifeValue: '保质期时长数字，例如 6、12。需配合生产日期使用。',
+            itemShelfLifeUnit: '保质期单位（天/周/月/年）。与数字一起决定过期日期。',
+            itemExpiry: '到期日期。可手动填写；当生产日期和保质期完整时会自动按其更新。日期支持 6-8 位数字：8位 YYYYMMDD、7位 YYYYMDD、6位 YYMMDD（自动转 20YY），并会标准化为 YYYY-MM-DD。',
             itemBarcode: '商品条码或序列号，用于盘点、对账或售后。可留空。',
-            itemReminderDate: '循环提醒从哪一天开始算。留空表示不启用循环提醒。',
+            itemReminderDate: '循环提醒从哪一天开始算。留空表示不启用循环提醒。日期支持 6-8 位数字：8位 YYYYMMDD、7位 YYYYMDD、6位 YYMMDD（自动转 20YY），并会标准化为 YYYY-MM-DD。',
             itemReminderEvery: '这是提醒频率数字，会基于“循环提醒初始日期”计算下次提醒日期。未填初始日期时此项不生效。',
             itemReminderUnit: '这是提醒频率单位（天/周/年），与上面的数字一起决定提醒周期。未填初始日期时此项不生效。',
-            itemReminderNext: '到这个日期的时候，系统会自动创建一条提醒显示在仪表盘中。日期为自动生成和更新，也可以手动更改。',
+            itemReminderNext: '到这个日期的时候，系统会自动创建一条提醒显示在仪表盘中。日期为自动生成和更新，也可以手动更改；支持 6-8 位数字（8位 YYYYMMDD、7位 YYYYMDD、6位 YYMMDD 自动转 20YY）并会标准化为 YYYY-MM-DD。',
             itemReminderNote: '提醒弹出时要做什么，例如“更换滤芯”“会员续费”。可留空。',
             itemTags: '关键词标签，多个标签用逗号分隔，方便以后搜索。可留空。',
             itemNotes: '其他补充说明，想记什么都可以写这里。可留空。',
             itemSharePublic: '打开后，这件物品会显示到公共频道给其他用户参考。',
             shoppingName: '写你准备购买的商品名称。',
             shoppingQty: '计划买几件。',
-            shoppingStatus: '采购进度：待购买=还没下单；待收货=已下单等待到货。',
+            shoppingStatus: '采购进度：待购买=还没下单；待收货=已下单等待到货。编辑清单时可点左下角“转为已购买/转为待购买”快捷切换。',
             shoppingPriority: '紧急程度。高优先会更醒目，便于先处理。',
             shoppingPrice: '预计单价，用来估算总预算。留空会按 0 处理。',
-            shoppingReminderDate: '到这个日期会提醒你处理这条清单。留空则不提醒。',
+            shoppingReminderDate: '到这个日期会提醒你处理这条清单。留空则不提醒。日期支持 6-8 位数字：8位 YYYYMMDD、7位 YYYYMDD、6位 YYMMDD（自动转 20YY），并会标准化为 YYYY-MM-DD。',
             shoppingReminderNote: '提醒时想看到的说明，例如“今晚活动结束”。可留空。',
             shoppingNotes: '采购补充信息，如品牌、型号、链接、比价结果。可留空。',
             catName: '分类名称，建议用你日常会搜索的词。',
@@ -8366,17 +9328,19 @@ $currentUserJson = json_encode([
             分类: '给物品分组，后续筛选和统计会更方便。',
             二级分类: '在一级分类下继续细分，不选也可以。',
             位置: '记录这件物品放在哪里。',
-            状态: '表示当前情况，如使用中、已归档。',
+            状态: '物品里表示当前情况（如使用中、已归档）；购物清单里表示采购进度（待购买/待收货）。',
             余量: '当前还剩多少。比如买了 10 个还剩 3 个，这里填 3。如果留空则不设提醒。',
             数量: '这件物品的总数量。留空会按 0 处理。',
             购入价格: '购买价格，可用于比价和预算回看。留空会按 0 处理。',
             购入渠道: '在哪里购买的，例如京东、淘宝、线下。留空则记为未设置。',
-            购入日期: '购买日期，不确定可以留空。',
-            过期日期: '设置后会自动进入到期提醒。留空则不提醒。',
+            购入日期: '购买日期，不确定可以留空。支持 6-8 位数字输入：8位 YYYYMMDD、7位 YYYYMDD、6位 YYMMDD（自动转 20YY），会自动标准化为 YYYY-MM-DD。',
+            生产日期: '与保质期组合后可自动推算过期日期。支持 6-8 位数字输入：8位 YYYYMMDD、7位 YYYYMDD、6位 YYMMDD（自动转 20YY），会自动标准化为 YYYY-MM-DD。',
+            保质期: '填写时长和单位（天/周/月/年），系统会据此更新过期日期。',
+            过期日期: '设置后会自动进入到期提醒。也可由“生产日期 + 保质期”自动计算。支持 6-8 位数字输入：8位 YYYYMMDD、7位 YYYYMDD、6位 YYMMDD（自动转 20YY），会自动标准化为 YYYY-MM-DD。',
             条码序列号: '用于盘点、对账或售后，可留空。',
-            循环提醒初始日期: '循环提醒从这一天开始计算。',
+            循环提醒初始日期: '循环提醒从这一天开始计算。支持 6-8 位数字输入：8位 YYYYMMDD、7位 YYYYMDD、6位 YYMMDD（自动转 20YY），会自动标准化为 YYYY-MM-DD。',
             循环频率: '这是基于“循环提醒初始日期”来计算下次提醒日期的频率；留空初始日期时不生效。',
-            下次提醒日期: '到这个日期的时候，系统会自动创建一条提醒显示在仪表盘中。日期为自动生成和更新，也可以手动更改。',
+            下次提醒日期: '到这个日期的时候，系统会自动创建一条提醒显示在仪表盘中。日期为自动生成和更新，也可以手动更改；支持 6-8 位数字输入：8位 YYYYMMDD、7位 YYYYMDD、6位 YYMMDD（自动转 20YY），会自动标准化为 YYYY-MM-DD。',
             循环提醒备注: '提醒触发时要做什么，可留空。',
             标签逗号分隔: '可填写多个关键词，便于搜索；留空也可以。',
             备注: '其他补充说明，留空也可以。',
@@ -8482,6 +9446,9 @@ $currentUserJson = json_encode([
             const scope = root && root.querySelectorAll ? root : document;
             const labels = scope.querySelectorAll('label');
             labels.forEach(labelEl => {
+                if (labelEl.dataset.helpSkip === '1' || labelEl.classList.contains('help-skip')) {
+                    return;
+                }
                 if (labelEl.querySelector('.help-hint-icon'))
                     return;
                 const hint = resolveHelpHintForLabel(labelEl);
@@ -8965,7 +9932,7 @@ $currentUserJson = json_encode([
 
         let itemFormInitialState = '';
         function getItemFormState() {
-            const ids = ['itemId', 'itemName', 'itemCategory', 'itemSubcategory', 'itemLocation', 'itemStatus', 'itemQuantity', 'itemRemainingCurrent', 'itemPrice', 'itemPurchaseFrom', 'itemSharePublic', 'itemDate', 'itemExpiry', 'itemBarcode', 'itemReminderDate', 'itemReminderEvery', 'itemReminderUnit', 'itemReminderNext', 'itemReminderNote', 'itemTags', 'itemNotes', 'itemImage', 'itemSourceShoppingId'];
+            const ids = ['itemId', 'itemName', 'itemCategory', 'itemSubcategory', 'itemLocation', 'itemStatus', 'itemQuantity', 'itemRemainingCurrent', 'itemPrice', 'itemPurchaseFrom', 'itemSharePublic', 'itemDate', 'itemProductionDate', 'itemShelfLifeValue', 'itemShelfLifeUnit', 'itemExpiry', 'itemBarcode', 'itemReminderDate', 'itemReminderEvery', 'itemReminderUnit', 'itemReminderNext', 'itemReminderNote', 'itemTags', 'itemNotes', 'itemImage', 'itemSourceShoppingId'];
             const state = {};
             ids.forEach(id => {
                 const el = document.getElementById(id);
@@ -9018,6 +9985,15 @@ $currentUserJson = json_encode([
             categories: [],
             publicChannelItems: [],
             messageBoardTasks: [],
+            collectionLists: [],
+            collectionItems: [],
+            collectionItemOptions: [],
+            selectedCollectionId: 0,
+            collectionAddKeyword: '',
+            collectionAddCategoryFilter: '',
+            collectionAddStatusFilter: '',
+            collectionAddSortMode: 'name',
+            collectionAddSelectedIds: new Set(),
             shoppingList: [],
             pendingShoppingEditId: 0,
             itemsSize: loadItemsSize(),
@@ -9172,24 +10148,376 @@ $currentUserJson = json_encode([
         }
 
         const DATE_PLACEHOLDER_TEXT = '____年/__月/__日';
+        const DATE_INPUT_LABELS = {
+            itemDate: '购入日期',
+            itemProductionDate: '生产日期',
+            itemExpiry: '过期日期',
+            itemReminderDate: '循环提醒初始日期',
+            itemReminderNext: '下次提醒日期',
+            shoppingReminderDate: '提醒日期'
+        };
+
+        function getDateInputLabel(inputId) {
+            return DATE_INPUT_LABELS[inputId] || '日期';
+        }
+
+        function setDateFormError(errorId, message = '') {
+            const el = document.getElementById(errorId);
+            if (!el) return;
+            const text = String(message || '').trim();
+            if (!text) {
+                el.textContent = '';
+                el.classList.add('hidden');
+                return;
+            }
+            el.textContent = text;
+            el.classList.remove('hidden');
+        }
+
+        function setItemFormDateError(message = '') {
+            setDateFormError('itemFormDateError', message);
+        }
+
+        function setShoppingFormDateError(message = '') {
+            setDateFormError('shoppingFormDateError', message);
+        }
+
+        let datePickerProxyInput = null;
+        let datePickerTargetInputId = '';
+        const datePickerTempStateMap = new WeakMap();
+
+        function formatDatePartsYmd(year, month, day) {
+            return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+        }
+
+        function isValidDateParts(year, month, day) {
+            if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) return false;
+            if (year < 1000 || year > 9999) return false;
+            const dt = new Date(Date.UTC(year, month - 1, day));
+            return (
+                dt.getUTCFullYear() === year &&
+                dt.getUTCMonth() === month - 1 &&
+                dt.getUTCDate() === day
+            );
+        }
+
+        function parseCompactDateDigits(rawDigits) {
+            const digits = String(rawDigits || '').trim();
+            if (!/^\d{6,8}$/.test(digits)) return '';
+            if (digits.length === 8) {
+                return `${digits.slice(0, 4)}-${digits.slice(4, 6)}-${digits.slice(6, 8)}`; // YYYYMMDD
+            }
+            if (digits.length === 7) {
+                return `${digits.slice(0, 4)}-${digits.slice(4, 5).padStart(2, '0')}-${digits.slice(5, 7)}`; // YYYYMDD
+            }
+            const yy = Number.parseInt(digits.slice(0, 2), 10);
+            if (!Number.isFinite(yy)) return '';
+            const year = String(2000 + yy).padStart(4, '0'); // YYMMDD -> 20YY-MM-DD
+            return `${year}-${digits.slice(2, 4)}-${digits.slice(4, 6)}`;
+        }
+
+        function parseDateInputValue(rawValue) {
+            const raw = String(rawValue || '').trim();
+            if (!raw) return { valid: true, empty: true, normalized: '' };
+            if (/^\d+$/.test(raw)) {
+                if (raw.length < 6 || raw.length > 8) {
+                    return { valid: false, empty: false, reason: 'length' };
+                }
+                const compact = parseCompactDateDigits(raw);
+                if (!compact) return { valid: false, empty: false, reason: 'format' };
+                const year = Number.parseInt(compact.slice(0, 4), 10);
+                const month = Number.parseInt(compact.slice(5, 7), 10);
+                const day = Number.parseInt(compact.slice(8, 10), 10);
+                if (month < 1 || month > 12) return { valid: false, empty: false, reason: 'month', normalized: compact };
+                if (day < 1 || day > 31) return { valid: false, empty: false, reason: 'day', normalized: compact };
+                if (!isValidDateParts(year, month, day)) {
+                    return { valid: false, empty: false, reason: 'date', normalized: compact };
+                }
+                return { valid: true, empty: false, normalized: compact };
+            }
+            const unified = raw
+                .replace(/\s+/g, '')
+                .replace(/[./]/g, '-')
+                .replace(/[年月]/g, '-')
+                .replace(/日/g, '')
+                .replace(/-+/g, '-');
+            const m = unified.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+            if (!m) return { valid: false, empty: false, reason: 'format' };
+            const year = Number.parseInt(m[1], 10);
+            const month = Number.parseInt(m[2], 10);
+            const day = Number.parseInt(m[3], 10);
+            const normalized = formatDatePartsYmd(year, month, day);
+            if (month < 1 || month > 12) return { valid: false, empty: false, reason: 'month', normalized };
+            if (day < 1 || day > 31) return { valid: false, empty: false, reason: 'day', normalized };
+            if (!isValidDateParts(year, month, day)) {
+                return { valid: false, empty: false, reason: 'date', normalized };
+            }
+            return {
+                valid: true,
+                empty: false,
+                normalized
+            };
+        }
+
+        function dateInputErrorMessage(inputId, reason) {
+            const label = getDateInputLabel(inputId);
+            if (reason === 'length') {
+                return `${label}需输入 6-8 位数字（8位: YYYYMMDD，7位: YYYYMDD，6位: YYMMDD）`;
+            }
+            if (reason === 'format') {
+                return `${label}格式错误，应输入 6-8 位数字（8位: YYYYMMDD，7位: YYYYMDD，6位: YYMMDD）`;
+            }
+            if (reason === 'month') {
+                return `${label}的月份超出范围（应为 01-12）`;
+            }
+            if (reason === 'day') {
+                return `${label}的日期超出范围（应为 01-31）`;
+            }
+            if (reason === 'date') {
+                return `${label}的日期不存在`;
+            }
+            return `${label}填入的日期数值异常`;
+        }
+
+        function validateDateInputElement(input, options = {}) {
+            if (!input) return { valid: true, normalized: '' };
+            const parsed = parseDateInputValue(input.value);
+            if (options.normalize && parsed.normalized && input.value !== parsed.normalized) {
+                input.value = parsed.normalized;
+            }
+            if (!parsed.valid) {
+                return {
+                    valid: false,
+                    message: dateInputErrorMessage(input.id, parsed.reason),
+                    input,
+                    reason: parsed.reason
+                };
+            }
+            return { valid: true, normalized: parsed.normalized || '', input };
+        }
+
+        function validateDateInputsInForm(formId, errorId, options = {}) {
+            const form = typeof formId === 'string' ? document.getElementById(formId) : formId;
+            if (!form) {
+                setDateFormError(errorId, '');
+                return { valid: true, message: '' };
+            }
+            const inputs = Array.from(form.querySelectorAll('input[data-date-input="1"]'));
+            let firstError = '';
+            inputs.forEach(input => {
+                const result = validateDateInputElement(input, { normalize: !!options.normalize });
+                if (!result.valid && !firstError) {
+                    firstError = result.message || '日期输入异常';
+                }
+            });
+            setDateFormError(errorId, firstError);
+            return { valid: !firstError, message: firstError };
+        }
+
+        function ensureDatePickerProxyInput() {
+            if (datePickerProxyInput) return datePickerProxyInput;
+            const proxy = document.createElement('input');
+            proxy.type = 'date';
+            proxy.className = 'date-picker-proxy';
+            proxy.tabIndex = -1;
+            proxy.setAttribute('aria-hidden', 'true');
+            proxy.addEventListener('change', () => {
+                const targetId = String(datePickerTargetInputId || '');
+                if (!targetId) return;
+                const target = document.getElementById(targetId);
+                if (!target) return;
+                target.value = proxy.value || '';
+                target.dispatchEvent(new Event('input', { bubbles: true }));
+                target.dispatchEvent(new Event('change', { bubbles: true }));
+                const form = target.closest('form');
+                if (form?.id === 'itemForm') {
+                    validateDateInputsInForm('itemForm', 'itemFormDateError', { normalize: true });
+                } else if (form?.id === 'shoppingForm') {
+                    validateDateInputsInForm('shoppingForm', 'shoppingFormDateError', { normalize: true });
+                }
+                datePickerTargetInputId = '';
+            });
+            document.body.appendChild(proxy);
+            datePickerProxyInput = proxy;
+            return proxy;
+        }
+
+        function cleanupTempDatePickerState(target, applyPicked = true) {
+            const state = datePickerTempStateMap.get(target);
+            if (!state) return;
+            if (state.finished) return;
+            state.finished = true;
+            target.removeEventListener('change', state.handleChange);
+            target.removeEventListener('blur', state.handleBlur);
+            if (state.safetyTimer) {
+                clearTimeout(state.safetyTimer);
+            }
+            const pickedValue = target.value;
+            target.dataset.datePickerTempOpen = '0';
+            target.classList.remove('date-picker-temp-open');
+            try { target.type = 'text'; } catch { }
+            if (applyPicked && (state.hasChanged || (pickedValue && pickedValue !== state.originalValue))) {
+                target.value = pickedValue || '';
+            } else {
+                target.value = state.originalValue;
+            }
+            datePickerTempStateMap.delete(target);
+        }
+
+        function openDatePickerByTextInput(target, preferredValue = '') {
+            if (!target) return false;
+            cleanupTempDatePickerState(target, false);
+            if (String(target.type || '').toLowerCase() !== 'text') {
+                try { target.type = 'text'; } catch { return false; }
+            }
+
+            const state = {
+                originalValue: target.value,
+                hasChanged: false,
+                finished: false,
+                safetyTimer: 0,
+                handleChange: null,
+                handleBlur: null
+            };
+
+            state.handleChange = () => {
+                state.hasChanged = true;
+                setTimeout(() => cleanupTempDatePickerState(target, true), 0);
+            };
+            state.handleBlur = () => {
+                setTimeout(() => cleanupTempDatePickerState(target, true), 0);
+            };
+            datePickerTempStateMap.set(target, state);
+
+            try {
+                target.dataset.datePickerTempOpen = '1';
+                target.classList.add('date-picker-temp-open');
+                target.addEventListener('change', state.handleChange);
+                target.addEventListener('blur', state.handleBlur);
+                target.type = 'date';
+                target.value = preferredValue || '';
+                if (typeof target.showPicker === 'function') {
+                    target.showPicker();
+                } else {
+                    target.focus({ preventScroll: true });
+                    target.click();
+                }
+                state.safetyTimer = window.setTimeout(() => {
+                    cleanupTempDatePickerState(target, true);
+                }, 30000);
+                return true;
+            } catch {
+                cleanupTempDatePickerState(target, false);
+                return false;
+            }
+        }
+
+        function openDatePickerByInputId(inputId) {
+            const target = document.getElementById(inputId);
+            if (!target) return;
+            const parsed = parseDateInputValue(target.value);
+            const preferredValue = parsed.valid ? (parsed.normalized || '') : '';
+
+            if (openDatePickerByTextInput(target, preferredValue)) {
+                return;
+            }
+
+            const proxy = ensureDatePickerProxyInput();
+            proxy.value = preferredValue;
+            datePickerTargetInputId = inputId;
+            try {
+                if (typeof proxy.showPicker === 'function') {
+                    proxy.showPicker();
+                    return;
+                }
+                proxy.focus({ preventScroll: true });
+                proxy.click();
+            } catch {
+                toast('当前浏览器不支持日期选择器，请手动输入', 'error');
+                datePickerTargetInputId = '';
+            }
+        }
+
+        function ensureDateInputPickerUi(input) {
+            if (!input || input.dataset.datePickerUiBound === '1') return;
+            const inputId = String(input.id || '').trim();
+            if (!inputId) return;
+            const parent = input.parentElement;
+            if (!parent) return;
+            let wrap = parent;
+            if (!parent.classList.contains('date-input-wrap')) {
+                wrap = document.createElement('div');
+                wrap.className = 'date-input-wrap';
+                parent.insertBefore(wrap, input);
+                wrap.appendChild(input);
+            }
+            let btn = wrap.querySelector(`.date-picker-btn[data-date-picker-for="${inputId}"]`);
+            if (!btn) {
+                btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'date-picker-btn';
+                btn.dataset.datePickerFor = inputId;
+                btn.title = '选择日期';
+                btn.setAttribute('aria-label', `选择${getDateInputLabel(inputId)}`);
+                btn.innerHTML = '<i class="ri-calendar-line"></i>';
+                wrap.appendChild(btn);
+            }
+            if (btn.dataset.boundClick !== '1') {
+                btn.dataset.boundClick = '1';
+                btn.addEventListener('click', () => {
+                    openDatePickerByInputId(inputId);
+                });
+            }
+            input.dataset.datePickerUiBound = '1';
+        }
+
         function refreshDateInputPlaceholderDisplay(root = document) {
-            root.querySelectorAll('input[data-date-placeholder="1"]').forEach(input => {
-                if (document.activeElement === input) return;
-                input.type = input.value ? 'date' : 'text';
+            root.querySelectorAll('input[data-date-input="1"]').forEach(input => {
+                if (!input.placeholder) input.placeholder = DATE_PLACEHOLDER_TEXT;
             });
         }
+
         function setupDateInputPlaceholders() {
-            document.querySelectorAll('input[type="date"]').forEach(input => {
+            document.querySelectorAll('input[data-date-input="1"]').forEach(input => {
+                ensureDateInputPickerUi(input);
+                if (input.dataset.dateDigitBound !== '1') {
+                    input.dataset.dateDigitBound = '1';
+                    input.inputMode = 'numeric';
+                    input.setAttribute('maxlength', '8');
+                    input.setAttribute('minlength', '6');
+                    input.addEventListener('input', () => {
+                        if (String(input.type || '').toLowerCase() !== 'text') return;
+                        if (input.dataset.datePickerTempOpen === '1') return;
+                        const raw = String(input.value || '');
+                        const digitsOnly = raw.replace(/\D+/g, '').slice(0, 8);
+                        if (raw !== digitsOnly) input.value = digitsOnly;
+                    });
+                }
                 if (input.dataset.datePlaceholderBound === '1') return;
                 input.dataset.datePlaceholderBound = '1';
                 input.dataset.datePlaceholder = '1';
                 input.placeholder = DATE_PLACEHOLDER_TEXT;
-                input.addEventListener('focus', () => { input.type = 'date'; });
+                const form = input.closest('form');
+                const formId = form?.id || '';
+                const errorId = formId === 'itemForm'
+                    ? 'itemFormDateError'
+                    : formId === 'shoppingForm'
+                        ? 'shoppingFormDateError'
+                        : '';
+                if (!errorId) return;
                 input.addEventListener('blur', () => {
-                    if (!input.value) input.type = 'text';
+                    validateDateInputsInForm(formId, errorId, { normalize: true });
                 });
-                input.addEventListener('change', () => { input.type = 'date'; });
+                input.addEventListener('change', () => {
+                    validateDateInputsInForm(formId, errorId, { normalize: true });
+                });
+                input.addEventListener('input', () => {
+                    const errEl = document.getElementById(errorId);
+                    if (!errEl || errEl.classList.contains('hidden')) return;
+                    validateDateInputsInForm(formId, errorId, { normalize: false });
+                });
             });
+            ensureDatePickerProxyInput();
             refreshDateInputPlaceholderDisplay();
         }
 
@@ -9597,7 +10925,7 @@ $currentUserJson = json_encode([
             document.querySelectorAll('.sidebar-link[data-view]').forEach(el => {
                 el.classList.toggle('active', el.dataset.view === view);
             });
-            const titles = { dashboard: '仪表盘', items: '物品管理', 'shopping-list': '购物清单', 'message-board': '任务清单', 'public-channel': '公共频道', categories: '分类管理', locations: '位置管理', trash: '物品管理', 'import-export': '数据管理', settings: '设置', 'reminder-settings': '设置', 'status-settings': '状态管理', 'channel-settings': '购入渠道管理', 'platform-settings': '平台设置', 'user-management': '用户管理', 'operation-logs': '操作日志', 'help-docs': '帮助文档', changelog: '更新记录' };
+            const titles = { dashboard: '仪表盘', items: '物品管理', 'shopping-list': '购物清单', 'message-board': '任务清单', 'collection-lists': '集合清单', 'public-channel': '公共频道', categories: '分类管理', locations: '位置管理', trash: '物品管理', 'import-export': '数据管理', settings: '设置', 'reminder-settings': '设置', 'status-settings': '状态管理', 'channel-settings': '购入渠道管理', 'platform-settings': '平台设置', 'user-management': '用户管理', 'operation-logs': '操作日志', 'help-docs': '帮助文档', changelog: '更新记录' };
             document.getElementById('viewTitle').textContent = titles[view] || '';
             // 回收站视图高亮物品管理侧边栏
             if (view === 'trash') document.querySelector('.sidebar-link[data-view="items"]')?.classList.add('active');
@@ -9625,6 +10953,7 @@ $currentUserJson = json_encode([
                 case 'items': await renderItems(c); break;
                 case 'shopping-list': await renderShoppingList(c); break;
                 case 'message-board': await renderMessageBoard(c); break;
+                case 'collection-lists': await renderCollectionLists(c); break;
                 case 'public-channel': await renderPublicChannel(c); break;
                 case 'categories': await renderCategories(c); break;
                 case 'locations': await renderLocations(c); break;
@@ -10015,6 +11344,630 @@ $currentUserJson = json_encode([
             </div>
         </div>
     `;
+        }
+
+        function getCollectionListById(collectionId) {
+            const id = Number(collectionId || 0);
+            if (id <= 0) return null;
+            const list = Array.isArray(App.collectionLists) ? App.collectionLists : [];
+            return list.find(x => Number(x.id || 0) === id) || null;
+        }
+
+        function getCollectionListItemById(itemId) {
+            const id = Number(itemId || 0);
+            if (id <= 0) return null;
+            const list = Array.isArray(App.collectionItems) ? App.collectionItems : [];
+            return list.find(x => Number(x.item_id || x.id || 0) === id) || null;
+        }
+
+        function ensureCollectionAddSelectedSet() {
+            if (App.collectionAddSelectedIds instanceof Set) {
+                return App.collectionAddSelectedIds;
+            }
+            const seed = Array.isArray(App.collectionAddSelectedIds) ? App.collectionAddSelectedIds : [];
+            App.collectionAddSelectedIds = new Set(seed.map(v => Number(v || 0)).filter(v => v > 0));
+            return App.collectionAddSelectedIds;
+        }
+
+        function updateCollectionAddBatchButtonState() {
+            const selectedSet = ensureCollectionAddSelectedSet();
+            const count = selectedSet.size;
+            const countEl = document.getElementById('collectionAddSelectedCount');
+            if (countEl) {
+                countEl.textContent = String(count);
+            }
+            const btn = document.getElementById('collectionAddBatchBtn');
+            if (btn) {
+                const disabled = count <= 0;
+                btn.disabled = disabled;
+                btn.classList.toggle('opacity-50', disabled);
+                btn.classList.toggle('cursor-not-allowed', disabled);
+                btn.innerHTML = `<i class="ri-add-circle-line"></i>批量加入${count > 0 ? `（${count}）` : ''}`;
+            }
+        }
+
+        async function selectCollectionList(collectionId) {
+            const nextCollectionId = Number(collectionId || 0);
+            if (nextCollectionId <= 0 || nextCollectionId === Number(App.selectedCollectionId || 0)) {
+                return;
+            }
+            App.selectedCollectionId = nextCollectionId;
+            App.collectionAddKeyword = '';
+            App.collectionAddSelectedIds = new Set();
+            const container = document.getElementById('viewContainer');
+            if (App.currentView === 'collection-lists' && container) {
+                await renderCollectionLists(container, { skipAnimation: true });
+                enhanceCustomSelects(container);
+                scheduleCustomSelectSync();
+                applyHelpModeHints(container);
+                return;
+            }
+            renderView();
+        }
+
+        function setCollectionAddKeyword(keyword) {
+            App.collectionAddKeyword = String(keyword || '');
+            renderView();
+        }
+
+        function setCollectionAddCategoryFilter(categoryName) {
+            App.collectionAddCategoryFilter = String(categoryName || '');
+            renderView();
+        }
+
+        function setCollectionAddStatusFilter(statusValue) {
+            App.collectionAddStatusFilter = String(statusValue || '');
+            renderView();
+        }
+
+        function normalizeCollectionAddSortMode(mode) {
+            const value = String(mode || '');
+            if (value === 'name' || value === 'status') {
+                return value;
+            }
+            return 'name';
+        }
+
+        function getCollectionAddSortModeLabel(mode) {
+            const value = normalizeCollectionAddSortMode(mode);
+            if (value === 'status') return '状态';
+            return '名称';
+        }
+
+        function toggleCollectionAddSortMode() {
+            const current = normalizeCollectionAddSortMode(App.collectionAddSortMode || 'name');
+            const next = current === 'name' ? 'status' : 'name';
+            App.collectionAddSortMode = next;
+            renderView();
+        }
+
+        function toggleCollectionAddItem(itemId, checked) {
+            const id = Number(itemId || 0);
+            if (id <= 0) {
+                return;
+            }
+            const selectedSet = ensureCollectionAddSelectedSet();
+            if (checked) {
+                selectedSet.add(id);
+            } else {
+                selectedSet.delete(id);
+            }
+            updateCollectionAddBatchButtonState();
+        }
+
+        function selectAllCollectionAddVisible(checked) {
+            const selectedSet = ensureCollectionAddSelectedSet();
+            const boxes = document.querySelectorAll('#collectionAddOptionsList input[type="checkbox"][data-item-id]');
+            boxes.forEach(box => {
+                const id = Number(box.dataset.itemId || 0);
+                if (id <= 0) return;
+                box.checked = !!checked;
+                if (checked) {
+                    selectedSet.add(id);
+                } else {
+                    selectedSet.delete(id);
+                }
+            });
+            updateCollectionAddBatchButtonState();
+        }
+
+        function clearCollectionAddSelection() {
+            const selectedSet = ensureCollectionAddSelectedSet();
+            selectedSet.clear();
+            const boxes = document.querySelectorAll('#collectionAddOptionsList input[type="checkbox"][data-item-id]');
+            boxes.forEach(box => { box.checked = false; });
+            updateCollectionAddBatchButtonState();
+        }
+
+        function getSortedCollectionItems(collectionItems) {
+            const list = Array.isArray(collectionItems) ? [...collectionItems] : [];
+            list.sort((a, b) => {
+                const af = Number(a.flagged || 0);
+                const bf = Number(b.flagged || 0);
+                if (af !== bf) {
+                    return bf - af;
+                }
+                return String(a.name || '').localeCompare(String(b.name || ''), 'zh');
+            });
+            return list;
+        }
+
+        function buildCollectionItemsRowsHtml(collectionItems, selectedCollectionId) {
+            const statusMap = getStatusMap();
+            const sortedItems = getSortedCollectionItems(collectionItems);
+            if (sortedItems.length <= 0) {
+                return '<p class="text-slate-500 text-sm text-center py-8">当前集合还没有物品</p>';
+            }
+            return sortedItems.map(row => {
+                const itemId = Number(row.item_id || 0);
+                const [statusLabel, statusClass, statusIcon] = statusMap[String(row.status || 'active')] || ['未设置', 'badge-archived', 'ri-checkbox-blank-circle-line'];
+                const qty = Math.max(0, Number(row.quantity || 0));
+                const remainingTotal = Math.max(0, Number(row.remaining_total || 0));
+                const remainingCurrent = Math.max(0, Number(row.remaining_current || 0));
+                const qtyLabel = remainingTotal > 0 ? `${remainingCurrent}/${remainingTotal}` : `${qty}`;
+                const flagged = Number(row.flagged || 0) === 1;
+                return `
+                    <div class="flex items-center gap-2 px-2 py-1.5 border-b border-white/5 last:border-b-0">
+                        <button title="${flagged ? '取消旗标' : '设为旗标'}" onclick="toggleCollectionListItemFlag(${selectedCollectionId}, ${itemId}, ${flagged ? 0 : 1})" class="btn btn-ghost btn-sm !py-1 !px-2 ${flagged ? 'text-amber-300 border-amber-400/35' : 'text-slate-500 border-white/10'}">
+                            <i class="${flagged ? 'ri-flag-fill' : 'ri-flag-line'}"></i>
+                        </button>
+                        <div class="min-w-0 flex-1">
+                            <p class="text-sm text-slate-200 truncate">${esc(String(row.name || '未命名物品'))}</p>
+                            <p class="text-[11px] text-slate-500 truncate">
+                                ${row.category_name ? esc(String(row.category_name || '')) : '未分类'}
+                                ${row.location_name ? ` · ${esc(String(row.location_name || ''))}` : ''}
+                                ${row.expiry_date ? ` · 过期 ${esc(String(row.expiry_date || ''))}` : ''}
+                            </p>
+                        </div>
+                        <span class="badge ${statusClass} !text-[10px]"><i class="${statusIcon} mr-1"></i>${statusLabel}</span>
+                        <span class="text-xs text-slate-400 w-14 text-right">${esc(qtyLabel)}</span>
+                        <div class="flex items-center gap-1">
+                            <button onclick="showDetail(${itemId})" class="btn btn-ghost btn-sm !py-1 !px-2 text-xs text-cyan-300 border-cyan-400/25 hover:border-cyan-300/40" title="查看物品"><i class="ri-eye-line"></i></button>
+                            <button onclick="removeCollectionListItem(${selectedCollectionId}, ${itemId})" class="btn btn-ghost btn-sm !py-1 !px-2 text-xs text-rose-300 border-rose-400/25 hover:border-rose-300/40" title="移出集合"><i class="ri-subtract-line"></i></button>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function refreshCollectionItemsListDom() {
+            const selectedCollectionId = Number(App.selectedCollectionId || 0);
+            const listBody = document.getElementById('collectionItemsListBody');
+            if (listBody) {
+                listBody.innerHTML = buildCollectionItemsRowsHtml(App.collectionItems, selectedCollectionId);
+            }
+            const countEl = document.getElementById('collectionItemsCount');
+            if (countEl) {
+                const count = Array.isArray(App.collectionItems) ? App.collectionItems.length : 0;
+                countEl.textContent = `共 ${count} 件`;
+            }
+        }
+
+        async function createCollectionList() {
+            const nameInput = document.getElementById('collectionListNameInput');
+            const descInput = document.getElementById('collectionListDescInput');
+            const notesInput = document.getElementById('collectionListNotesInput');
+            const name = String(nameInput?.value || '').trim();
+            const description = String(descInput?.value || '').trim();
+            const notes = String(notesInput?.value || '').trim();
+            if (!name) {
+                toast('请输入集合名称', 'error');
+                nameInput?.focus();
+                return;
+            }
+            const res = await apiPost('collection-lists', { name, description, notes });
+            if (!res || !res.success) {
+                toast((res && res.message) || '创建集合失败', 'error');
+                return;
+            }
+            App.selectedCollectionId = Number(res.id || 0);
+            App.collectionAddKeyword = '';
+            App.collectionAddSelectedIds = new Set();
+            toast(res.message || '集合已创建');
+            renderView();
+        }
+
+        async function editCollectionList(collectionId) {
+            const collection = getCollectionListById(collectionId);
+            if (!collection) {
+                toast('集合不存在', 'error');
+                return;
+            }
+            document.getElementById('collectionEditId').value = String(Number(collection.id || 0));
+            document.getElementById('collectionEditName').value = String(collection.name || '');
+            document.getElementById('collectionEditDescription').value = String(collection.description || '');
+            document.getElementById('collectionEditNotes').value = String(collection.notes || '');
+            document.getElementById('collectionEditModal').classList.add('show');
+            const nameInput = document.getElementById('collectionEditName');
+            if (nameInput) {
+                setTimeout(() => nameInput.focus(), 0);
+            }
+        }
+
+        function closeCollectionEditModal() {
+            const modal = document.getElementById('collectionEditModal');
+            if (modal) {
+                modal.classList.remove('show');
+            }
+        }
+
+        async function saveCollectionEdit(event) {
+            if (event) {
+                event.preventDefault();
+            }
+            const id = Number(document.getElementById('collectionEditId')?.value || 0);
+            const name = String(document.getElementById('collectionEditName')?.value || '').trim();
+            const description = String(document.getElementById('collectionEditDescription')?.value || '').trim();
+            const notes = String(document.getElementById('collectionEditNotes')?.value || '').trim();
+            if (id <= 0) {
+                toast('集合不存在', 'error');
+                return false;
+            }
+            if (!name) {
+                toast('集合名称不能为空', 'error');
+                const nameInput = document.getElementById('collectionEditName');
+                if (nameInput) {
+                    nameInput.focus();
+                }
+                return false;
+            }
+            const res = await apiPost('collection-lists/update', { id, name, description, notes });
+            if (!res || !res.success) {
+                toast((res && res.message) || '集合更新失败', 'error');
+                return false;
+            }
+            toast(res.message || '集合已更新');
+            closeCollectionEditModal();
+            renderView();
+            return false;
+        }
+
+        async function deleteCollectionList(collectionId) {
+            const collection = getCollectionListById(collectionId);
+            if (!collection) {
+                toast('集合不存在', 'error');
+                return;
+            }
+            const collectionName = String(collection.name || '该集合');
+            if (!confirm(`确定删除集合「${collectionName}」？`)) return;
+            const res = await apiPost('collection-lists/delete', { id: Number(collection.id || 0) });
+            if (!res || !res.success) {
+                toast((res && res.message) || '集合删除失败', 'error');
+                return;
+            }
+            if (Number(App.selectedCollectionId || 0) === Number(collection.id || 0)) {
+                App.selectedCollectionId = 0;
+            }
+            toast(res.message || '集合已删除');
+            renderView();
+        }
+
+        async function removeCollectionListItem(collectionId, itemId) {
+            const item = getCollectionListItemById(itemId);
+            const itemName = String(item?.name || '该物品');
+            if (!confirm(`确定将「${itemName}」从该集合移除吗？`)) return;
+            const res = await apiPost('collection-lists/items/remove', {
+                collection_id: Number(collectionId || 0),
+                item_id: Number(itemId || 0)
+            });
+            if (!res || !res.success) {
+                toast((res && res.message) || '移除失败', 'error');
+                return;
+            }
+            toast(res.message || '已移除');
+            renderView();
+        }
+
+        async function addCollectionListItemsBatch() {
+            const collectionId = Number(App.selectedCollectionId || 0);
+            if (collectionId <= 0) {
+                toast('请先选择集合', 'error');
+                return;
+            }
+            const selectedSet = ensureCollectionAddSelectedSet();
+            const itemIds = Array.from(selectedSet).map(v => Number(v || 0)).filter(v => v > 0);
+            if (itemIds.length === 0) {
+                toast('请先勾选要加入的物品', 'error');
+                return;
+            }
+            const res = await apiPost('collection-lists/items/add-batch', {
+                collection_id: collectionId,
+                item_ids: itemIds
+            });
+            if (!res || !res.success) {
+                toast((res && res.message) || '批量加入失败', 'error');
+                return;
+            }
+            App.collectionAddSelectedIds = new Set();
+            toast(res.message || '批量加入完成');
+            renderView();
+        }
+
+        async function toggleCollectionListItemFlag(collectionId, itemId, flagged) {
+            const res = await apiPost('collection-lists/items/flag', {
+                collection_id: Number(collectionId || 0),
+                item_id: Number(itemId || 0),
+                flagged: Number(flagged || 0) === 1 ? 1 : 0
+            });
+            if (!res || !res.success) {
+                toast((res && res.message) || '旗标更新失败', 'error');
+                return;
+            }
+            const targetId = Number(itemId || 0);
+            const nextFlagged = Number(flagged || 0) === 1 ? 1 : 0;
+            if (targetId > 0 && Array.isArray(App.collectionItems)) {
+                const row = App.collectionItems.find(x => Number(x.item_id || 0) === targetId);
+                if (row) {
+                    row.flagged = nextFlagged;
+                }
+            }
+            refreshCollectionItemsListDom();
+        }
+
+        async function renderCollectionLists(container, options = {}) {
+            const skipAnimation = !!(options && options.skipAnimation);
+            const [listRes, optionsRes] = await Promise.all([
+                api('collection-lists'),
+                api('collection-lists/item-options&limit=500')
+            ]);
+            if (!listRes || !listRes.success) {
+                container.innerHTML = '<p class="text-red-400">集合清单加载失败</p>';
+                return;
+            }
+            if (!optionsRes || !optionsRes.success) {
+                container.innerHTML = '<p class="text-red-400">可选物品加载失败</p>';
+                return;
+            }
+
+            const lists = Array.isArray(listRes.data) ? listRes.data : [];
+            const itemOptions = Array.isArray(optionsRes.data) ? optionsRes.data : [];
+            App.collectionLists = lists;
+            App.collectionItemOptions = itemOptions;
+
+            let selectedCollectionId = Number(App.selectedCollectionId || 0);
+            if (!lists.some(x => Number(x.id || 0) === selectedCollectionId)) {
+                selectedCollectionId = lists.length > 0 ? Number(lists[0].id || 0) : 0;
+            }
+            App.selectedCollectionId = selectedCollectionId;
+
+            let collectionItems = [];
+            if (selectedCollectionId > 0) {
+                const itemsRes = await api(`collection-lists/items&collection_id=${selectedCollectionId}`);
+                if (!itemsRes || !itemsRes.success) {
+                    container.innerHTML = '<p class="text-red-400">集合物品加载失败</p>';
+                    return;
+                }
+                collectionItems = Array.isArray(itemsRes.data) ? itemsRes.data : [];
+            }
+            App.collectionItems = collectionItems;
+
+            const selectedCollection = getCollectionListById(selectedCollectionId);
+            const selectedItemIds = new Set(collectionItems.map(row => Number(row.item_id || row.id || 0)).filter(v => v > 0));
+            const availableItemOptions = itemOptions.filter(row => !selectedItemIds.has(Number(row.id || 0)));
+            const selectedAddSet = ensureCollectionAddSelectedSet();
+            const availableItemIdSet = new Set(availableItemOptions.map(row => Number(row.id || 0)).filter(v => v > 0));
+            Array.from(selectedAddSet).forEach(id => {
+                if (!availableItemIdSet.has(id)) {
+                    selectedAddSet.delete(id);
+                }
+            });
+            const statusMap = getStatusMap();
+            const totalCollectionItems = lists.reduce((sum, row) => sum + Math.max(0, Number(row.item_count || 0)), 0);
+            const addKeyword = String(App.collectionAddKeyword || '').trim().toLowerCase();
+
+            const categoryNames = Array.from(new Set(
+                availableItemOptions
+                    .map(row => String(row.category_name || '').trim())
+                    .filter(v => v !== '')
+            )).sort((a, b) => a.localeCompare(b, 'zh'));
+            let addCategoryFilter = String(App.collectionAddCategoryFilter || '');
+            if (addCategoryFilter !== '' && !categoryNames.includes(addCategoryFilter)) {
+                addCategoryFilter = '';
+                App.collectionAddCategoryFilter = '';
+            }
+
+            const statusValues = Array.from(new Set(
+                availableItemOptions
+                    .map(row => String(row.status || '').trim())
+                    .filter(v => v !== '')
+            )).sort((a, b) => {
+                const aLabel = String((statusMap[a] || [a])[0] || a);
+                const bLabel = String((statusMap[b] || [b])[0] || b);
+                return aLabel.localeCompare(bLabel, 'zh');
+            });
+            let addStatusFilter = String(App.collectionAddStatusFilter || '');
+            if (addStatusFilter !== '' && !statusValues.includes(addStatusFilter)) {
+                addStatusFilter = '';
+                App.collectionAddStatusFilter = '';
+            }
+
+            const addSortMode = normalizeCollectionAddSortMode(App.collectionAddSortMode || 'name');
+            App.collectionAddSortMode = addSortMode;
+
+            let filteredAvailableOptions = availableItemOptions.filter(row => {
+                const name = String(row.name || '').toLowerCase();
+                const category = String(row.category_name || '').toLowerCase();
+                const statusValue = String(row.status || '');
+                const keywordMatched = addKeyword === '' || name.includes(addKeyword) || category.includes(addKeyword);
+                const categoryMatched = addCategoryFilter === '' || String(row.category_name || '') === addCategoryFilter;
+                const statusMatched = addStatusFilter === '' || statusValue === addStatusFilter;
+                return keywordMatched && categoryMatched && statusMatched;
+            });
+            if (addSortMode === 'name') {
+                filteredAvailableOptions = [...filteredAvailableOptions].sort((a, b) => {
+                    return String(a.name || '').localeCompare(String(b.name || ''), 'zh');
+                });
+            } else if (addSortMode === 'status') {
+                filteredAvailableOptions = [...filteredAvailableOptions].sort((a, b) => {
+                    const aStatus = String(a.status || '');
+                    const bStatus = String(b.status || '');
+                    const aLabel = String((statusMap[aStatus] || [aStatus])[0] || aStatus);
+                    const bLabel = String((statusMap[bStatus] || [bStatus])[0] || bStatus);
+                    const statusCmp = aLabel.localeCompare(bLabel, 'zh');
+                    if (statusCmp !== 0) {
+                        return statusCmp;
+                    }
+                    return String(a.name || '').localeCompare(String(b.name || ''), 'zh');
+                });
+            }
+            const hasActiveFilter = addKeyword !== '' || addCategoryFilter !== '' || addStatusFilter !== '';
+
+            const listCardsHtml = lists.length > 0
+                ? lists.map(row => {
+                    const id = Number(row.id || 0);
+                    const isActive = id === selectedCollectionId;
+                    const itemCount = Math.max(0, Number(row.item_count || 0));
+                    const updatedAt = String(row.updated_at || row.created_at || '').slice(0, 16);
+                    const rowDescription = String(row.description || '').trim();
+                    const rowNotes = String(row.notes || '').trim();
+                    const metaParts = [`${itemCount} 件`];
+                    if (updatedAt) {
+                        metaParts.push(updatedAt);
+                    }
+                    return `
+                        <div onclick="selectCollectionList(${id})" class="rounded-lg border ${isActive ? 'border-sky-400/45 bg-sky-500/10' : 'border-white/10 bg-white/[0.03]'} px-3 py-2.5 cursor-pointer hover:border-sky-400/35 transition">
+                            <div class="flex items-start gap-2">
+                                <div class="min-w-0 flex-1">
+                                    <p class="text-sm font-medium ${isActive ? 'text-sky-200' : 'text-slate-200'} truncate">${esc(String(row.name || '未命名集合'))}</p>
+                                    <p class="text-[11px] text-slate-500 truncate">${esc(metaParts.join(' · '))}</p>
+                                    ${rowDescription ? `<p class="text-[11px] text-slate-500 truncate mt-0.5">说明：${esc(rowDescription)}</p>` : ''}
+                                    ${rowNotes ? `<p class="text-[11px] text-amber-300/90 truncate mt-0.5">备注：${esc(rowNotes)}</p>` : ''}
+                                </div>
+                                <button onclick="event.stopPropagation();editCollectionList(${id})" class="btn btn-ghost btn-sm !py-1 !px-2 text-xs text-cyan-300 border-cyan-400/25 hover:border-cyan-300/40"><i class="ri-edit-line"></i></button>
+                                <button onclick="event.stopPropagation();deleteCollectionList(${id})" class="btn btn-ghost btn-sm !py-1 !px-2 text-xs text-rose-300 border-rose-400/25 hover:border-rose-300/40"><i class="ri-delete-bin-line"></i></button>
+                            </div>
+                        </div>
+                    `;
+                }).join('')
+                : '<p class="text-slate-500 text-sm text-center py-8">还没有集合，先创建一个吧</p>';
+
+            const availableOptionsHtml = filteredAvailableOptions.length > 0
+                ? filteredAvailableOptions.map(row => {
+                    const id = Number(row.id || 0);
+                    const qty = Math.max(0, Number(row.quantity || 0));
+                    return `
+                        <label data-help-skip="1" class="flex items-center gap-2 px-2 py-1.5 rounded-lg hover:bg-white/[0.04]">
+                            <input type="checkbox" data-item-id="${id}" class="accent-sky-500" ${selectedAddSet.has(id) ? 'checked' : ''} onchange="toggleCollectionAddItem(${id}, this.checked)">
+                            <div class="min-w-0 flex-1">
+                                <p class="text-sm text-slate-200 truncate">${esc(String(row.name || '未命名物品'))}</p>
+                                <p class="text-[11px] text-slate-500 truncate">${row.category_name ? esc(String(row.category_name || '')) : '未分类'} · 数量 ${qty}</p>
+                            </div>
+                        </label>
+                    `;
+                }).join('')
+                : `<p class="text-slate-500 text-sm text-center py-6">${hasActiveFilter ? '没有匹配过滤条件的物品' : '暂无可添加物品'}</p>`;
+
+            const selectedItemsHtml = buildCollectionItemsRowsHtml(collectionItems, selectedCollectionId);
+            const categoryFilterOptionsHtml = categoryNames.map(name => `<option value="${esc(name)}" ${name === addCategoryFilter ? 'selected' : ''}>${esc(name)}</option>`).join('');
+            const statusFilterOptionsHtml = statusValues.map(value => {
+                const [label] = statusMap[value] || [value];
+                return `<option value="${esc(value)}" ${value === addStatusFilter ? 'selected' : ''}>${esc(String(label || value))}</option>`;
+            }).join('');
+
+            const addPanelToolsHtml = `
+                <div class="flex flex-wrap items-center gap-2 mt-2 mb-2">
+                    <button onclick="selectAllCollectionAddVisible(true)" class="btn btn-ghost btn-sm !py-1 !px-2 text-xs">全选可见</button>
+                    <button onclick="selectAllCollectionAddVisible(false)" class="btn btn-ghost btn-sm !py-1 !px-2 text-xs">取消可见</button>
+                    <button onclick="clearCollectionAddSelection()" class="btn btn-ghost btn-sm !py-1 !px-2 text-xs text-slate-400">清空选择</button>
+                    <button id="collectionAddBatchBtn" onclick="addCollectionListItemsBatch()" class="btn btn-primary btn-sm !py-1 !px-3"><i class="ri-add-circle-line"></i>批量加入</button>
+                </div>
+            `;
+
+            const leftPaneAnimClass = skipAnimation ? '' : ' anim-up';
+            const rightPaneAnimClass = skipAnimation ? '' : ' anim-up';
+            const leftPaneAnimStyle = skipAnimation ? '' : ' style="animation-delay:0.03s"';
+            const rightPaneAnimStyle = skipAnimation ? '' : ' style="animation-delay:0.05s"';
+
+            container.innerHTML = `
+        <div class="space-y-6">
+            <div class="grid grid-cols-1 xl:grid-cols-12 gap-5">
+                <div class="xl:col-span-3 glass rounded-2xl p-4${leftPaneAnimClass} min-h-[74vh]"${leftPaneAnimStyle}>
+                    <div class="flex items-center justify-between">
+                        <h3 class="font-semibold text-white flex items-center gap-2"><i class="ri-list-check"></i>集合列表</h3>
+                        <span class="text-xs text-slate-500">${lists.length} 组</span>
+                    </div>
+                    <p class="text-xs text-slate-500 mt-1 mb-3"><i class="ri-archive-line mr-1 text-emerald-400"></i>已归集物品 ${totalCollectionItems} 条</p>
+                    <div class="rounded-xl border border-white/10 bg-white/[0.02] p-3 mb-3">
+                        <h4 class="text-sm font-medium text-slate-200 mb-2">新建集合</h4>
+                        <div class="space-y-2.5">
+                            <input id="collectionListNameInput" type="text" maxlength="60" class="input !py-2.5" placeholder="集合名称（如：上班要带）">
+                            <input id="collectionListDescInput" type="text" maxlength="200" class="input !py-2.5" placeholder="集合说明（可选）">
+                            <textarea id="collectionListNotesInput" rows="2" maxlength="500" class="input !py-2.5 resize-y" placeholder="集合备注（可选）"></textarea>
+                            <button onclick="createCollectionList()" class="btn btn-primary w-full !py-2.5"><i class="ri-add-line"></i>添加集合</button>
+                        </div>
+                    </div>
+                    <div class="space-y-2 max-h-[58vh] overflow-auto pr-1">
+                        ${listCardsHtml}
+                    </div>
+                </div>
+
+                <div class="xl:col-span-9 glass rounded-2xl p-4${rightPaneAnimClass} min-h-[78vh]"${rightPaneAnimStyle}>
+                    ${selectedCollection ? `
+                        <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
+                            <div>
+                                <h3 class="font-semibold text-white flex items-center gap-2"><i class="ri-folder-open-line text-cyan-300"></i>${esc(String(selectedCollection.name || '未命名集合'))}</h3>
+                                ${String(selectedCollection.description || '').trim()
+                    ? `<p class="text-xs text-slate-500 mt-1">说明：${esc(String(selectedCollection.description || '').trim())}</p>`
+                    : '<p class="text-xs text-slate-500 mt-1">可把同场景要带/要买的物品集中放到一个集合，方便一次查看和处理。</p>'}
+                                ${String(selectedCollection.notes || '').trim() ? `<p class="text-xs text-amber-300/90 mt-1">备注：${esc(String(selectedCollection.notes || '').trim())}</p>` : ''}
+                            </div>
+                            <span id="collectionItemsCount" class="text-xs text-slate-500">共 ${collectionItems.length} 件</span>
+                        </div>
+
+                        <div class="grid grid-cols-1 2xl:grid-cols-2 gap-4">
+                            <div class="rounded-xl border border-white/10 bg-white/[0.02] p-3">
+                                <div class="flex items-center justify-between gap-2 mb-2">
+                                    <h4 class="text-sm font-medium text-slate-200">集合内物品（列表）</h4>
+                                    <span class="text-xs text-slate-500">旗标优先</span>
+                                </div>
+                                <p class="text-xs text-amber-300 mb-2">旗标：你可以用它来标记是否已经携带，也可以用它来作为特别提醒。</p>
+                                <div class="rounded-lg border border-white/10 bg-black/10 max-h-[72vh] overflow-auto">
+                                    <div class="flex items-center gap-2 px-2 py-1 text-[11px] text-slate-500 border-b border-white/10">
+                                        <span class="w-10 text-center">旗标</span>
+                                        <span class="flex-1">物品</span>
+                                        <span class="w-24 text-center">状态</span>
+                                        <span class="w-14 text-right">数量</span>
+                                        <span class="w-16 text-center">操作</span>
+                                    </div>
+                                    <div id="collectionItemsListBody">${selectedItemsHtml}</div>
+                                </div>
+                            </div>
+
+                            <div class="rounded-xl border border-white/10 bg-white/[0.02] p-3">
+                                <div class="flex items-center justify-between gap-2 mb-2">
+                                    <h4 class="text-sm font-medium text-slate-200">批量选择加入</h4>
+                                    <span class="text-xs text-slate-500">已选 <span id="collectionAddSelectedCount">0</span> 件</span>
+                                </div>
+                                <input type="text" class="input !py-2" value="${esc(App.collectionAddKeyword || '')}" placeholder="搜索可添加物品（输入后回车或失焦生效）..." onchange="setCollectionAddKeyword(this.value)">
+                                <div class="grid grid-cols-1 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] gap-2 mt-2">
+                                    <select class="input !py-2" onchange="setCollectionAddCategoryFilter(this.value)">
+                                        <option value="">全部分类</option>
+                                        ${categoryFilterOptionsHtml}
+                                    </select>
+                                    <select class="input !py-2" onchange="setCollectionAddStatusFilter(this.value)">
+                                        <option value="">全部状态</option>
+                                        ${statusFilterOptionsHtml}
+                                    </select>
+                                    <button onclick="toggleCollectionAddSortMode()" class="btn btn-ghost btn-sm !py-2 !px-3 text-xs whitespace-nowrap">排序：${esc(getCollectionAddSortModeLabel(addSortMode))}</button>
+                                </div>
+                                ${addPanelToolsHtml}
+                                <div id="collectionAddOptionsList" class="max-h-[64vh] overflow-auto pr-1 space-y-1">
+                                    ${availableOptionsHtml}
+                                </div>
+                            </div>
+                        </div>
+                    ` : `
+                        <div class="empty-state !py-10">
+                            <i class="ri-inbox-2-line"></i>
+                            <h3 class="text-lg font-semibold text-slate-300 mb-2">请选择一个集合</h3>
+                            <p class="text-slate-500 text-sm">先在左侧新建集合，再把已有物品加入集合中。</p>
+                        </div>
+                    `}
+                </div>
+            </div>
+        </div>
+    `;
+            updateCollectionAddBatchButtonState();
         }
 
         // ============================================================
@@ -10674,6 +12627,8 @@ $currentUserJson = json_encode([
                 <div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">余量</p><p class="text-sm text-white">${Number(item.remaining_total || 0) > 0 ? `${Number(item.remaining_current || 0)}/${Number(item.remaining_total || 0)}` : '未设置'}</p></div>
                 <div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">价值</p><p class="text-sm text-amber-400 font-medium">¥${Number(item.purchase_price || 0).toLocaleString()}</p></div>
                 ${item.purchase_date ? `<div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">购入日期</p><p class="text-sm text-white">${item.purchase_date}</p></div>` : ''}
+                ${item.production_date ? `<div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">生产日期</p><p class="text-sm text-white">${item.production_date}</p></div>` : ''}
+                ${Number(item.shelf_life_value || 0) > 0 && item.shelf_life_unit ? `<div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">保质期</p><p class="text-sm text-white">${shelfLifeLabel(item.shelf_life_value, item.shelf_life_unit)}</p></div>` : ''}
                 ${item.expiry_date ? `<div class="p-3 rounded-xl ${expiryBg(item.expiry_date)}"><p class="text-xs text-slate-500 mb-1">过期日期</p><p class="text-sm font-medium ${expiryColor(item.expiry_date)}">${item.expiry_date} ${expiryLabel(item.expiry_date)}</p></div>` : ''}
                 ${reminderDisplayDate(item) && item.reminder_cycle_unit ? `<div class="p-3 rounded-xl bg-cyan-500/10 border border-cyan-500/20"><p class="text-xs text-slate-500 mb-1">循环提醒</p><p class="text-sm font-medium text-cyan-300 leading-6">初始：${item.reminder_date || '-'} <span class="text-cyan-200/90">(${reminderCycleLabel(item.reminder_cycle_value, item.reminder_cycle_unit)})</span></p><p class="text-sm font-medium text-cyan-300 leading-6">下次：${reminderDisplayDate(item)} ${reminderDueLabel(reminderDisplayDate(item))}</p>${item.reminder_note ? `<p class="text-xs text-slate-400 mt-1">${esc(item.reminder_note)}</p>` : ''}</div>` : ''}
                 ${item.purchase_from ? `<div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">购入渠道</p><p class="text-sm text-white">${esc(item.purchase_from)}</p></div>` : ''}
@@ -10698,8 +12653,12 @@ $currentUserJson = json_encode([
 
         // ---------- 添加 / 编辑物品 ----------
         async function openAddItem() {
+            const now = new Date();
+            const pad = n => String(n).padStart(2, '0');
+            const today = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
             document.getElementById('itemModalTitle').textContent = '添加物品';
             document.getElementById('itemForm').reset();
+            setItemFormDateError('');
             document.getElementById('itemId').value = '';
             document.getElementById('itemImage').value = '';
             document.getElementById('itemSourceShoppingId').value = '';
@@ -10707,6 +12666,10 @@ $currentUserJson = json_encode([
             document.getElementById('itemQuantity').value = '1';
             document.getElementById('itemRemainingCurrent').value = '';
             document.getElementById('itemPrice').value = '0';
+            document.getElementById('itemDate').value = today;
+            document.getElementById('itemProductionDate').value = '';
+            document.getElementById('itemShelfLifeValue').value = '';
+            document.getElementById('itemShelfLifeUnit').value = 'month';
             document.getElementById('itemExpiry').value = '';
             document.getElementById('itemReminderDate').value = '';
             document.getElementById('itemReminderEvery').value = '1';
@@ -10714,6 +12677,7 @@ $currentUserJson = json_encode([
             document.getElementById('itemReminderNext').value = '';
             document.getElementById('itemReminderNote').value = '';
             document.getElementById('itemNotes').value = '';
+            syncShelfLifeFields();
             syncReminderFields();
             resetUploadZone();
             await populateSelects({
@@ -10736,6 +12700,7 @@ $currentUserJson = json_encode([
             if (!item) { toast('物品不存在', 'error'); return; }
 
             document.getElementById('itemModalTitle').textContent = '编辑物品';
+            setItemFormDateError('');
             document.getElementById('itemId').value = item.id;
             document.getElementById('itemName').value = item.name;
             document.getElementById('itemSourceShoppingId').value = '';
@@ -10746,6 +12711,9 @@ $currentUserJson = json_encode([
                 : '';
             document.getElementById('itemPrice').value = item.purchase_price;
             document.getElementById('itemDate').value = item.purchase_date;
+            document.getElementById('itemProductionDate').value = item.production_date || '';
+            document.getElementById('itemShelfLifeValue').value = Number(item.shelf_life_value || 0) > 0 ? String(Number(item.shelf_life_value || 0)) : '';
+            document.getElementById('itemShelfLifeUnit').value = ['day', 'week', 'month', 'year'].includes(item.shelf_life_unit) ? item.shelf_life_unit : 'month';
             document.getElementById('itemExpiry').value = item.expiry_date || '';
             document.getElementById('itemReminderDate').value = item.reminder_date || '';
             document.getElementById('itemReminderEvery').value = item.reminder_cycle_value || 1;
@@ -10757,6 +12725,7 @@ $currentUserJson = json_encode([
             document.getElementById('itemImage').value = item.image || '';
             document.getElementById('itemNotes').value = item.notes || '';
             document.getElementById('itemSharePublic').checked = Number(item.is_public_shared || 0) === 1;
+            syncShelfLifeFields();
             syncReminderFields();
 
             resetUploadZone();
@@ -10824,6 +12793,11 @@ $currentUserJson = json_encode([
 
         async function saveItem(e) {
             e.preventDefault();
+            setItemFormDateError('');
+            const itemDateValidation = validateDateInputsInForm('itemForm', 'itemFormDateError', { normalize: true });
+            if (!itemDateValidation.valid) {
+                return false;
+            }
             const id = document.getElementById('itemId').value;
             const sourceShoppingId = +document.getElementById('itemSourceShoppingId').value || 0;
             const quantityRaw = String(document.getElementById('itemQuantity').value || '').trim();
@@ -10852,6 +12826,37 @@ $currentUserJson = json_encode([
                     return false;
                 }
             }
+            const productionDate = document.getElementById('itemProductionDate').value;
+            const shelfLifeRaw = String(document.getElementById('itemShelfLifeValue').value || '').trim();
+            const shelfLifeUnitRaw = document.getElementById('itemShelfLifeUnit').value;
+            let shelfLifeValue = 0;
+            let shelfLifeUnit = '';
+            if (shelfLifeRaw !== '') {
+                if (!/^\d+$/.test(shelfLifeRaw)) {
+                    toast('保质期数字只能输入正整数', 'error');
+                    return false;
+                }
+                shelfLifeValue = Number.parseInt(shelfLifeRaw, 10);
+                if (shelfLifeValue < 1) {
+                    toast('保质期数字需大于 0', 'error');
+                    return false;
+                }
+                if (!productionDate) {
+                    toast('填写保质期前请先填写生产日期', 'error');
+                    return false;
+                }
+                shelfLifeUnit = ['day', 'week', 'month', 'year'].includes(shelfLifeUnitRaw) ? shelfLifeUnitRaw : 'month';
+            }
+            if (!productionDate) {
+                shelfLifeValue = 0;
+                shelfLifeUnit = '';
+            }
+            let expiryDate = document.getElementById('itemExpiry').value;
+            const autoExpiryDate = calcShelfLifeExpiryDate(productionDate, shelfLifeValue, shelfLifeUnit);
+            if (autoExpiryDate) {
+                expiryDate = autoExpiryDate;
+                document.getElementById('itemExpiry').value = autoExpiryDate;
+            }
             const data = {
                 id: id ? +id : undefined,
                 name: document.getElementById('itemName').value.trim(),
@@ -10863,7 +12868,10 @@ $currentUserJson = json_encode([
                 remaining_total: hasRemainingValue ? quantity : 0,
                 purchase_price: +document.getElementById('itemPrice').value,
                 purchase_date: document.getElementById('itemDate').value,
-                expiry_date: document.getElementById('itemExpiry').value,
+                production_date: productionDate,
+                shelf_life_value: shelfLifeValue,
+                shelf_life_unit: shelfLifeUnit,
+                expiry_date: expiryDate,
                 barcode: document.getElementById('itemBarcode').value.trim(),
                 tags: document.getElementById('itemTags').value.trim(),
                 status: document.getElementById('itemStatus').value,
@@ -10933,13 +12941,111 @@ $currentUserJson = json_encode([
                 openItemUnsavedConfirm();
                 return false;
             }
+            setItemFormDateError('');
             document.getElementById('itemModal').classList.remove('show');
             closeItemUnsavedConfirm();
             clearItemFormTrack();
             return true;
         }
 
-        function syncReminderFields() {
+        function toUtcDateFromYmd(dateStr) {
+            const parsed = parseDateInputValue(dateStr);
+            if (!parsed.valid || !parsed.normalized) return null;
+            const m = parsed.normalized.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+            if (!m) return null;
+            const year = Number.parseInt(m[1], 10);
+            const month = Number.parseInt(m[2], 10);
+            const day = Number.parseInt(m[3], 10);
+            const dt = new Date(Date.UTC(year, month - 1, day));
+            if (dt.getUTCFullYear() !== year || dt.getUTCMonth() !== month - 1 || dt.getUTCDate() !== day) {
+                return null;
+            }
+            return dt;
+        }
+
+        function formatUtcDateYmd(dateObj) {
+            if (!(dateObj instanceof Date)) return '';
+            const y = dateObj.getUTCFullYear();
+            const m = String(dateObj.getUTCMonth() + 1).padStart(2, '0');
+            const d = String(dateObj.getUTCDate()).padStart(2, '0');
+            return `${y}-${m}-${d}`;
+        }
+
+        function calcShelfLifeExpiryDate(productionDate, valueRaw, unitRaw) {
+            const base = toUtcDateFromYmd(productionDate);
+            if (!base) return '';
+            const value = Number.parseInt(String(valueRaw || ''), 10);
+            if (!Number.isFinite(value) || value < 1) return '';
+            const unit = ['day', 'week', 'month', 'year'].includes(unitRaw) ? unitRaw : '';
+            if (!unit) return '';
+
+            const next = new Date(base.getTime());
+            if (unit === 'day') {
+                next.setUTCDate(next.getUTCDate() + value);
+            } else if (unit === 'week') {
+                next.setUTCDate(next.getUTCDate() + (value * 7));
+            } else if (unit === 'month') {
+                const year = base.getUTCFullYear();
+                const monthIndex = base.getUTCMonth();
+                const day = base.getUTCDate();
+                const totalMonths = monthIndex + value;
+                const targetYear = year + Math.floor(totalMonths / 12);
+                const targetMonth = ((totalMonths % 12) + 12) % 12;
+                const lastDayOfTargetMonth = new Date(Date.UTC(targetYear, targetMonth + 1, 0)).getUTCDate();
+                next.setUTCFullYear(targetYear, targetMonth, Math.min(day, lastDayOfTargetMonth));
+            } else {
+                const year = base.getUTCFullYear();
+                const monthIndex = base.getUTCMonth();
+                const day = base.getUTCDate();
+                const targetYear = year + value;
+                const lastDayOfTargetMonth = new Date(Date.UTC(targetYear, monthIndex + 1, 0)).getUTCDate();
+                next.setUTCFullYear(targetYear, monthIndex, Math.min(day, lastDayOfTargetMonth));
+            }
+            return formatUtcDateYmd(next);
+        }
+
+        function calcReminderNextDate(reminderDate, valueRaw, unitRaw) {
+            const base = toUtcDateFromYmd(reminderDate);
+            if (!base) return '';
+            const value = Number.parseInt(String(valueRaw || ''), 10);
+            if (!Number.isFinite(value) || value < 1) return '';
+            const unit = ['day', 'week', 'year'].includes(unitRaw) ? unitRaw : '';
+            if (!unit) return '';
+
+            const next = new Date(base.getTime());
+            if (unit === 'day') {
+                next.setUTCDate(next.getUTCDate() + value);
+            } else if (unit === 'week') {
+                next.setUTCDate(next.getUTCDate() + (value * 7));
+            } else {
+                const year = base.getUTCFullYear();
+                const monthIndex = base.getUTCMonth();
+                const day = base.getUTCDate();
+                const targetYear = year + value;
+                const lastDayOfTargetMonth = new Date(Date.UTC(targetYear, monthIndex + 1, 0)).getUTCDate();
+                next.setUTCFullYear(targetYear, monthIndex, Math.min(day, lastDayOfTargetMonth));
+            }
+            return formatUtcDateYmd(next);
+        }
+
+        function syncShelfLifeFields() {
+            const productionInput = document.getElementById('itemProductionDate');
+            const valueInput = document.getElementById('itemShelfLifeValue');
+            const unitSelect = document.getElementById('itemShelfLifeUnit');
+            const expiryInput = document.getElementById('itemExpiry');
+            if (!productionInput || !valueInput || !unitSelect || !expiryInput) return;
+
+            if (!['day', 'week', 'month', 'year'].includes(unitSelect.value)) {
+                unitSelect.value = 'month';
+            }
+            const expiryDate = calcShelfLifeExpiryDate(productionInput.value, valueInput.value, unitSelect.value);
+            if (expiryDate) {
+                expiryInput.value = expiryDate;
+            }
+            refreshDateInputPlaceholderDisplay(document.getElementById('itemForm'));
+        }
+
+        function syncReminderFields(forceRecalc = false) {
             const dateInput = document.getElementById('itemReminderDate');
             const everyInput = document.getElementById('itemReminderEvery');
             const unitSelect = document.getElementById('itemReminderUnit');
@@ -10958,7 +13064,12 @@ $currentUserJson = json_encode([
             if (!Number.isFinite(currentEvery) || currentEvery < 1) everyInput.value = '1';
             everyInput.disabled = false;
             unitSelect.disabled = false;
-            if (!nextInput.value) nextInput.value = dateInput.value;
+            const nextDate = calcReminderNextDate(dateInput.value, everyInput.value, unitSelect.value);
+            if (forceRecalc) {
+                nextInput.value = nextDate || '';
+            } else if (!nextInput.value) {
+                nextInput.value = nextDate || '';
+            }
             refreshDateInputPlaceholderDisplay(document.getElementById('itemForm'));
         }
 
@@ -11260,7 +13371,7 @@ $currentUserJson = json_encode([
             const current = shoppingStatusKey(statusInput.value);
             const target = current === 'pending_purchase' ? 'pending_receipt' : 'pending_purchase';
             btn.dataset.targetStatus = target;
-            label.textContent = target === 'pending_receipt' ? '已购买' : '待购买';
+            label.textContent = target === 'pending_receipt' ? '转为已购买' : '转为待购买';
             btn.classList.remove('hidden');
         }
 
@@ -11516,6 +13627,7 @@ $currentUserJson = json_encode([
         async function openAddShoppingItem() {
             document.getElementById('shoppingModalTitle').textContent = '添加清单';
             document.getElementById('shoppingForm').reset();
+            setShoppingFormDateError('');
             document.getElementById('shoppingId').value = '';
             document.getElementById('shoppingConvertBtn')?.classList.add('hidden');
             document.getElementById('shoppingToggleStatusBtn')?.classList.add('hidden');
@@ -11551,6 +13663,7 @@ $currentUserJson = json_encode([
             if (!item) { toast('清单项不存在', 'error'); return; }
 
             document.getElementById('shoppingModalTitle').textContent = '编辑清单';
+            setShoppingFormDateError('');
             document.getElementById('shoppingId').value = item.id;
             document.getElementById('shoppingConvertBtn')?.classList.remove('hidden');
             document.getElementById('shoppingCategoryId').value = String(Number(item.category_id || 0));
@@ -11594,7 +13707,7 @@ $currentUserJson = json_encode([
                 const localItem = App.shoppingList.find(x => x.id === id);
                 if (localItem)
                     localItem.status = target;
-                toast(`已切换为${target === 'pending_receipt' ? '待收货' : '待购买'}`);
+                toast(`已转为${target === 'pending_receipt' ? '待收货' : '待购买'}`);
                 closeShoppingModal();
                 renderView();
             } finally {
@@ -11614,6 +13727,11 @@ $currentUserJson = json_encode([
 
         async function saveShoppingItem(e) {
             e.preventDefault();
+            setShoppingFormDateError('');
+            const shoppingDateValidation = validateDateInputsInForm('shoppingForm', 'shoppingFormDateError', { normalize: true });
+            if (!shoppingDateValidation.valid) {
+                return false;
+            }
             const id = document.getElementById('shoppingId').value;
             const name = document.getElementById('shoppingName').value.trim();
             if (!name) { toast('请输入清单名称', 'error'); return false; }
@@ -11668,6 +13786,7 @@ $currentUserJson = json_encode([
 
             document.getElementById('itemModalTitle').textContent = '已购买入库';
             document.getElementById('itemForm').reset();
+            setItemFormDateError('');
             document.getElementById('itemId').value = '';
             document.getElementById('itemImage').value = '';
             document.getElementById('itemSourceShoppingId').value = item.id;
@@ -11677,6 +13796,9 @@ $currentUserJson = json_encode([
             document.getElementById('itemRemainingCurrent').value = '';
             document.getElementById('itemPrice').value = Math.max(0, Number(item.planned_price || 0));
             document.getElementById('itemDate').value = today;
+            document.getElementById('itemProductionDate').value = '';
+            document.getElementById('itemShelfLifeValue').value = '';
+            document.getElementById('itemShelfLifeUnit').value = 'month';
             document.getElementById('itemExpiry').value = '';
             document.getElementById('itemReminderDate').value = '';
             document.getElementById('itemReminderEvery').value = '1';
@@ -11687,6 +13809,7 @@ $currentUserJson = json_encode([
             document.getElementById('itemTags').value = '';
             document.getElementById('itemNotes').value = item.notes || '';
             document.getElementById('itemSharePublic').checked = false;
+            syncShelfLifeFields();
             syncReminderFields();
 
             resetUploadZone();
@@ -11712,6 +13835,7 @@ $currentUserJson = json_encode([
             if (shoppingSimilarSearchTimer)
                 clearTimeout(shoppingSimilarSearchTimer);
             renderShoppingSimilarItemPrices([], 'idle', '');
+            setShoppingFormDateError('');
             document.getElementById('shoppingModal').classList.remove('show');
         }
 
@@ -12186,8 +14310,8 @@ $currentUserJson = json_encode([
             const items = res.data.items;
             const statusMap = getStatusMap();
             const statusLabelByKey = key => (statusMap[key] ? statusMap[key][0] : (key || ''));
-            const header = ['ID', '名称', '分类', '位置', '数量', '价格', '购入渠道', '购入日期', '过期日期', '条码', '标签', '状态', '备注'];
-            const rows = items.map(i => [i.id, i.name, i.category_name || '', i.location_name || '', i.quantity, i.purchase_price, i.purchase_from || '', i.purchase_date, i.expiry_date || '', i.barcode, i.tags, statusLabelByKey(i.status), i.notes || ''].map(csvCell));
+            const header = ['ID', '名称', '分类', '位置', '数量', '价格', '购入渠道', '购入日期', '生产日期', '保质期数值', '保质期单位', '过期日期', '条码', '标签', '状态', '备注'];
+            const rows = items.map(i => [i.id, i.name, i.category_name || '', i.location_name || '', i.quantity, i.purchase_price, i.purchase_from || '', i.purchase_date, i.production_date || '', Number(i.shelf_life_value || 0) > 0 ? i.shelf_life_value : '', i.shelf_life_unit || '', i.expiry_date || '', i.barcode, i.tags, statusLabelByKey(i.status), i.notes || ''].map(csvCell));
             const csv = '\uFEFF' + [header.join(','), ...rows.map(r => r.join(','))].join('\n');
             downloadBlob(new Blob([csv], { type: 'text/csv;charset=utf-8' }), `items_${dateStr()}.csv`);
             toast('CSV 导出成功');
@@ -12262,7 +14386,7 @@ $currentUserJson = json_encode([
         }
 
         function downloadManualImportTemplate() {
-            const header = ['名称', '分类', '位置', '数量', '状态', '购入价格', '购入渠道', '购入日期', '过期日期', '条码/序列号', '标签', '备注'];
+            const header = ['名称', '分类', '位置', '数量', '状态', '购入价格', '购入渠道', '购入日期', '生产日期', '保质期数值', '保质期单位', '过期日期', '条码/序列号', '标签', '备注'];
             const sample = [
                 '示例物品（必填）',
                 '电子设备（可选）',
@@ -12272,6 +14396,9 @@ $currentUserJson = json_encode([
                 '199.00（可选）',
                 '京东（可选）',
                 '2026/02/09（可选）',
+                '2026/01/01（可选）',
+                '12（可选）',
+                '月（可选）',
                 '2026/12/31（可选）',
                 'SN-001（可选）',
                 '示例,批量导入（可选）',
@@ -12389,6 +14516,15 @@ $currentUserJson = json_encode([
                     'purchasefrom': 'purchase_from',
                     '购入日期': 'purchase_date',
                     'purchasedate': 'purchase_date',
+                    '生产日期': 'production_date',
+                    '生产时间': 'production_date',
+                    'productiondate': 'production_date',
+                    '保质期数值': 'shelf_life_value',
+                    '保质期时长': 'shelf_life_value',
+                    '保质期': 'shelf_life_value',
+                    'shelflifevalue': 'shelf_life_value',
+                    '保质期单位': 'shelf_life_unit',
+                    'shelflifeunit': 'shelf_life_unit',
                     '过期日期': 'expiry_date',
                     '过期时间': 'expiry_date',
                     'expirydate': 'expiry_date',
@@ -12460,6 +14596,15 @@ $currentUserJson = json_encode([
                 const purchaseChannelCandidates = App.purchaseChannels
                     .map(ch => ({ value: ch, norm: normalizeMatchText(ch) }))
                     .filter(ch => ch.norm);
+                const normalizeShelfUnit = raw => {
+                    const text = normalizeMatchText(raw);
+                    if (!text) return '';
+                    if (['day', 'days', 'd', '天'].includes(text)) return 'day';
+                    if (['week', 'weeks', 'w', '周'].includes(text)) return 'week';
+                    if (['month', 'months', 'm', '月'].includes(text)) return 'month';
+                    if (['year', 'years', 'y', '年'].includes(text)) return 'year';
+                    return '';
+                };
                 const defaultStatus = getDefaultStatusKey();
                 const defaultPurchaseFrom = '';
 
@@ -12486,14 +14631,34 @@ $currentUserJson = json_encode([
                     const qtyParsed = Number.parseInt(qtyRaw, 10);
                     const priceParsed = Number.parseFloat(priceRaw);
                     const purchaseDate = normalizeDateYMD(getCell(row, 'purchase_date'));
+                    const productionDate = normalizeDateYMD(getCell(row, 'production_date'));
                     const expiryDate = normalizeDateYMD(getCell(row, 'expiry_date'));
+                    const shelfLifeRaw = getCell(row, 'shelf_life_value');
+                    const shelfLifeValue = shelfLifeRaw === '' ? 0 : Number.parseInt(shelfLifeRaw, 10);
+                    const shelfLifeUnit = normalizeShelfUnit(getCell(row, 'shelf_life_unit'));
 
                     if (purchaseDate === null) {
                         skippedDateErrors.push(`第 ${i + 1} 行：购入日期格式错误（应为 YYYY-MM-DD 或 YYYY/MM/DD，如 2026/2/9）`);
                         continue;
                     }
+                    if (productionDate === null) {
+                        skippedDateErrors.push(`第 ${i + 1} 行：生产日期格式错误（应为 YYYY-MM-DD 或 YYYY/MM/DD，如 2026/2/9）`);
+                        continue;
+                    }
                     if (expiryDate === null) {
                         skippedDateErrors.push(`第 ${i + 1} 行：过期日期格式错误（应为 YYYY-MM-DD 或 YYYY/MM/DD，如 2026/2/9）`);
+                        continue;
+                    }
+                    if (shelfLifeRaw !== '' && (!Number.isFinite(shelfLifeValue) || shelfLifeValue < 1)) {
+                        skippedDateErrors.push(`第 ${i + 1} 行：保质期数值需为正整数`);
+                        continue;
+                    }
+                    if (shelfLifeRaw !== '' && !productionDate) {
+                        skippedDateErrors.push(`第 ${i + 1} 行：填写保质期时必须填写生产日期`);
+                        continue;
+                    }
+                    if (shelfLifeRaw !== '' && !['day', 'week', 'month', 'year'].includes(shelfLifeUnit)) {
+                        skippedDateErrors.push(`第 ${i + 1} 行：保质期单位仅支持 天/周/月/年`);
                         continue;
                     }
 
@@ -12511,6 +14676,9 @@ $currentUserJson = json_encode([
                         purchase_price: Number.isNaN(priceParsed) ? 0 : priceParsed,
                         purchase_from: purchaseFromMatch ? purchaseFromMatch.value : defaultPurchaseFrom,
                         purchase_date: purchaseDate,
+                        production_date: productionDate,
+                        shelf_life_value: shelfLifeRaw === '' ? 0 : shelfLifeValue,
+                        shelf_life_unit: shelfLifeRaw === '' ? '' : shelfLifeUnit,
                         expiry_date: expiryDate,
                         barcode: getCell(row, 'barcode'),
                         tags: getCell(row, 'tags'),
@@ -12607,6 +14775,7 @@ $currentUserJson = json_encode([
 
             // 打开添加表单并填入被复制物品的数据（不含 ID，图片保留引用）
             document.getElementById('itemModalTitle').textContent = '复制物品';
+            setItemFormDateError('');
             document.getElementById('itemId').value = '';  // 无 ID = 新建
             document.getElementById('itemSourceShoppingId').value = '';
             document.getElementById('itemName').value = item.name + ' (副本)';
@@ -12617,6 +14786,9 @@ $currentUserJson = json_encode([
                 : '';
             document.getElementById('itemPrice').value = item.purchase_price;
             document.getElementById('itemDate').value = item.purchase_date;
+            document.getElementById('itemProductionDate').value = item.production_date || '';
+            document.getElementById('itemShelfLifeValue').value = Number(item.shelf_life_value || 0) > 0 ? String(Number(item.shelf_life_value || 0)) : '';
+            document.getElementById('itemShelfLifeUnit').value = ['day', 'week', 'month', 'year'].includes(item.shelf_life_unit) ? item.shelf_life_unit : 'month';
             document.getElementById('itemExpiry').value = item.expiry_date || '';
             document.getElementById('itemReminderDate').value = item.reminder_date || '';
             document.getElementById('itemReminderEvery').value = item.reminder_cycle_value || 1;
@@ -12628,6 +14800,7 @@ $currentUserJson = json_encode([
             document.getElementById('itemImage').value = item.image || '';
             document.getElementById('itemNotes').value = item.notes || '';
             document.getElementById('itemSharePublic').checked = Number(item.is_public_shared || 0) === 1;
+            syncShelfLifeFields();
             syncReminderFields();
 
             resetUploadZone();
@@ -12814,6 +14987,8 @@ $currentUserJson = json_encode([
                 <div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">数量</p><p class="text-sm text-white">${item.quantity}</p></div>
                 <div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">价值</p><p class="text-sm text-amber-400 font-medium">¥${Number(item.purchase_price || 0).toLocaleString()}</p></div>
                 ${item.purchase_date ? `<div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">购入日期</p><p class="text-sm text-white">${item.purchase_date}</p></div>` : ''}
+                ${item.production_date ? `<div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">生产日期</p><p class="text-sm text-white">${item.production_date}</p></div>` : ''}
+                ${Number(item.shelf_life_value || 0) > 0 && item.shelf_life_unit ? `<div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">保质期</p><p class="text-sm text-white">${shelfLifeLabel(item.shelf_life_value, item.shelf_life_unit)}</p></div>` : ''}
                 ${item.expiry_date ? `<div class="p-3 rounded-xl ${expiryBg(item.expiry_date)}"><p class="text-xs text-slate-500 mb-1">过期日期</p><p class="text-sm font-medium ${expiryColor(item.expiry_date)}">${item.expiry_date} ${expiryLabel(item.expiry_date)}</p></div>` : ''}
                 ${item.purchase_from ? `<div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">购入渠道</p><p class="text-sm text-white">${esc(item.purchase_from)}</p></div>` : ''}
                 ${item.barcode ? `<div class="p-3 rounded-xl bg-white/5"><p class="text-xs text-slate-500 mb-1">条码/序列号</p><p class="text-sm text-white font-mono">${esc(item.barcode)}</p></div>` : ''}
@@ -12863,22 +15038,72 @@ $currentUserJson = json_encode([
         // ---------- 更新记录数据 ----------
         const CHANGELOG = [
             {
-                version: 'v1.6.2', date: '2026-02-20', title: '帮助模式默认开启',
+                version: 'v1.9.3', date: '2026-02-21',
+                sections: {
+                    features: [
+                        '“集合清单”支持批量选择后一次性加入，减少逐条添加的操作成本',
+                        '“集合清单”内新增“旗标”能力，可按需标记重点物品并在列表里优先识别'
+                    ],
+                    optimizations: [
+                        '“集合清单”中的集合项与集合内物品改为紧凑列表展示，同屏可看到更多内容',
+                        '“集合清单”帮助文本补充旗标用途说明：你可以用它来标记是否已经携带，也可以用它来作为特别提醒'
+                    ],
+                    fixes: []
+                }
+            },
+            {
+                version: 'v1.9.2', date: '2026-02-21',
+                sections: {
+                    features: [
+                        '新增“集合清单”模块（位于“任务清单”下方），可把已有物品按场景归集（如上班要带、露营要带、大扫除要买）'
+                    ],
+                    optimizations: [
+                        '“数据导出/导入”“恢复默认环境”“加载演示数据”已同步纳入集合清单数据，避免迁移后丢失集合关系'
+                    ],
+                    fixes: []
+                }
+            },
+            {
+                version: 'v1.9.1', date: '2026-02-21',
+                sections: {
+                    features: [
+                        '编辑清单左下角更改为更直观的状态切换文案：“转为已购买 / 转为待购买”'
+                    ],
+                    optimizations: [
+                        '状态切换成功提示同步改为“已转为待收货 / 已转为待购买”，与按钮动作语义一致',
+                        '帮助提示与"帮助文档"补充"购物清单"状态切换说明，明确可在编辑态快速转换采购进度'
+                    ],
+                    fixes: []
+                }
+            },
+            {
+                version: 'v1.9.0', date: '2026-02-21', title: '保质期联动过期日期 + 入库流程同步',
+                changes: [
+                    '编辑物品与“已购买入库”表单新增“生产日期 + 保质期（数字 + 天/周/月/年）”字段，并与过期日期联动',
+                    '当生产日期和保质期完整时，系统会自动更新过期日期；保存时后端也会按同规则兜底计算',
+                    '表单字段顺序优化：条码/序列号与过期日期位置调整，过期日期与生产日期/保质期集中展示',
+                    '手动批量导入模板、CSV 导入导出和 JSON 导入导出补充生产日期/保质期字段，兼容新旧数据',
+                    '演示数据补充保质期示例（含临期、已过期与正常库存场景），便于验证提醒效果',
+                    '"帮助文档"同步更新新增字段说明与留空逻辑，并补充“生产日期 + 保质期自动计算过期日期”指引'
+                ]
+            },
+            {
+                version: 'v1.8.2', date: '2026-02-20', title: '帮助模式默认开启',
                 changes: [
                     '帮助模式改为默认开启：首次进入即可在字段名后看到问号提示，降低上手门槛',
                     '顶部“菜单”展示当前登录用户名，并统一承载帮助模式开关与退出登录',
                     '帮助提示定位与换行策略优化，编辑物品左侧字段提示不再溢出遮挡',
                     '帮助文案改为更适合零基础用户的混合版表达，字段解释更直白',
-                    '设置二级菜单中“帮助文档”持续位于“更新记录”上方，查阅路径更稳定',
+                    '"设置"二级菜单中"帮助文档"持续位于"更新记录"上方，查阅路径更稳定',
                     '提醒相关示例统一强调“循环提醒初始日期 + 循环频率 = 下次提醒日期”'
                 ]
             },
             {
-                version: 'v1.6.1', date: '2026-02-19', title: '设置体验优化 + 页面响应提升',
+                version: 'v1.8.1', date: '2026-02-19', title: '设置体验优化 + 页面响应提升',
                 changes: [
-                    '通用设置结构重整：按“仪表盘相关 / 列表页面相关”分组展示，查找更直观',
-                    '提醒能力整合：余量提醒阈值并入通用设置，避免多入口来回切换',
-                    '设置项顺序优化：仪表盘组内按“提醒显示范围 → 分类统计排序 → 余量提醒阈值”排列',
+                    '"通用设置"结构重整：按“仪表盘相关 / 列表页面相关”分组展示，查找更直观',
+                    '提醒能力整合：余量提醒阈值并入"通用设置"，避免多入口来回切换',
+                    '设置项顺序优化："仪表盘"组内按“提醒显示范围 → 分类统计排序 → 余量提醒阈值”排列',
                     '用户操作日志优化：仅显示业务描述，不再展示“当前返回多少条”',
                     '设置变更日志优化：只记录实际改动项，避免未改动项重复出现',
                     '下拉筛选与编辑表单的交互更顺滑，长时间停留页面时资源占用更稳定',
@@ -12887,54 +15112,54 @@ $currentUserJson = json_encode([
                 ]
             },
             {
-                version: 'v1.6.0', date: '2026-02-19', title: '仪表盘管理上线：提醒范围可配置 + 展示自适应优化',
+                version: 'v1.8.0', date: '2026-02-19', title: '"仪表盘"管理上线：提醒范围可配置 + 展示自适应优化',
                 changes: [
-                    '设置页新增“仪表盘管理”，可分别配置过期提醒与备忘提醒的显示时间范围',
+                    '"设置页"新增“仪表盘管理”，可分别配置过期提醒与备忘提醒的显示时间范围',
                     '过期提醒支持配置“过期 X 天到未来 X 天”；输入留空可按需改为不限制',
                     '备忘提醒支持配置“过期 X 天到未来 X 天”；输入留空可按需改为不限制',
                     '默认范围更新为：过期提醒“过期不限制，未来 60 天”；备忘提醒“过期不限制，未来 3 天”',
-                    '仪表盘提醒卡片网格升级为自适应铺满：仅在可容纳新卡片时自动增列，减少右侧空白',
+                    '"仪表盘"提醒卡片网格升级为自适应铺满：仅在可容纳新卡片时自动增列，减少右侧空白',
                     '提醒时间文案优化为单行显示，避免“已过期 X 天”在窄卡片中换行影响阅读'
                 ]
             },
             {
-                version: 'v1.5.2', date: '2026-02-19', title: '账号体验升级：注册双态提示 + 自定义验证问题',
+                version: 'v1.7.0', date: '2026-02-19', title: '账号体验升级：注册双态提示 + 自定义验证问题',
                 changes: [
-                    '注册页新增“开放注册/暂未开放”双态提示，登录页与注册页提示语分开显示，信息更清晰',
+                    '"注册页"新增“开放注册/暂未开放”双态提示，"登录页"与"注册页"提示语分开显示，信息更清晰',
                     '平台关闭注册时，仍保留“注册”入口，但创建账号按钮会禁用并显示关闭说明',
                     '注册关闭时不再展示用户名、密码等注册输入框，避免无效填写',
                     '注册验证问题新增“自定义问题”，可自行填写问题与答案，找回密码时可直接显示该问题',
-                    '用户管理卡片新增每位成员的操作日志条数，便于管理员快速判断活跃度'
+                    '"用户管理"卡片新增每位成员的操作日志条数，便于管理员快速判断活跃度'
                 ]
             },
             {
-                version: 'v1.5.1', date: '2026-02-18', title: '分类与位置体验升级：二级分类联动 + Emoji 图标分组 + 移动端优化',
+                version: 'v1.6.0', date: '2026-02-18', title: '分类与位置体验升级：二级分类联动 + Emoji 图标分组 + 移动端优化',
                 changes: [
                     '新增默认一级分类“食物”，并补齐常用一级分类的预设二级分类，开箱即可直接使用',
                     '二级分类升级为独立物品属性，在“编辑物品”和“已购买入库”流程中都可填写',
                     '二级分类与一级分类联动，只显示当前一级分类下的可选项，减少误选',
-                    '分类管理升级为一对多可视化视图，可直接查看一级分类与其二级分类关系',
+                    '"分类管理"升级为一对多可视化视图，可直接查看一级分类与其二级分类关系',
                     '分类图标改为可展开的分组 Emoji 选择面板，图标选择更直观',
                     '位置图标统一改为 Emoji 展示，列表、筛选和编辑流程保持一致',
                     '位置编辑弹窗新增分组 Emoji 选择能力，与分类编辑体验统一',
-                    '公共频道“加入购物清单”流程优化，加入动作更稳定，备注文案更清晰（如“1件”）',
-                    '公共频道权限体验优化：可清楚区分“仅发布者可编辑”与“其他用户可查看/评论”',
-                    '公共频道数据隔离优化，避免不同账号之间出现错误穿透',
-                    '移动端体验优化：日期输入框尺寸统一，分类管理与物品管理关键操作按钮改为纵向排布'
+                    '"公共频道"加入"购物清单"流程优化，加入动作更稳定，备注文案更清晰（如“1件”）',
+                    '"公共频道"权限体验优化：可清楚区分“仅发布者可编辑”与“其他用户可查看/评论”',
+                    '"公共频道"数据隔离优化，避免不同账号之间出现错误穿透',
+                    '移动端体验优化：日期输入框尺寸统一，"分类管理"与"物品管理"关键操作按钮改为纵向排布'
                 ]
             },
             {
-                version: 'v1.5.0', date: '2026-02-16', title: '公共频道升级：发布者编辑 + 推荐理由 + 评论协作',
+                version: 'v1.5.0', date: '2026-02-16', title: '"公共频道"升级：发布者编辑 + 推荐理由 + 评论协作',
                 changes: [
-                    '新增公共频道编辑能力：共享物品卡片支持“编辑”，仅发布者可修改名称、分类、购入价格、购入渠道与推荐理由',
-                    '公共频道新增“推荐理由”展示，帮助其他人更快判断是否值得购买',
-                    '新增公共频道评论能力：所有用户都可以发表评论，支持多人互动',
+                    '新增"公共频道"编辑能力：共享物品卡片支持“编辑”，仅发布者可修改名称、分类、购入价格、购入渠道与推荐理由',
+                    '"公共频道"新增“推荐理由”展示，帮助其他人更快判断是否值得购买',
+                    '新增"公共频道"评论能力：所有用户都可以发表评论，支持多人互动',
                     '新增评论删除能力：仅评论者本人或管理员可删除评论，评论区更可控',
                     '系统会根据身份自动显示可执行操作，减少误操作',
-                    '共享物品加入购物清单时会自动带上推荐理由，后续回看更直观',
-                    '共享物品下架后，相关评论会同步清理，公共频道保持整洁',
-                    '共享信息编辑流程更集中，维护公共频道内容更高效',
-                    '侧边栏信息架构微调：公共频道、位置管理、分类管理与设置分组顺序优化'
+                    '共享物品加入"购物清单"时会自动带上推荐理由，后续回看更直观',
+                    '共享物品下架后，相关评论会同步清理，"公共频道"保持整洁',
+                    '共享信息编辑流程更集中，维护"公共频道"内容更高效',
+                    '侧边栏信息架构微调："公共频道"、"位置管理"、"分类管理"与"设置"分组顺序优化'
                 ]
             },
             {
@@ -12944,53 +15169,53 @@ $currentUserJson = json_encode([
                     '新增管理员角色与默认管理员账号（admin），支持历史账号自动升级为管理员',
                     '注册流程新增验证问题与答案，用于后续密码找回',
                     '新增“忘记密码”流程：先查询验证问题，再校验答案并重置密码',
-                    '新增管理员“用户管理”页面：查看用户、角色、物品种类数/总件数、最近登录时间，并可重置用户密码'
+                    '新增管理员"用户管理"页面：查看用户、角色、物品种类数/总件数、最近登录时间，并可重置用户密码'
                 ]
             },
             {
-                version: 'v1.3.0', date: '2026-02-11', title: '购物清单增强 + 备忘提醒重构 + 交互统一',
+                version: 'v1.3.0', date: '2026-02-11', title: '"购物清单"增强 + 备忘提醒重构 + 交互统一',
                 changes: [
-                    '新增购物清单模块，支持预算、优先级、提醒日期与提醒备注',
-                    '仪表盘「循环提醒」更名为「备忘提醒」，合并展示循环提醒与购物清单提醒',
-                    '备忘提醒中的购物清单项支持「查看清单」直达并自动打开对应编辑弹窗',
+                    '新增"购物清单"模块，支持预算、优先级、提醒日期与提醒备注',
+                    '"仪表盘"「循环提醒」更名为「备忘提醒」，合并展示循环提醒与"购物清单"提醒',
+                    '备忘提醒中的"购物清单"项支持「查看清单」直达并自动打开对应编辑弹窗',
                     '编辑清单弹窗新增左下角「已购买入库」按钮，可直接进入该条目的入库流程',
                     '入库流程与物品编辑体验保持一致，提交后会自动移除对应清单项',
-                    '购物清单新增状态字段（待购买/待收货），并按状态分组显示（待购买在上）',
-                    '编辑清单新增状态切换按钮（已购买/待购买），点击后自动保存并关闭弹窗',
+                    '"购物清单"新增状态字段（待购买/待收货），并按状态分组显示（待购买在上）',
+                    '编辑清单新增状态切换按钮（转为已购买/转为待购买），点击后自动保存并关闭弹窗',
                     '待收货分组为空时不再显示“暂无待收货清单”占位文案',
                     '循环提醒支持待完成、已完成、撤销三种操作，处理更灵活',
                     '点击「待完成」后状态变为「已完成」，并自动生成下一次提醒记录',
                     '已完成状态新增「撤销」，可回滚为待完成并撤销对应生成的下一条提醒记录',
                     '物品编辑支持手动修改下次提醒日期，循环提醒字段布局与顺序统一优化',
                     '日期输入空值统一占位为 ____年/__月/__日，并修复空值/有值切换时输入框尺寸跳动',
-                    '优化位置管理描述显示、购物清单提醒备注单行截断、浅色模式中尺寸卡片操作区视觉',
-                    '修复浅色模式状态管理中图标下拉菜单背景过深问题，提升可读性',
+                    '优化"位置管理"描述显示、"购物清单"提醒备注单行截断、浅色模式中尺寸卡片操作区视觉',
+                    '修复浅色模式"状态管理"中图标下拉菜单背景过深问题，提升可读性',
                     '优化浅色模式下“查看清单/待完成/已完成/撤销”按钮文字与边框对比',
-                    '优化仪表盘过期提醒与备忘提醒卡片在深浅色模式下的配色协调性',
-                    '仪表盘备忘提醒新增分项统计（过期/循环/购物），分类统计与状态统计统一单位“件”'
+                    '优化"仪表盘"过期提醒与备忘提醒卡片在深浅色模式下的配色协调性',
+                    '"仪表盘"备忘提醒新增分项统计（过期/循环/购物），分类统计与状态统计统一单位“件”'
                 ]
             },
             {
-                version: 'v1.2.0', date: '2026-02-09', title: '数据管理增强 + 批量导入完善 + 仪表盘优化',
+                version: 'v1.2.0', date: '2026-02-09', title: '"数据管理"增强 + 批量导入完善 + "仪表盘"优化',
                 changes: [
-                    '设置菜单中的「导入/导出」统一改名为「数据管理」',
+                    '"设置"菜单中的「导入/导出」统一改名为"数据管理"',
                     '新增「物品数据重置」与「恢复默认环境」两项能力',
                     '重置或恢复默认时，历史图片会先进入回收区，降低误删风险',
-                    '新增购入渠道管理（默认：淘宝/京东/拼多多/闲鱼/官方渠道/线下/礼品），表单改为下拉选择',
-                    '移除位置上下级功能，位置管理统一为单级结构',
-                    '分类管理固定显示「未分类」、位置管理固定显示「未设定」，并支持一键查看对应物品',
-                    '物品管理过滤器新增「未分类 / 未设定」选项，便于筛出未绑定分类或位置的物品',
-                    '物品管理新增「过期管理」过滤按钮，一键筛选带过期日期的物品',
-                    '物品管理搜索栏支持属性关键词检索（分类/位置/购入渠道/备注/状态等），支持搜索按钮和 Enter 触发',
+                    '新增"购入渠道管理"（默认：淘宝/京东/拼多多/闲鱼/官方渠道/线下/礼品），表单改为下拉选择',
+                    '移除位置上下级功能，"位置管理"统一为单级结构',
+                    '"分类管理"固定显示「未分类」、"位置管理"固定显示「未设定」，并支持一键查看对应物品',
+                    '"物品管理"过滤器新增「未分类 / 未设定」选项，便于筛出未绑定分类或位置的物品',
+                    '"物品管理"新增「过期管理」过滤按钮，一键筛选带过期日期的物品',
+                    '"物品管理"搜索栏支持属性关键词检索（分类/位置/购入渠道/备注/状态等），支持搜索按钮和 Enter 触发',
                     '物品排序新增名称 Z-A、价格低→高、数量少→多、最早更新/添加、过期日期近→远与远→近（空过期日期自动置后）',
-                    '分类管理与位置管理新增排序按钮；下拉层级遮挡问题已修复，并默认跟随系统排序设置',
+                    '"分类管理"与"位置管理"新增排序按钮；下拉层级遮挡问题已修复，并默认跟随系统排序设置',
                     '导出文件名精确到秒，并支持按需导出图片',
                     '导入时可同时恢复已导出的图片内容',
                     '新增手动批量导入（CSV 模板），模板示例明确必填与可选项',
                     '批量导入日期支持多种常见写法，错误行会自动跳过并提示',
                     '导入时分类/位置/购入渠道/状态支持模糊匹配已有值，不存在时自动回退默认值',
-                    '仪表盘新增状态统计；分类统计可直接看到未分类件数，并聚焦在使用中的物品',
-                    '仪表盘「过期提醒」「状态统计」在无数据时也保持显示空态，不再整块隐藏',
+                    '"仪表盘"新增状态统计；分类统计可直接看到未分类件数，并聚焦在使用中的物品',
+                    '"仪表盘"「过期提醒」「状态统计」在无数据时也保持显示空态，不再整块隐藏',
                     '浅色模式下优化过期提醒卡片与时间文字、分类进度条背景，降低突兀感',
                     '状态图标选择器升级为可视化下拉（图标 + 名称）'
                 ]
@@ -12999,18 +15224,18 @@ $currentUserJson = json_encode([
                 version: 'v1.1.0', date: '2026-02-08', title: '核心功能完善与交互优化',
                 changes: [
                     '新增过期日期字段、过期提醒板块与三级过期视觉状态',
-                    '新增排序设置（仪表盘/物品/分类/位置）并持久化保存',
+                    '新增排序设置（"仪表盘"/"物品管理"/"分类管理"/"位置管理"）并持久化保存',
                     '新增复制物品、一键从分类/位置跳转筛选物品',
-                    '新增回收站（软删除、恢复、彻底删除、清空）与回收站详情',
-                    '侧边栏设置菜单重构，更新记录独立页面，Logo 旁显示版本号',
-                    '仪表盘与最近更新区域布局优化，物品视图支持大/中/小尺寸切换',
-                    '物品管理支持按状态分组显示，空状态组自动隐藏',
-                    '新增状态管理（新增/删除）并支持编辑状态名称、图标、颜色',
+                    '新增"回收站"（软删除、恢复、彻底删除、清空）与"回收站"详情',
+                    '侧边栏"设置"菜单重构，"更新记录"独立页面，Logo 旁显示版本号',
+                    '"仪表盘"与最近更新区域布局优化，物品视图支持大/中/小尺寸切换',
+                    '"物品管理"支持按状态分组显示，空状态组自动隐藏',
+                    '新增"状态管理"（新增/删除）并支持编辑状态名称、图标、颜色',
                     '新增属性显示控制（分类/位置/件数/价格/过期日期/购入渠道/备注）',
                     '新增购入渠道与备注字段，物品表单布局优化为 3 列',
                     '新增筛选栏重置按钮与属性按钮样式优化',
                     '列表切换与编辑流程更顺滑，并尽量保持当前浏览位置',
-                    '状态管理支持编辑已有状态（名称、图标、颜色）',
+                    '"状态管理"支持编辑已有状态（名称、图标、颜色）',
                     '物品卡片中件数显示位置调整到分类前面，并修复部分显示与编辑回填问题',
                 ]
             },
@@ -13018,9 +15243,9 @@ $currentUserJson = json_encode([
                 version: 'v1.0.0', date: '2026-02-08', title: '初始版本发布',
                 changes: [
                     '完整的物品增删改查功能',
-                    '仪表盘统计面板 + 分类进度条',
-                    '分类管理（Emoji 图标 + 自定义颜色）',
-                    '位置管理（单级结构）',
+                    '"仪表盘"统计面板 + 分类进度条',
+                    '"分类管理"（Emoji 图标 + 自定义颜色）',
+                    '"位置管理"（单级结构）',
                     '图片上传与预览',
                     '全局搜索 + 多维度筛选 + 多种排序',
                     '数据导出（JSON/CSV）与导入',
@@ -13034,10 +15259,15 @@ $currentUserJson = json_encode([
             '右上角用户名菜单里的「帮助模式」默认已开启，看到字段名后的 ?，鼠标悬停即可查看说明。',
             '先进入「分类管理」和「位置管理」，补齐你家里常用的分类与存放位置。',
             '在「状态管理」「购入渠道管理」里先把常用选项配好，后续录入会更快。',
-            '点击右上角「添加物品」，建议按“名称 → 分类/位置 → 余量/数量 → 价格/渠道”顺序填写。',
+            '点击右上角「添加物品」，建议按“名称 → 分类/位置 → 余量/数量 → 价格/渠道 → 日期/保质期”顺序填写。',
+            '日期输入支持两种方式：可直接输入 6-8 位数字（8位 YYYYMMDD、7位 YYYYMDD、6位 YYMMDD，6位会自动转 20YY）并在失焦后标准化为 YYYY-MM-DD，也可点击输入框右侧日历按钮手动选择。',
             '「余量」支持留空：留空时不会触发低余量提醒，后续可在编辑里再补。',
+            '填写了“生产日期 + 保质期”后，系统会自动更新“过期日期”；留空保质期时可手动填过期日期。',
             '要用循环提醒时，先填「循环提醒初始日期」，再填「循环频率」，系统会自动算出「下次提醒日期」。',
             '需要采购时先记到「购物清单」，买完后点「已购买入库」可直接转成物品。',
+            '编辑购物清单时，可用左下角「转为已购买 / 转为待购买」按钮快速切换采购进度。',
+            '在「集合清单」里可按场景归集已有物品（如上班要带、露营要带、大扫除要买），并可用备注记录要点、用搜索/过滤/排序后批量加入。',
+            '“集合清单”里的旗标可用于标记“已经携带”或“特别提醒”的物品，便于临出门前快速核对。',
             '多人协作时勾选「共享到公共频道」，其他成员可查看、评论并加入自己的购物清单。',
             '定期到「数据管理」做导出备份，重置或恢复默认环境前先备份。'
         ];
@@ -13046,6 +15276,7 @@ $currentUserJson = json_encode([
             { name: '物品管理', desc: '添加、编辑、删除物品，支持筛选、排序、复制和回收站。' },
             { name: '购物清单', desc: '记录待买和待收货商品，设置优先级、预算和提醒，并可一键入库。' },
             { name: '任务清单', desc: '多人任务协作，支持待办/完成切换、编辑、删除。' },
+            { name: '集合清单', desc: '把已存在物品按场景归集成清单，支持批量加入、旗标标记、快速移除和一键查看详情。' },
             { name: '公共频道', desc: '分享推荐物品、填写推荐理由、评论互动，并可加入自己的购物清单。' },
             { name: '分类管理', desc: '维护一级/二级分类、图标和颜色，方便统一管理。' },
             { name: '位置管理', desc: '维护存放位置、图标与描述，支持按位置追踪物品。' },
@@ -13065,12 +15296,14 @@ $currentUserJson = json_encode([
                     { name: '余量 / 数量', desc: '数量=总共有多少，余量=现在还剩多少；例如买 10 个还剩 3 个，就填 3 / 10。余量留空=不启用低余量提醒。' },
                     { name: '购入价格', desc: '购买价格，方便后续比价和预算回顾。留空按 0 处理。' },
                     { name: '购入渠道', desc: '在哪里买的，方便下次复购。留空则记为未设置。' },
-                    { name: '购入日期', desc: '什么时候买的，不确定可留空。' },
-                    { name: '过期日期', desc: '填写后会自动进入到期提醒；留空则不提醒。' },
+                    { name: '购入日期', desc: '什么时候买的，不确定可留空。支持 6-8 位数字输入（8位 YYYYMMDD、7位 YYYYMDD、6位 YYMMDD 自动转 20YY）并标准化为 YYYY-MM-DD，也可点右侧日历按钮选择。' },
                     { name: '条码/序列号', desc: '用于盘点、对账或售后，可不填。' },
-                    { name: '循环提醒初始日期', desc: '第一次提醒从哪一天开始算；留空=不开启循环提醒（例如填“滤芯安装日”）。' },
+                    { name: '生产日期', desc: '与保质期一起用于自动推算过期日期；可留空。支持 6-8 位数字输入（8位 YYYYMMDD、7位 YYYYMDD、6位 YYMMDD 自动转 20YY）并标准化为 YYYY-MM-DD，也可点右侧日历按钮选择。' },
+                    { name: '保质期（数字 + 天/周/月/年）', desc: '填写后会根据生产日期自动计算过期日期；只填一部分时不会自动推算。' },
+                    { name: '过期日期', desc: '可手动填写；当“生产日期 + 保质期”完整时会自动更新。留空则不提醒。支持 6-8 位数字输入（8位 YYYYMMDD、7位 YYYYMDD、6位 YYMMDD 自动转 20YY）并标准化为 YYYY-MM-DD，也可点右侧日历按钮选择。' },
+                    { name: '循环提醒初始日期', desc: '第一次提醒从哪一天开始算；留空=不开启循环提醒（例如填“滤芯安装日”）。支持 6-8 位数字输入（8位 YYYYMMDD、7位 YYYYMDD、6位 YYMMDD 自动转 20YY）并标准化为 YYYY-MM-DD，也可点右侧日历按钮选择。' },
                     { name: '循环频率（每 X 天/周/年）', desc: '这个频率是基于“循环提醒初始日期”来计算下次提醒日期的；未填初始日期时不生效。' },
-                    { name: '下次提醒日期', desc: '本次即将提醒的日期，通常由系统自动生成和更新，也可以手动改。' },
+                    { name: '下次提醒日期', desc: '本次即将提醒的日期，通常由系统自动生成和更新，也可以手动改。支持 6-8 位数字输入（8位 YYYYMMDD、7位 YYYYMDD、6位 YYMMDD 自动转 20YY）并标准化为 YYYY-MM-DD，也可点右侧日历按钮选择。' },
                     { name: '循环提醒备注', desc: '提醒弹出时要做什么，例如“更换滤芯”；留空也可以。' },
                     { name: '标签（逗号分隔）', desc: '多个关键词用逗号分隔，便于快速搜索；可留空。' },
                     { name: '备注', desc: '其他补充信息都可以写这里，可留空。' },
@@ -13084,12 +15317,24 @@ $currentUserJson = json_encode([
                 fields: [
                     { name: '名称（必填）', desc: '写你准备购买的商品名称。' },
                     { name: '计划数量', desc: '计划买几件。' },
-                    { name: '状态', desc: '待购买=还没下单；待收货=已下单但还没到货。' },
+                    { name: '状态', desc: '待购买=还没下单；待收货=已下单但还没到货。编辑态可点“转为已购买/转为待购买”快速切换。' },
                     { name: '优先级', desc: '高优先表示更急，建议先买。' },
                     { name: '预算单价', desc: '预计单价，用来估算总预算。留空按 0 处理。' },
-                    { name: '提醒日期', desc: '到了这一天系统会提醒你处理这条清单；留空则不提醒。' },
+                    { name: '提醒日期', desc: '到了这一天系统会提醒你处理这条清单；留空则不提醒。支持 6-8 位数字输入（8位 YYYYMMDD、7位 YYYYMDD、6位 YYMMDD 自动转 20YY）并标准化为 YYYY-MM-DD，也可点右侧日历按钮选择。' },
                     { name: '提醒备注', desc: '提醒时显示的补充说明；留空则只显示清单名称。' },
                     { name: '备注', desc: '可记录品牌、型号、链接、比价结论，可留空。' }
+                ]
+            },
+            {
+                title: '集合清单字段（集合清单）',
+                icon: 'ri-layout-grid-line',
+                fields: [
+                    { name: '集合名称（必填）', desc: '按使用场景命名，例如“上班要带”“周末露营要带”。' },
+                    { name: '集合说明', desc: '补充该集合的用途说明，便于快速识别。' },
+                    { name: '集合备注', desc: '记录这个集合的执行要点或提醒；可在编辑集合时修改。' },
+                    { name: '批量选择加入（搜索/过滤/排序）', desc: '可按关键词、分类、状态筛选，再按名称排序后批量加入。' },
+                    { name: '旗标', desc: '你可以用它来标记是否已经携带，也可以用它来作为特别提醒。' },
+                    { name: '移出集合', desc: '把不需要的物品从当前集合中移除，不影响原始物品数据。' }
                 ]
             },
             {
@@ -13537,6 +15782,61 @@ $currentUserJson = json_encode([
     `;
         }
 
+        const CHANGELOG_SECTION_META = [
+            { key: 'features', label: '新功能', icon: 'ri-sparkling-line', toneClass: 'text-cyan-300' },
+            { key: 'optimizations', label: '逻辑变更与优化', icon: 'ri-loop-right-line', toneClass: 'text-emerald-300' },
+            { key: 'fixes', label: 'bug修复', icon: 'ri-bug-line', toneClass: 'text-rose-300' }
+        ];
+
+        function emptyChangelogSections() {
+            return { features: [], optimizations: [], fixes: [] };
+        }
+
+        function classifyChangelogChange(changeText) {
+            const text = String(changeText || '').trim();
+            if (!text)
+                return 'optimizations';
+            if (/(修复|修正|解决|避免|异常|失败|错误|兼容|兜底|恢复|bug|BUG|穿透|溢出|错位|无响应|跳动|不再)/.test(text))
+                return 'fixes';
+            if (/(新增|增加|上线|引入|开放|支持|提供|新增“|新增「|新增模块|新增能力)/.test(text))
+                return 'features';
+            return 'optimizations';
+        }
+
+        function normalizeChangelogSections(log) {
+            const normalized = emptyChangelogSections();
+            if (log && log.sections && typeof log.sections === 'object') {
+                normalized.features = Array.isArray(log.sections.features) ? log.sections.features.filter(Boolean) : [];
+                normalized.optimizations = Array.isArray(log.sections.optimizations) ? log.sections.optimizations.filter(Boolean) : [];
+                normalized.fixes = Array.isArray(log.sections.fixes) ? log.sections.fixes.filter(Boolean) : [];
+                if (normalized.features.length > 0 || normalized.optimizations.length > 0 || normalized.fixes.length > 0) {
+                    return normalized;
+                }
+            }
+
+            const changes = Array.isArray(log?.changes) ? log.changes : [];
+            changes.forEach(change => {
+                const key = classifyChangelogChange(change);
+                normalized[key].push(change);
+            });
+            return normalized;
+        }
+
+        function renderChangelogSections(log) {
+            const sections = normalizeChangelogSections(log);
+            return CHANGELOG_SECTION_META.map((meta, idx) => {
+                const items = Array.isArray(sections[meta.key]) ? sections[meta.key] : [];
+                const contentHtml = items.length > 0
+                    ? `<ul class="space-y-1.5">${items.map(c => `<li class="text-xs text-slate-400 flex gap-2"><span class="text-slate-600 flex-shrink-0">•</span><span>${esc(c)}</span></li>`).join('')}</ul>`
+                    : '<p class="text-xs text-slate-600">暂无</p>';
+                return `
+                    <div class="${idx > 0 ? 'mt-3' : ''}">
+                        <p class="text-[11px] ${meta.toneClass} mb-1 flex items-center gap-1"><i class="${meta.icon}"></i>${meta.label}</p>
+                        ${contentHtml}
+                    </div>`;
+            }).join('');
+        }
+
         function renderChangelog(container) {
             container.innerHTML = `
         <div class="max-w-2xl mx-auto space-y-6">
@@ -13552,10 +15852,7 @@ $currentUserJson = json_encode([
                             <span class="px-2 py-0.5 rounded-md text-xs font-mono font-semibold ${idx === 0 ? 'bg-sky-500/20 text-sky-400' : 'bg-white/5 text-slate-400'}">${log.version}</span>
                             <span class="text-xs text-slate-500">${log.date}</span>
                         </div>
-                        <h4 class="text-sm font-medium text-white mb-2">${esc(log.title)}</h4>
-                        <ul class="space-y-1">
-                            ${log.changes.map(c => `<li class="text-xs text-slate-400 flex gap-2"><span class="text-slate-600 flex-shrink-0">•</span><span>${esc(c)}</span></li>`).join('')}
-                        </ul>
+                        ${renderChangelogSections(log)}
                     </div>`).join('')}
                 </div>
             </div>
@@ -14118,6 +16415,14 @@ $currentUserJson = json_encode([
             if (unit === 'week') return `每 ${n} 周`;
             if (unit === 'year') return `每 ${n} 年`;
             return '未设置周期';
+        }
+        function shelfLifeLabel(value, unit) {
+            const n = Math.max(1, Number(value || 1));
+            if (unit === 'day') return `${n} 天`;
+            if (unit === 'week') return `${n} 周`;
+            if (unit === 'month') return `${n} 个月`;
+            if (unit === 'year') return `${n} 年`;
+            return `${n}`;
         }
         function reminderDueLabel(dateStr) {
             const days = daysUntilReminder(dateStr);
