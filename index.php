@@ -6166,6 +6166,10 @@ $currentUserJson = json_encode([
             display: flex;
             align-items: center;
             justify-content: center;
+            padding: 12px;
+            overflow-y: auto;
+            overscroll-behavior: contain;
+            -webkit-overflow-scrolling: touch;
             opacity: 0;
             pointer-events: none;
             transition: opacity 0.25s;
@@ -6183,13 +6187,20 @@ $currentUserJson = json_encode([
             width: 95%;
             max-width: 720px;
             max-height: 90vh;
+            max-height: calc(100dvh - 24px);
             overflow-y: auto;
+            overscroll-behavior: contain;
+            -webkit-overflow-scrolling: touch;
             transform: translateY(20px);
             transition: transform 0.25s;
         }
 
         .modal-overlay.show .modal-box {
             transform: translateY(0);
+        }
+
+        .modal-form-actions {
+            background: transparent;
         }
 
         /* 状态徽标 */
@@ -7700,6 +7711,31 @@ $currentUserJson = json_encode([
                 padding-bottom: 0 !important;
             }
 
+            .modal-overlay {
+                align-items: flex-start;
+            }
+
+            .modal-box {
+                width: 100%;
+                margin: 0 auto;
+                max-height: calc(100dvh - 24px);
+            }
+
+            .modal-form-actions {
+                position: sticky;
+                bottom: 0;
+                z-index: 5;
+                margin-top: 16px;
+                padding-top: 12px;
+                padding-bottom: calc(8px + env(safe-area-inset-bottom));
+                background: linear-gradient(180deg, rgba(30, 41, 59, 0) 0%, rgba(30, 41, 59, 0.92) 26%);
+                backdrop-filter: blur(2px);
+            }
+
+            body.light .modal-form-actions {
+                background: linear-gradient(180deg, rgba(255, 255, 255, 0) 0%, rgba(255, 255, 255, 0.94) 26%);
+            }
+
             .categories-header {
                 flex-direction: column;
                 align-items: stretch;
@@ -7966,7 +8002,7 @@ $currentUserJson = json_encode([
                         <div class="flex items-end gap-2">
                             <div class="flex-1">
                                 <label class="block text-sm text-slate-400 mb-1.5">余量</label>
-                                <input type="number" id="itemRemainingCurrent" class="input !px-3 text-center" value="0" min="0" step="1" inputmode="numeric">
+                                <input type="number" id="itemRemainingCurrent" class="input !px-3 text-center" value="" min="0" step="1" inputmode="numeric" placeholder="留空不提醒">
                             </div>
                             <span class="text-slate-500 text-sm font-mono pb-2 text-center">/</span>
                             <div class="flex-1">
@@ -8048,7 +8084,7 @@ $currentUserJson = json_encode([
                             onchange="handleImageUpload(this)">
                     </div>
                 </div>
-                <div class="flex justify-end gap-3 mt-6 pt-4 border-t border-white/5">
+                <div class="modal-form-actions flex justify-end gap-3 mt-6 pt-4 border-t border-white/5">
                     <button type="button" onclick="closeItemModal()" class="btn btn-ghost">取消</button>
                     <button type="submit" class="btn btn-primary"><i class="ri-save-line"></i><span id="itemSubmitLabel">保存</span></button>
                 </div>
@@ -8131,7 +8167,7 @@ $currentUserJson = json_encode([
                         </div>
                     </div>
                 </div>
-                <div class="flex items-center justify-between gap-3 mt-6 pt-4 border-t border-white/5">
+                <div class="modal-form-actions flex items-center justify-between gap-3 mt-6 pt-4 border-t border-white/5">
                     <div class="flex items-center gap-2">
                         <button type="button" id="shoppingConvertBtn" onclick="convertCurrentShoppingItem()"
                             class="btn btn-primary hidden"><i class="ri-shopping-bag-3-line"></i>已购买入库</button>
@@ -8280,29 +8316,29 @@ $currentUserJson = json_encode([
             itemSubcategory: '在大类下再细分一层，不需要时可以不选。',
             itemLocation: '填写物品放在哪里，例如“厨房上柜”“书房抽屉”。',
             itemStatus: '表示当前情况，例如“使用中”“已归档”“已转卖”。',
-            itemRemainingCurrent: '当前还剩多少。比如买了 10 个还剩 3 个，这里填 3。',
-            itemQuantity: '总共买了多少。比如一共买了 10 个，这里填 10。',
-            itemPrice: '购买价格，可用于后续比价和预算回顾。',
-            itemPurchaseFrom: '在哪里买的，例如京东、淘宝、线下门店。',
+            itemRemainingCurrent: '当前还剩多少。比如买了 10 个还剩 3 个，这里填 3。如果留空则不设提醒。',
+            itemQuantity: '总共买了多少。比如一共买了 10 个，这里填 10。留空会按 0 处理。',
+            itemPrice: '购买价格，可用于后续比价和预算回顾。留空会按 0 处理。',
+            itemPurchaseFrom: '在哪里买的，例如京东、淘宝、线下门店。留空则记为未设置。',
             itemDate: '购买日期，不确定时可以留空。',
-            itemExpiry: '到期日期。填写后会在仪表盘里自动出现到期提醒。',
-            itemBarcode: '商品条码或序列号，用于盘点、对账或售后。',
+            itemExpiry: '到期日期。填写后会在仪表盘里自动出现到期提醒；留空则不提醒。',
+            itemBarcode: '商品条码或序列号，用于盘点、对账或售后。可留空。',
             itemReminderDate: '循环提醒从哪一天开始算。留空表示不启用循环提醒。',
-            itemReminderEvery: '这是提醒频率数字，会基于“循环提醒初始日期”计算下次提醒日期。',
-            itemReminderUnit: '这是提醒频率单位（天/周/年），与上面的数字一起决定提醒周期。',
+            itemReminderEvery: '这是提醒频率数字，会基于“循环提醒初始日期”计算下次提醒日期。未填初始日期时此项不生效。',
+            itemReminderUnit: '这是提醒频率单位（天/周/年），与上面的数字一起决定提醒周期。未填初始日期时此项不生效。',
             itemReminderNext: '到这个日期的时候，系统会自动创建一条提醒显示在仪表盘中。日期为自动生成和更新，也可以手动更改。',
-            itemReminderNote: '提醒弹出时要做什么，例如“更换滤芯”“会员续费”。',
-            itemTags: '关键词标签，多个标签用逗号分隔，方便以后搜索。',
-            itemNotes: '其他补充说明，想记什么都可以写这里。',
+            itemReminderNote: '提醒弹出时要做什么，例如“更换滤芯”“会员续费”。可留空。',
+            itemTags: '关键词标签，多个标签用逗号分隔，方便以后搜索。可留空。',
+            itemNotes: '其他补充说明，想记什么都可以写这里。可留空。',
             itemSharePublic: '打开后，这件物品会显示到公共频道给其他用户参考。',
             shoppingName: '写你准备购买的商品名称。',
             shoppingQty: '计划买几件。',
             shoppingStatus: '采购进度：待购买=还没下单；待收货=已下单等待到货。',
             shoppingPriority: '紧急程度。高优先会更醒目，便于先处理。',
-            shoppingPrice: '预计单价，用来估算总预算，可不填。',
-            shoppingReminderDate: '到这个日期会提醒你处理这条清单。',
-            shoppingReminderNote: '提醒时想看到的说明，例如“今晚活动结束”。',
-            shoppingNotes: '采购补充信息，如品牌、型号、链接、比价结果。',
+            shoppingPrice: '预计单价，用来估算总预算。留空会按 0 处理。',
+            shoppingReminderDate: '到这个日期会提醒你处理这条清单。留空则不提醒。',
+            shoppingReminderNote: '提醒时想看到的说明，例如“今晚活动结束”。可留空。',
+            shoppingNotes: '采购补充信息，如品牌、型号、链接、比价结果。可留空。',
             catName: '分类名称，建议用你日常会搜索的词。',
             catParentId: '不选就是一级分类；选择后会变成该分类下的二级分类。',
             catColor: '分类显示颜色，只影响界面展示。',
@@ -8331,19 +8367,19 @@ $currentUserJson = json_encode([
             二级分类: '在一级分类下继续细分，不选也可以。',
             位置: '记录这件物品放在哪里。',
             状态: '表示当前情况，如使用中、已归档。',
-            余量: '当前剩余可用数量。',
-            数量: '这件物品的总数量。',
-            购入价格: '购买价格，可用于比价和预算回看。',
-            购入渠道: '在哪里购买的，例如京东、淘宝、线下。',
+            余量: '当前还剩多少。比如买了 10 个还剩 3 个，这里填 3。如果留空则不设提醒。',
+            数量: '这件物品的总数量。留空会按 0 处理。',
+            购入价格: '购买价格，可用于比价和预算回看。留空会按 0 处理。',
+            购入渠道: '在哪里购买的，例如京东、淘宝、线下。留空则记为未设置。',
             购入日期: '购买日期，不确定可以留空。',
-            过期日期: '设置后会自动进入到期提醒。',
-            条码序列号: '用于盘点、对账或售后。',
+            过期日期: '设置后会自动进入到期提醒。留空则不提醒。',
+            条码序列号: '用于盘点、对账或售后，可留空。',
             循环提醒初始日期: '循环提醒从这一天开始计算。',
-            循环频率: '这是基于“循环提醒初始日期”来计算下次提醒日期的频率。',
+            循环频率: '这是基于“循环提醒初始日期”来计算下次提醒日期的频率；留空初始日期时不生效。',
             下次提醒日期: '到这个日期的时候，系统会自动创建一条提醒显示在仪表盘中。日期为自动生成和更新，也可以手动更改。',
-            循环提醒备注: '提醒触发时要做什么。',
-            标签逗号分隔: '可填写多个关键词，便于搜索。',
-            备注: '其他补充说明。',
+            循环提醒备注: '提醒触发时要做什么，可留空。',
+            标签逗号分隔: '可填写多个关键词，便于搜索；留空也可以。',
+            备注: '其他补充说明，留空也可以。',
             共享到公共频道: '开启后会把物品基础信息共享到公共频道。',
             开放注册: '平台注册策略开关。启用后允许自助注册；关闭后仅既有账号可登录。'
         };
@@ -10669,7 +10705,7 @@ $currentUserJson = json_encode([
             document.getElementById('itemSourceShoppingId').value = '';
             document.getElementById('itemSharePublic').checked = false;
             document.getElementById('itemQuantity').value = '1';
-            document.getElementById('itemRemainingCurrent').value = '0';
+            document.getElementById('itemRemainingCurrent').value = '';
             document.getElementById('itemPrice').value = '0';
             document.getElementById('itemExpiry').value = '';
             document.getElementById('itemReminderDate').value = '';
@@ -11638,7 +11674,7 @@ $currentUserJson = json_encode([
             document.getElementById('itemName').value = item.name || '';
             const convertedQty = Math.max(1, Number(item.quantity || 1));
             document.getElementById('itemQuantity').value = convertedQty;
-            document.getElementById('itemRemainingCurrent').value = convertedQty;
+            document.getElementById('itemRemainingCurrent').value = '';
             document.getElementById('itemPrice').value = Math.max(0, Number(item.planned_price || 0));
             document.getElementById('itemDate').value = today;
             document.getElementById('itemExpiry').value = '';
@@ -12999,6 +13035,7 @@ $currentUserJson = json_encode([
             '先进入「分类管理」和「位置管理」，补齐你家里常用的分类与存放位置。',
             '在「状态管理」「购入渠道管理」里先把常用选项配好，后续录入会更快。',
             '点击右上角「添加物品」，建议按“名称 → 分类/位置 → 余量/数量 → 价格/渠道”顺序填写。',
+            '「余量」支持留空：留空时不会触发低余量提醒，后续可在编辑里再补。',
             '要用循环提醒时，先填「循环提醒初始日期」，再填「循环频率」，系统会自动算出「下次提醒日期」。',
             '需要采购时先记到「购物清单」，买完后点「已购买入库」可直接转成物品。',
             '多人协作时勾选「共享到公共频道」，其他成员可查看、评论并加入自己的购物清单。',
@@ -13025,18 +13062,18 @@ $currentUserJson = json_encode([
                     { name: '分类 / 二级分类', desc: '先选大类，再按需要选小类；不选二级分类也可以。' },
                     { name: '位置', desc: '填物品放在哪里，例如“厨房上柜”“书房抽屉”。' },
                     { name: '状态', desc: '表示当前情况，例如“使用中”“已归档”。' },
-                    { name: '余量 / 数量', desc: '数量=总共有多少，余量=现在还剩多少；例如买 10 个还剩 3 个，就填 3 / 10。' },
-                    { name: '购入价格', desc: '购买价格，方便后续比价和预算回顾。' },
-                    { name: '购入渠道', desc: '在哪里买的，方便下次复购。' },
+                    { name: '余量 / 数量', desc: '数量=总共有多少，余量=现在还剩多少；例如买 10 个还剩 3 个，就填 3 / 10。余量留空=不启用低余量提醒。' },
+                    { name: '购入价格', desc: '购买价格，方便后续比价和预算回顾。留空按 0 处理。' },
+                    { name: '购入渠道', desc: '在哪里买的，方便下次复购。留空则记为未设置。' },
                     { name: '购入日期', desc: '什么时候买的，不确定可留空。' },
-                    { name: '过期日期', desc: '填写后会自动进入到期提醒。' },
+                    { name: '过期日期', desc: '填写后会自动进入到期提醒；留空则不提醒。' },
                     { name: '条码/序列号', desc: '用于盘点、对账或售后，可不填。' },
                     { name: '循环提醒初始日期', desc: '第一次提醒从哪一天开始算；留空=不开启循环提醒（例如填“滤芯安装日”）。' },
-                    { name: '循环频率（每 X 天/周/年）', desc: '这个频率是基于“循环提醒初始日期”来计算下次提醒日期的。' },
+                    { name: '循环频率（每 X 天/周/年）', desc: '这个频率是基于“循环提醒初始日期”来计算下次提醒日期的；未填初始日期时不生效。' },
                     { name: '下次提醒日期', desc: '本次即将提醒的日期，通常由系统自动生成和更新，也可以手动改。' },
-                    { name: '循环提醒备注', desc: '提醒弹出时要做什么，例如“更换滤芯”。' },
-                    { name: '标签（逗号分隔）', desc: '多个关键词用逗号分隔，便于快速搜索。' },
-                    { name: '备注', desc: '其他补充信息都可以写这里。' },
+                    { name: '循环提醒备注', desc: '提醒弹出时要做什么，例如“更换滤芯”；留空也可以。' },
+                    { name: '标签（逗号分隔）', desc: '多个关键词用逗号分隔，便于快速搜索；可留空。' },
+                    { name: '备注', desc: '其他补充信息都可以写这里，可留空。' },
                     { name: '图片', desc: '上传物品照片或票据，方便识别和回看。' },
                     { name: '共享到公共频道', desc: '勾选后会分享给其他成员查看。' }
                 ]
@@ -13049,10 +13086,10 @@ $currentUserJson = json_encode([
                     { name: '计划数量', desc: '计划买几件。' },
                     { name: '状态', desc: '待购买=还没下单；待收货=已下单但还没到货。' },
                     { name: '优先级', desc: '高优先表示更急，建议先买。' },
-                    { name: '预算单价', desc: '预计单价，用来估算总预算。' },
-                    { name: '提醒日期', desc: '到了这一天系统会提醒你处理这条清单。' },
-                    { name: '提醒备注', desc: '提醒时显示的补充说明。' },
-                    { name: '备注', desc: '可记录品牌、型号、链接、比价结论。' }
+                    { name: '预算单价', desc: '预计单价，用来估算总预算。留空按 0 处理。' },
+                    { name: '提醒日期', desc: '到了这一天系统会提醒你处理这条清单；留空则不提醒。' },
+                    { name: '提醒备注', desc: '提醒时显示的补充说明；留空则只显示清单名称。' },
+                    { name: '备注', desc: '可记录品牌、型号、链接、比价结论，可留空。' }
                 ]
             },
             {
