@@ -113,6 +113,7 @@ function getAuthDB()
             category_name TEXT DEFAULT '',
             purchase_price REAL DEFAULT 0,
             purchase_from TEXT DEFAULT '',
+            purchase_link TEXT DEFAULT '',
             recommend_reason TEXT DEFAULT '',
             owner_item_updated_at TEXT DEFAULT '',
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -168,6 +169,10 @@ function getAuthDB()
         $initRegistrationStmt->execute([ALLOW_PUBLIC_REGISTRATION ? '1' : '0']);
         try {
             $authDb->exec("ALTER TABLE public_shared_items ADD COLUMN recommend_reason TEXT DEFAULT ''");
+        } catch (Exception $e) {
+        }
+        try {
+            $authDb->exec("ALTER TABLE public_shared_items ADD COLUMN purchase_link TEXT DEFAULT ''");
         } catch (Exception $e) {
         }
         try {
@@ -1344,6 +1349,46 @@ function makeUniqueImportImageFilename($originalName)
     return $candidate;
 }
 
+function ensureDemoImageAssets()
+{
+    if (!is_dir(UPLOAD_DIR) && !@mkdir(UPLOAD_DIR, 0755, true)) {
+        return [];
+    }
+
+    $assets = [
+        'device_laptop' => [
+            'filename' => 'demo_device_laptop.svg',
+            'content' => '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 900"><defs><linearGradient id="bgA" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#0ea5e9"/><stop offset="100%" stop-color="#1e3a8a"/></linearGradient></defs><rect width="1200" height="900" fill="url(#bgA)"/><rect x="180" y="170" width="840" height="500" rx="34" fill="#0f172a" stroke="#7dd3fc" stroke-width="8"/><rect x="225" y="215" width="750" height="380" rx="16" fill="#0b1120"/><circle cx="600" cy="405" r="92" fill="#38bdf8" fill-opacity="0.2"/><path d="M600 338l20 44 49 7-35 35 8 49-42-24-42 24 8-49-35-35 49-7z" fill="#7dd3fc"/><rect x="120" y="680" width="960" height="70" rx="35" fill="#e2e8f0"/><text x="600" y="804" text-anchor="middle" fill="#e0f2fe" font-size="56" font-family="Arial, sans-serif">Work Device</text></svg>'
+        ],
+        'home_filter' => [
+            'filename' => 'demo_home_filter.svg',
+            'content' => '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 900"><defs><linearGradient id="bgB" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#22c55e"/><stop offset="100%" stop-color="#14532d"/></linearGradient></defs><rect width="1200" height="900" fill="url(#bgB)"/><rect x="260" y="130" width="680" height="650" rx="70" fill="#052e16" stroke="#86efac" stroke-width="12"/><rect x="330" y="220" width="540" height="430" rx="40" fill="#064e3b"/><g stroke="#34d399" stroke-width="8"><line x1="380" y1="250" x2="380" y2="620"/><line x1="445" y1="250" x2="445" y2="620"/><line x1="510" y1="250" x2="510" y2="620"/><line x1="575" y1="250" x2="575" y2="620"/><line x1="640" y1="250" x2="640" y2="620"/><line x1="705" y1="250" x2="705" y2="620"/><line x1="770" y1="250" x2="770" y2="620"/></g><circle cx="600" cy="435" r="120" fill="#bbf7d0" fill-opacity="0.18"/><path d="M600 345c62 0 113 52 113 114s-51 114-113 114-113-52-113-114 51-114 113-114zm0 48c-36 0-65 30-65 66s29 66 65 66 65-30 65-66-29-66-65-66z" fill="#dcfce7"/><text x="600" y="842" text-anchor="middle" fill="#dcfce7" font-size="56" font-family="Arial, sans-serif">Filter Cartridge</text></svg>'
+        ],
+        'safety_extinguisher' => [
+            'filename' => 'demo_safety_extinguisher.svg',
+            'content' => '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 900"><defs><linearGradient id="bgC" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#f97316"/><stop offset="100%" stop-color="#7c2d12"/></linearGradient></defs><rect width="1200" height="900" fill="url(#bgC)"/><rect x="430" y="120" width="340" height="90" rx="28" fill="#334155"/><rect x="500" y="80" width="210" height="52" rx="24" fill="#1e293b"/><rect x="335" y="212" width="530" height="560" rx="120" fill="#991b1b" stroke="#fecaca" stroke-width="12"/><rect x="420" y="302" width="360" height="280" rx="30" fill="#dc2626"/><circle cx="600" cy="442" r="105" fill="#fee2e2" fill-opacity="0.2"/><path d="M600 340l38 78h85l-69 54 28 84-82-51-82 51 28-84-69-54h85z" fill="#fee2e2"/><path d="M420 640h360v60H420z" fill="#7f1d1d"/><text x="600" y="842" text-anchor="middle" fill="#fff1f2" font-size="56" font-family="Arial, sans-serif">Safety Gear</text></svg>'
+        ],
+    ];
+
+    $ready = [];
+    foreach ($assets as $key => $asset) {
+        $filename = basename((string) ($asset['filename'] ?? ''));
+        $content = (string) ($asset['content'] ?? '');
+        if ($filename === '' || $content === '') {
+            continue;
+        }
+        $path = UPLOAD_DIR . $filename;
+        $written = (@file_put_contents($path, $content) !== false);
+        if (!$written && file_exists($path)) {
+            $written = true;
+        }
+        if ($written) {
+            $ready[$key] = $filename;
+        }
+    }
+    return $ready;
+}
+
 function getUploadErrorMessage($errCode)
 {
     switch (intval($errCode)) {
@@ -1862,17 +1907,18 @@ function loadDemoDataIntoDb($db, $options = [])
         }
 
         $today = date('Y-m-d');
+        $demoImageMap = ensureDemoImageAssets();
         $demoItems = [
-            ['name' => 'MacBook Air M2', 'category' => '电子设备', 'subcategory' => '电脑外设', 'location' => '书房', 'quantity' => 1, 'description' => '日常办公主力设备', 'barcode' => 'SN-MBA-2026', 'purchase_date' => date('Y-m-d', strtotime('-420 days')), 'purchase_price' => 7999, 'tags' => '电脑,办公', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '附带保护壳与扩展坞'],
+            ['name' => 'MacBook Air M2', 'category' => '电子设备', 'subcategory' => '电脑外设', 'location' => '书房', 'quantity' => 1, 'description' => '日常办公主力设备', 'image_key' => 'device_laptop', 'barcode' => 'SN-MBA-2026', 'purchase_date' => date('Y-m-d', strtotime('-420 days')), 'purchase_price' => 7999, 'tags' => '电脑,办公', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '附带保护壳与扩展坞，可在大图预览中测试放大与拖拽'],
             ['name' => 'AirPods Pro', 'category' => '电子设备', 'subcategory' => '音频设备', 'location' => '卧室', 'quantity' => 1, 'description' => '蓝牙耳机', 'barcode' => 'SN-AIRPODS-02', 'purchase_date' => date('Y-m-d', strtotime('-260 days')), 'purchase_price' => 1499, 'tags' => '耳机,音频', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '淘宝', 'notes' => '配件齐全'],
             ['name' => '机械键盘', 'category' => '电子设备', 'subcategory' => '电脑外设', 'location' => '书桌抽屉', 'quantity' => 1, 'description' => '备用键盘', 'barcode' => 'KB-RED-87', 'purchase_date' => date('Y-m-d', strtotime('-540 days')), 'purchase_price' => 399, 'tags' => '键盘,外设', 'status' => 'archived', 'expiry_date' => '', 'purchase_from' => '拼多多', 'notes' => '近期未使用，已归档保存'],
             ['name' => '二手显示器', 'category' => '电子设备', 'subcategory' => '电脑外设', 'location' => '储物间', 'quantity' => 1, 'description' => '已转卖物品', 'barcode' => 'MON-USED-24', 'purchase_date' => date('Y-m-d', strtotime('-800 days')), 'purchase_price' => 1200, 'tags' => '显示器,转卖', 'status' => 'sold', 'expiry_date' => '', 'purchase_from' => '闲鱼', 'notes' => '已完成交易，保留记录'],
             ['name' => '胶囊咖啡机', 'category' => '厨房用品', 'subcategory' => '厨房小电', 'location' => '厨房', 'quantity' => 1, 'description' => '家用咖啡机', 'barcode' => 'COFFEE-01', 'purchase_date' => date('Y-m-d', strtotime('-320 days')), 'purchase_price' => 899, 'tags' => '咖啡,厨房', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '线下', 'notes' => '常用设备', 'is_public_shared' => 1, 'public_recommend_reason' => '稳定耐用，家用入门友好，维护成本低', 'reminder_date' => date('Y-m-d', strtotime('-28 days')), 'reminder_next_date' => date('Y-m-d', strtotime('+2 days')), 'reminder_cycle_value' => 30, 'reminder_cycle_unit' => 'day', 'reminder_note' => '需要清洗水箱并补充咖啡胶囊'],
             ['name' => '维生素 D3', 'category' => '其他', 'subcategory' => '日用杂项', 'location' => '厨房', 'quantity' => 2, 'remaining_current' => 1, 'description' => '保健品', 'barcode' => 'HEALTH-D3-01', 'purchase_date' => date('Y-m-d', strtotime('-60 days')), 'production_date' => date('Y-m-d', strtotime('-360 days')), 'shelf_life_value' => 1, 'shelf_life_unit' => 'year', 'purchase_price' => 128, 'tags' => '保健,补剂', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+5 days')), 'purchase_from' => '线下', 'notes' => '还有约一周到期，优先使用'],
-            ['name' => '车载灭火器', 'category' => '工具五金', 'location' => '阳台', 'quantity' => 1, 'remaining_current' => 0, 'description' => '安全应急用品', 'barcode' => 'SAFE-FIRE-01', 'purchase_date' => date('Y-m-d', strtotime('-480 days')), 'production_date' => date('Y-m-d', strtotime('-742 days')), 'shelf_life_value' => 2, 'shelf_life_unit' => 'year', 'purchase_price' => 89, 'tags' => '安全,应急', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('-12 days')), 'purchase_from' => '京东', 'notes' => '已超过有效期，需尽快更换'],
+            ['name' => '车载灭火器', 'category' => '工具五金', 'location' => '阳台', 'quantity' => 1, 'remaining_current' => 0, 'description' => '安全应急用品', 'image_key' => 'safety_extinguisher', 'barcode' => 'SAFE-FIRE-01', 'purchase_date' => date('Y-m-d', strtotime('-480 days')), 'production_date' => date('Y-m-d', strtotime('-742 days')), 'shelf_life_value' => 2, 'shelf_life_unit' => 'year', 'purchase_price' => 89, 'tags' => '安全,应急', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('-12 days')), 'purchase_from' => '京东', 'notes' => '已超过有效期，需尽快更换'],
             ['name' => '沐浴露补充装', 'category' => '其他', 'subcategory' => '日用杂项', 'location' => '储物间', 'quantity' => 3, 'description' => '家庭日用品', 'barcode' => 'HOME-BATH-03', 'purchase_date' => date('Y-m-d', strtotime('-30 days')), 'production_date' => date('Y-m-d', strtotime('-340 days')), 'shelf_life_value' => 1, 'shelf_life_unit' => 'year', 'purchase_price' => 75, 'tags' => '日用品,家居', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+25 days')), 'purchase_from' => '拼多多', 'notes' => '本月内到期，先用旧库存'],
             ['name' => '训练足球', 'category' => '运动户外', 'subcategory' => '球类器材', 'location' => '阳台', 'quantity' => 1, 'description' => '周末运动使用', 'barcode' => 'SPORT-BALL-01', 'purchase_date' => date('Y-m-d', strtotime('-210 days')), 'purchase_price' => 199, 'tags' => '运动,户外', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '淘宝', 'notes' => '周末固定训练用球', 'reminder_date' => date('Y-m-d', strtotime('-20 days')), 'reminder_next_date' => date('Y-m-d', strtotime('+1 day')), 'reminder_cycle_value' => 1, 'reminder_cycle_unit' => 'week', 'reminder_note' => '按首次训练日期每周提醒一次，出门前检查气压'],
-            ['name' => '空气净化器滤芯', 'category' => '家具家居', 'subcategory' => '清洁收纳', 'location' => '客厅', 'quantity' => 1, 'remaining_current' => 0, 'description' => '客厅净化器维护项目', 'barcode' => 'AIR-FILTER-01', 'purchase_date' => date('Y-m-d', strtotime('-200 days')), 'purchase_price' => 169, 'tags' => '家居,维护', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '上次维护后需持续追踪更换周期', 'is_public_shared' => 1, 'public_recommend_reason' => '价格和性能平衡，适合作为常备耗材', 'reminder_date' => date('Y-m-d', strtotime('-87 days')), 'reminder_next_date' => date('Y-m-d', strtotime('+3 days')), 'reminder_cycle_value' => 90, 'reminder_cycle_unit' => 'day', 'reminder_note' => '按初始维护日期每 90 天提醒一次，临近提醒时准备更换滤芯'],
+            ['name' => '空气净化器滤芯', 'category' => '家具家居', 'subcategory' => '清洁收纳', 'location' => '客厅', 'quantity' => 1, 'remaining_current' => 0, 'description' => '客厅净化器维护项目', 'image_key' => 'home_filter', 'barcode' => 'AIR-FILTER-01', 'purchase_date' => date('Y-m-d', strtotime('-200 days')), 'purchase_price' => 169, 'tags' => '家居,维护', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '上次维护后需持续追踪更换周期，可用于测试图片大图预览', 'is_public_shared' => 1, 'public_recommend_reason' => '价格和性能平衡，适合作为常备耗材', 'reminder_date' => date('Y-m-d', strtotime('-87 days')), 'reminder_next_date' => date('Y-m-d', strtotime('+3 days')), 'reminder_cycle_value' => 90, 'reminder_cycle_unit' => 'day', 'reminder_note' => '按初始维护日期每 90 天提醒一次，临近提醒时准备更换滤芯'],
             ['name' => '空气净化器滤芯（原厂）', 'category' => '家具家居', 'subcategory' => '清洁收纳', 'location' => '储物间', 'quantity' => 1, 'description' => '上一批次原厂滤芯采购记录', 'barcode' => 'AIR-FILTER-OEM-02', 'purchase_date' => date('Y-m-d', strtotime('-35 days')), 'purchase_price' => 199, 'tags' => '滤芯,原厂', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '京东', 'notes' => '价格较高但安装更稳', 'is_public_shared' => 1, 'public_recommend_reason' => '安装契合度高，追求稳定可优先考虑'],
             ['name' => '空气净化器滤芯（兼容款）', 'category' => '家具家居', 'subcategory' => '清洁收纳', 'location' => '储物间', 'quantity' => 2, 'description' => '兼容款滤芯采购记录', 'barcode' => 'AIR-FILTER-COMP-03', 'purchase_date' => date('Y-m-d', strtotime('-120 days')), 'purchase_price' => 129, 'tags' => '滤芯,兼容', 'status' => 'active', 'expiry_date' => '', 'purchase_from' => '拼多多', 'notes' => '单价更低，适合备货'],
             ['name' => '维生素D3滴剂', 'category' => '其他', 'subcategory' => '日用杂项', 'location' => '厨房', 'quantity' => 1, 'description' => '儿童可用滴剂版本', 'barcode' => 'HEALTH-D3-DROP-02', 'purchase_date' => date('Y-m-d', strtotime('-22 days')), 'production_date' => date('Y-m-d', strtotime('-45 days')), 'shelf_life_value' => 1, 'shelf_life_unit' => 'year', 'purchase_price' => 139, 'tags' => '保健,滴剂', 'status' => 'active', 'expiry_date' => date('Y-m-d', strtotime('+320 days')), 'purchase_from' => '淘宝', 'notes' => '最近一次补货'],
@@ -1894,6 +1940,7 @@ function loadDemoDataIntoDb($db, $options = [])
         $publicCommentCreated = 0;
         $usedUpCount = 0;
         $remainingUnsetCount = 0;
+        $demoImageBoundCount = 0;
         $itemIdByName = [];
         if ($authDb && $ownerUserId > 0) {
             removePublicSharedItemsByOwner($authDb, $ownerUserId);
@@ -1925,6 +1972,17 @@ function loadDemoDataIntoDb($db, $options = [])
             if ($itemStatus === 'used_up') {
                 $usedUpCount++;
             }
+            $itemImage = basename(trim((string) ($item['image'] ?? '')));
+            $imageKey = trim((string) ($item['image_key'] ?? ''));
+            if ($itemImage === '' && $imageKey !== '' && isset($demoImageMap[$imageKey])) {
+                $itemImage = basename((string) $demoImageMap[$imageKey]);
+            }
+            if ($itemImage !== '' && !file_exists(UPLOAD_DIR . $itemImage)) {
+                $itemImage = '';
+            }
+            if ($itemImage !== '') {
+                $demoImageBoundCount++;
+            }
             $insertItem->execute([
                 $item['name'],
                 $categoryId,
@@ -1934,7 +1992,7 @@ function loadDemoDataIntoDb($db, $options = [])
                 $remainingCurrent,
                 $remainingTotal,
                 $item['description'] ?? '',
-                '',
+                $itemImage,
                 $item['barcode'] ?? '',
                 normalizeDateYmd($item['purchase_date'] ?? '') ?? '',
                 normalizeDateYmd($item['production_date'] ?? '') ?? '',
@@ -2237,7 +2295,8 @@ function loadDemoDataIntoDb($db, $options = [])
                 'details' => 'Demo 数据初始化：新增物品 ' . $created . ' 件'
                     . ($subcategoryBoundCount > 0 ? ('，其中二级分类 ' . $subcategoryBoundCount . ' 件') : '')
                     . ($usedUpCount > 0 ? ('，已用完状态 ' . $usedUpCount . ' 件') : '')
-                    . ($remainingUnsetCount > 0 ? ('，余量未设置 ' . $remainingUnsetCount . ' 件') : ''),
+                    . ($remainingUnsetCount > 0 ? ('，余量未设置 ' . $remainingUnsetCount . ' 件') : '')
+                    . ($demoImageBoundCount > 0 ? ('，图片示例 ' . $demoImageBoundCount . ' 件') : ''),
                 'created_at' => "datetime('now','-120 minutes','localtime')"
             ],
             [
@@ -2372,6 +2431,9 @@ function loadDemoDataIntoDb($db, $options = [])
         if ($remainingUnsetCount > 0) {
             $message .= "，含 $remainingUnsetCount 件“余量未设置”示例";
         }
+        if ($demoImageBoundCount > 0) {
+            $message .= "，含 $demoImageBoundCount 件“可预览大图”图片示例";
+        }
         if ($collectionCreated > 0) {
             $message .= "，含 $collectionCreated 组集合清单（关联 $collectionLinkedItems 条物品）";
         }
@@ -2402,6 +2464,7 @@ function loadDemoDataIntoDb($db, $options = [])
             'subcategory_bound' => $subcategoryBoundCount,
             'used_up_seeded' => $usedUpCount,
             'remaining_unset_seeded' => $remainingUnsetCount,
+            'demo_image_seeded' => $demoImageBoundCount,
             'shopping_created' => $shoppingCreated,
             'collection_created' => $collectionCreated,
             'collection_linked_items' => $collectionLinkedItems,
@@ -3814,6 +3877,7 @@ if (isset($_GET['api'])) {
                 if ($method === 'POST') {
                     $demoLoad = loadDemoDataIntoDb($db, ['move_images' => true, 'auth_db' => $authDb, 'owner_user_id' => intval($currentUser['id'])]);
                     $operationDetails = '物品: ' . intval($demoLoad['created'] ?? 0)
+                        . '；示例图片: ' . intval($demoLoad['demo_image_seeded'] ?? 0)
                         . '；购物清单: ' . intval($demoLoad['shopping_created'] ?? 0)
                         . '；集合清单: ' . intval($demoLoad['collection_created'] ?? 0)
                         . '；集合关联: ' . intval($demoLoad['collection_linked_items'] ?? 0)
@@ -5162,6 +5226,7 @@ if (isset($_GET['api'])) {
                             p.category_name,
                             p.purchase_price,
                             p.purchase_from,
+                            p.purchase_link,
                             p.recommend_reason,
                             p.owner_item_updated_at,
                             p.created_at,
@@ -5224,6 +5289,7 @@ if (isset($_GET['api'])) {
                             'category_name' => trim((string) ($live['category_name'] ?? '')),
                             'purchase_price' => max(0, floatval($live['purchase_price'] ?? 0)),
                             'purchase_from' => trim((string) ($live['purchase_from'] ?? '')),
+                            'purchase_link' => trim((string) ($row['purchase_link'] ?? '')),
                             'recommend_reason' => trim((string) ($live['recommend_reason'] ?? '')),
                             'owner_item_updated_at' => trim((string) ($live['updated_at'] ?? '')),
                             'created_at' => $row['created_at'] ?? '',
@@ -5360,6 +5426,12 @@ if (isset($_GET['api'])) {
                     }
                     $purchasePrice = max(0, floatval($data['purchase_price'] ?? 0));
                     $purchaseFrom = trim((string) ($data['purchase_from'] ?? ''));
+                    $purchaseLink = trim((string) ($data['purchase_link'] ?? ''));
+                    if (function_exists('mb_substr')) {
+                        $purchaseLink = mb_substr($purchaseLink, 0, 500, 'UTF-8');
+                    } else {
+                        $purchaseLink = substr($purchaseLink, 0, 500);
+                    }
                     $recommendReason = trim((string) ($data['recommend_reason'] ?? ''));
                     if (function_exists('mb_substr')) {
                         $recommendReason = mb_substr($recommendReason, 0, 300, 'UTF-8');
@@ -5379,6 +5451,10 @@ if (isset($_GET['api'])) {
                         WHERE id=? AND deleted_at IS NULL");
                     $updateStmt->execute([$itemName, $categoryId, $purchasePrice, $purchaseFrom, $recommendReason, $ownerItemId]);
                     syncPublicSharedItem($authDb, $db, intval($currentUser['id']), $ownerItemId, 1);
+                    $updateShareStmt = $authDb->prepare("UPDATE public_shared_items
+                        SET purchase_link=?, updated_at=datetime('now','localtime')
+                        WHERE id=? LIMIT 1");
+                    $updateShareStmt->execute([$purchaseLink, $sharedId]);
                     $catName = '';
                     if ($categoryId > 0) {
                         $catName = trim((string) ($db->query("SELECT name FROM categories WHERE id=" . $categoryId . " LIMIT 1")->fetchColumn() ?: ''));
@@ -5387,6 +5463,7 @@ if (isset($_GET['api'])) {
                         . '；物品: ' . $itemName . '（来源物品ID:' . $ownerItemId . '）'
                         . ($catName !== '' ? ('；分类: ' . $catName) : '')
                         . ($purchaseFrom !== '' ? ('；购入渠道: ' . $purchaseFrom) : '')
+                        . ($purchaseLink !== '' ? ('；购买链接: ' . $purchaseLink) : '')
                         . '；价格: ' . $purchasePrice;
                     $result = ['success' => true, 'message' => '共享物品已更新'];
                 }
@@ -5508,6 +5585,7 @@ if (isset($_GET['api'])) {
                             p.id,
                             p.owner_user_id,
                             p.owner_item_id,
+                            p.purchase_link,
                             p.recommend_reason,
                             u.username,
                             u.display_name
@@ -5590,6 +5668,10 @@ if (isset($_GET['api'])) {
                     }
                     if ($categoryName !== '') {
                         $noteParts[] = '分类: ' . $categoryName;
+                    }
+                    $purchaseLink = trim((string) ($shareRow['purchase_link'] ?? ''));
+                    if ($purchaseLink !== '') {
+                        $noteParts[] = '购买链接: ' . $purchaseLink;
                     }
                     $recommendReason = trim((string) ($live['recommend_reason'] ?? $shareRow['recommend_reason'] ?? ''));
                     if ($recommendReason !== '') {
@@ -5743,7 +5825,7 @@ if (isset($_GET['api'])) {
                     'collection_lists' => $collectionLists,
                     'collection_list_items' => $collectionListItems,
                     'exported_at' => date('Y-m-d H:i:s'),
-                    'version' => '1.9.3'
+                    'version' => '1.10.0'
                 ]];
                 break;
 
@@ -7699,6 +7781,216 @@ $currentUserJson = json_encode([
             padding: 8px;
         }
 
+        .item-modal-head {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 16px;
+        }
+
+        .item-modal-head-fields {
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .item-modal-meta-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 16px;
+        }
+
+        .item-modal-image-slot {
+            justify-self: stretch;
+            width: 100%;
+        }
+
+        .item-image-label-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            margin-bottom: 6px;
+        }
+
+        .item-image-label-row label {
+            margin-bottom: 0;
+        }
+
+        .item-image-preview-btn {
+            border: 1px solid rgba(56, 189, 248, 0.35);
+            border-radius: 8px;
+            background: rgba(56, 189, 248, 0.12);
+            color: #7dd3fc;
+            font-size: 12px;
+            line-height: 1;
+            padding: 6px 10px;
+            cursor: pointer;
+            transition: all 0.2s;
+            white-space: nowrap;
+        }
+
+        .item-image-preview-btn:hover:not(:disabled) {
+            border-color: rgba(56, 189, 248, 0.5);
+            background: rgba(56, 189, 248, 0.2);
+            color: #bae6fd;
+        }
+
+        .item-image-preview-btn:disabled,
+        .item-image-preview-btn.is-disabled {
+            cursor: not-allowed;
+            border-color: rgba(100, 116, 139, 0.32);
+            background: rgba(51, 65, 85, 0.45);
+            color: #64748b;
+            opacity: 0.95;
+        }
+
+        .item-modal-upload {
+            width: 100%;
+            height: auto;
+            aspect-ratio: 1 / 1;
+            padding: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+
+        .item-modal-upload-placeholder {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 4px;
+            width: 100%;
+            height: 100%;
+            padding: 4px;
+        }
+
+        .item-modal-upload #uploadPreview {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            border-radius: 8px;
+        }
+
+        .item-image-preview-modal-box {
+            width: min(1100px, 96vw);
+            max-width: min(1100px, 96vw);
+            max-height: calc(100dvh - 24px);
+        }
+
+        .item-image-preview-toolbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 10px;
+        }
+
+        .item-image-preview-tools {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .item-image-preview-tool-btn {
+            border: 1px solid rgba(148, 163, 184, 0.35);
+            border-radius: 8px;
+            background: rgba(51, 65, 85, 0.6);
+            color: #cbd5e1;
+            font-size: 12px;
+            line-height: 1;
+            padding: 7px 11px;
+            cursor: pointer;
+            transition: all 0.2s;
+            white-space: nowrap;
+        }
+
+        .item-image-preview-tool-btn:hover:not(:disabled) {
+            border-color: rgba(56, 189, 248, 0.45);
+            background: rgba(56, 189, 248, 0.16);
+            color: #e0f2fe;
+        }
+
+        .item-image-preview-tool-btn:disabled {
+            cursor: not-allowed;
+            border-color: rgba(100, 116, 139, 0.32);
+            background: rgba(30, 41, 59, 0.55);
+            color: #64748b;
+        }
+
+        .item-image-preview-zoom-label {
+            min-width: 52px;
+            text-align: right;
+            font-size: 12px;
+            color: #94a3b8;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .item-image-preview-stage {
+            border: 1px solid rgba(148, 163, 184, 0.28);
+            border-radius: 12px;
+            min-height: 260px;
+            max-height: calc(100dvh - 180px);
+            padding: 12px;
+            background: rgba(15, 23, 42, 0.65);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+        }
+
+        .item-image-preview-large {
+            width: 100%;
+            height: 100%;
+            max-height: calc(100dvh - 220px);
+            object-fit: contain;
+            border-radius: 10px;
+            transform: translate(0px, 0px) scale(1);
+            transform-origin: center center;
+            transition: transform 0.12s ease;
+            user-select: none;
+            -webkit-user-drag: none;
+            touch-action: none;
+            cursor: default;
+            will-change: transform;
+        }
+
+        .item-image-preview-large.is-movable {
+            cursor: grab;
+        }
+
+        .item-image-preview-large.is-dragging {
+            cursor: grabbing;
+            transition: none;
+        }
+
+        @media (min-width: 768px) {
+            .item-modal-head {
+                grid-template-columns: repeat(3, minmax(0, 1fr));
+                align-items: start;
+            }
+
+            .item-modal-image-slot {
+                grid-column: 1;
+            }
+
+            .item-modal-head-fields {
+                grid-column: 2 / span 2;
+            }
+
+            .item-modal-meta-grid {
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+        }
+
+        @media (max-width: 767px) {
+            .item-modal-meta-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
         /* 数据卡片 */
         /* 尺寸切换按钮 */
         .size-btn {
@@ -8006,6 +8298,52 @@ $currentUserJson = json_encode([
 
         body.light .input::placeholder {
             color: #94a3b8;
+        }
+
+        body.light .item-image-preview-btn {
+            border-color: rgba(2, 132, 199, 0.3);
+            background: rgba(14, 165, 233, 0.12);
+            color: #0369a1;
+        }
+
+        body.light .item-image-preview-btn:hover:not(:disabled) {
+            border-color: rgba(2, 132, 199, 0.42);
+            background: rgba(14, 165, 233, 0.2);
+            color: #075985;
+        }
+
+        body.light .item-image-preview-btn:disabled,
+        body.light .item-image-preview-btn.is-disabled {
+            border-color: rgba(148, 163, 184, 0.45);
+            background: rgba(226, 232, 240, 0.7);
+            color: #94a3b8;
+        }
+
+        body.light .item-image-preview-stage {
+            background: rgba(248, 250, 252, 0.95);
+            border-color: rgba(148, 163, 184, 0.45);
+        }
+
+        body.light .item-image-preview-tool-btn {
+            border-color: rgba(148, 163, 184, 0.45);
+            background: rgba(241, 245, 249, 0.9);
+            color: #334155;
+        }
+
+        body.light .item-image-preview-tool-btn:hover:not(:disabled) {
+            border-color: rgba(2, 132, 199, 0.38);
+            background: rgba(14, 165, 233, 0.16);
+            color: #075985;
+        }
+
+        body.light .item-image-preview-tool-btn:disabled {
+            border-color: rgba(148, 163, 184, 0.45);
+            background: rgba(226, 232, 240, 0.7);
+            color: #94a3b8;
+        }
+
+        body.light .item-image-preview-zoom-label {
+            color: #64748b;
         }
 
         body.light .status-icon-picker-menu {
@@ -8873,27 +9211,57 @@ $currentUserJson = json_encode([
                 <input type="hidden" id="itemSourceShoppingId">
                 <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
                     <div class="sm:col-span-2 md:col-span-3">
-                        <label class="block text-sm text-slate-400 mb-1.5">物品名称 <span
-                                class="text-red-400">*</span></label>
-                        <input type="text" id="itemName" class="input" placeholder="请输入物品名称" required>
-                    </div>
-                    <div>
-                        <label class="block text-sm text-slate-400 mb-1.5">分类</label>
-                        <select id="itemCategory" class="input">
-                            <option value="0">选择分类</option>
-                        </select>
-                    </div>
-                    <div>
-                        <label class="block text-sm text-slate-400 mb-1.5">二级分类</label>
-                        <select id="itemSubcategory" class="input" disabled>
-                            <option value="0">请先选择一级分类</option>
-                        </select>
-                    </div>
-                    <div>
-                        <label class="block text-sm text-slate-400 mb-1.5">位置</label>
-                        <select id="itemLocation" class="input">
-                            <option value="0">选择位置</option>
-                        </select>
+                        <div class="item-modal-head">
+                            <div class="item-modal-image-slot">
+                                <div class="item-image-label-row">
+                                    <label class="block text-sm text-slate-400">图片</label>
+                                    <button type="button" id="itemImagePreviewBtn" class="item-image-preview-btn is-disabled" onclick="openItemImagePreviewModal()" disabled>
+                                        <i class="ri-image-line mr-1"></i>显示大图
+                                    </button>
+                                </div>
+                                <div id="uploadZone" class="upload-zone item-modal-upload"
+                                    onclick="document.getElementById('imageInput').click()">
+                                    <div id="uploadPlaceholder" class="item-modal-upload-placeholder">
+                                        <i class="ri-image-add-line text-2xl text-slate-500"></i>
+                                        <p class="text-xs text-slate-500">点击上传</p>
+                                    </div>
+                                    <img id="uploadPreview" class="hidden" alt="preview">
+                                </div>
+                                <input type="file" id="imageInput" class="hidden" accept="image/*"
+                                    onchange="handleImageUpload(this)">
+                            </div>
+                            <div class="item-modal-head-fields">
+                                <div>
+                                    <label class="block text-sm text-slate-400 mb-1.5">物品名称 <span
+                                            class="text-red-400">*</span></label>
+                                    <input type="text" id="itemName" class="input" placeholder="请输入物品名称" required>
+                                </div>
+                                <div class="item-modal-meta-grid">
+                                    <div>
+                                        <label class="block text-sm text-slate-400 mb-1.5">分类</label>
+                                        <select id="itemCategory" class="input">
+                                            <option value="0">选择分类</option>
+                                        </select>
+                                    </div>
+                                    <div>
+                                        <label class="block text-sm text-slate-400 mb-1.5">二级分类</label>
+                                        <select id="itemSubcategory" class="input" disabled>
+                                            <option value="0">请先选择一级分类</option>
+                                        </select>
+                                    </div>
+                                    <div>
+                                        <label class="block text-sm text-slate-400 mb-1.5">位置</label>
+                                        <select id="itemLocation" class="input">
+                                            <option value="0">选择位置</option>
+                                        </select>
+                                    </div>
+                                    <div>
+                                        <label class="block text-sm text-slate-400 mb-1.5">具体位置</label>
+                                        <input type="text" id="itemDescription" class="input" placeholder="例如：左侧第二层、门后挂钩">
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                     <div>
                         <label class="block text-sm text-slate-400 mb-1.5">状态</label>
@@ -8990,20 +9358,6 @@ $currentUserJson = json_encode([
                         <label class="block text-sm text-slate-400 mb-1.5">备注</label>
                         <textarea id="itemNotes" class="input" rows="2" placeholder="内部备注，不对外显示..."></textarea>
                     </div>
-                    <div class="sm:col-span-2 md:col-span-3">
-                        <label class="block text-sm text-slate-400 mb-1.5">图片</label>
-                        <div id="uploadZone" class="upload-zone"
-                            onclick="document.getElementById('imageInput').click()">
-                            <div id="uploadPlaceholder">
-                                <i class="ri-image-add-line text-3xl text-slate-500 mb-2"></i>
-                                <p class="text-sm text-slate-500">点击上传图片</p>
-                                <p class="text-xs text-slate-600 mt-1">支持 JPG / PNG / GIF / WebP, 最大 10MB</p>
-                            </div>
-                            <img id="uploadPreview" class="hidden max-h-40 mx-auto rounded-lg" alt="preview">
-                        </div>
-                        <input type="file" id="imageInput" class="hidden" accept="image/*"
-                            onchange="handleImageUpload(this)">
-                    </div>
                 </div>
                 <div class="modal-form-actions flex items-center justify-between gap-3 mt-6 pt-4 border-t border-white/5">
                     <div id="itemFormDateError" class="text-sm text-red-400 hidden"></div>
@@ -9013,6 +9367,36 @@ $currentUserJson = json_encode([
                     </div>
                 </div>
             </form>
+        </div>
+    </div>
+
+    <!-- 物品图片大图预览弹窗 -->
+    <div id="itemImagePreviewModal" class="modal-overlay" onclick="if(event.target===this)closeItemImagePreviewModal()">
+        <div class="modal-box p-4 item-image-preview-modal-box">
+            <div class="flex items-center justify-between mb-3">
+                <h3 class="text-base font-semibold text-white">图片大图预览</h3>
+                <button type="button" onclick="closeItemImagePreviewModal()" class="text-slate-400 hover:text-white transition">
+                    <i class="ri-close-line text-2xl"></i>
+                </button>
+            </div>
+            <div class="item-image-preview-toolbar">
+                <div class="item-image-preview-tools">
+                    <button type="button" id="itemImagePreviewZoomInBtn" class="item-image-preview-tool-btn" onclick="zoomInItemImagePreview()" disabled>
+                        <i class="ri-zoom-in-line mr-1"></i>放大
+                    </button>
+                    <button type="button" id="itemImagePreviewZoomOutBtn" class="item-image-preview-tool-btn" onclick="zoomOutItemImagePreview()" disabled>
+                        <i class="ri-zoom-out-line mr-1"></i>缩小
+                    </button>
+                    <button type="button" id="itemImagePreviewResetBtn" class="item-image-preview-tool-btn" onclick="resetItemImagePreviewTransform()" disabled>
+                        <i class="ri-refresh-line mr-1"></i>还原
+                    </button>
+                </div>
+                <span id="itemImagePreviewZoomLabel" class="item-image-preview-zoom-label">100%</span>
+            </div>
+            <div id="itemImagePreviewStage" class="item-image-preview-stage">
+                <img id="itemImagePreviewLarge" class="item-image-preview-large hidden" alt="item-image-large-preview">
+                <p id="itemImagePreviewEmpty" class="text-sm text-slate-400">当前没有可预览的图片</p>
+            </div>
         </div>
     </div>
 
@@ -9245,6 +9629,10 @@ $currentUserJson = json_encode([
                         <input type="text" id="publicSharedEditPurchaseFrom" class="input" placeholder="例如：京东、淘宝、线下">
                     </div>
                     <div class="sm:col-span-2">
+                        <label class="block text-sm text-slate-400 mb-1.5">购买链接</label>
+                        <input type="text" id="publicSharedEditPurchaseLink" class="input" maxlength="500" placeholder="例如：https://example.com/item/123">
+                    </div>
+                    <div class="sm:col-span-2">
                         <label class="block text-sm text-slate-400 mb-1.5">推荐理由</label>
                         <textarea id="publicSharedEditReason" class="input" rows="3" maxlength="300" placeholder="告诉其他用户你推荐这个物品的原因..."></textarea>
                     </div>
@@ -9274,7 +9662,9 @@ $currentUserJson = json_encode([
             itemCategory: '选择物品的大类，后续查找和统计会更方便。',
             itemSubcategory: '在大类下再细分一层，不需要时可以不选。',
             itemLocation: '填写物品放在哪里，例如“厨房上柜”“书房抽屉”。',
+            itemDescription: '记录同一位置下更精确的位置细节，例如“左侧第二层”或“门后挂钩”。可留空。',
             itemStatus: '表示当前情况，例如“使用中”“已归档”“已转卖”。',
+            itemImagePreviewBtn: '上传图片后可点“显示大图”打开预览窗口；支持放大、缩小、还原，放大后可拖动查看细节。',
             itemRemainingCurrent: '当前还剩多少。比如买了 10 个还剩 3 个，这里填 3。如果留空则不设提醒。',
             itemQuantity: '总共买了多少。比如一共买了 10 个，这里填 10。留空会按 0 处理。',
             itemPrice: '购买价格，可用于后续比价和预算回顾。留空会按 0 处理。',
@@ -9310,6 +9700,7 @@ $currentUserJson = json_encode([
             publicSharedEditCategory: '公开信息所属分类，便于别人筛选。',
             publicSharedEditPrice: '分享给他人的参考价格，不填也可以。',
             publicSharedEditPurchaseFrom: '分享给他人的购买渠道信息。',
+            publicSharedEditPurchaseLink: '填写购买链接，方便他人直接参考或下单。',
             publicSharedEditReason: '告诉别人你为什么推荐它、适合谁买。',
             set_expiry_past_days: '定义“过期提醒”时间窗口下界（过去天数）。留空表示不限制。',
             set_expiry_future_days: '定义“过期提醒”时间窗口上界（未来天数）。留空表示不限制。',
@@ -9328,6 +9719,7 @@ $currentUserJson = json_encode([
             分类: '给物品分组，后续筛选和统计会更方便。',
             二级分类: '在一级分类下继续细分，不选也可以。',
             位置: '记录这件物品放在哪里。',
+            具体位置: '记录更细的摆放点位，例如“左侧第二层”。',
             状态: '物品里表示当前情况（如使用中、已归档）；购物清单里表示采购进度（待购买/待收货）。',
             余量: '当前还剩多少。比如买了 10 个还剩 3 个，这里填 3。如果留空则不设提醒。',
             数量: '这件物品的总数量。留空会按 0 处理。',
@@ -9932,7 +10324,7 @@ $currentUserJson = json_encode([
 
         let itemFormInitialState = '';
         function getItemFormState() {
-            const ids = ['itemId', 'itemName', 'itemCategory', 'itemSubcategory', 'itemLocation', 'itemStatus', 'itemQuantity', 'itemRemainingCurrent', 'itemPrice', 'itemPurchaseFrom', 'itemSharePublic', 'itemDate', 'itemProductionDate', 'itemShelfLifeValue', 'itemShelfLifeUnit', 'itemExpiry', 'itemBarcode', 'itemReminderDate', 'itemReminderEvery', 'itemReminderUnit', 'itemReminderNext', 'itemReminderNote', 'itemTags', 'itemNotes', 'itemImage', 'itemSourceShoppingId'];
+            const ids = ['itemId', 'itemName', 'itemCategory', 'itemSubcategory', 'itemLocation', 'itemDescription', 'itemStatus', 'itemQuantity', 'itemRemainingCurrent', 'itemPrice', 'itemPurchaseFrom', 'itemSharePublic', 'itemDate', 'itemProductionDate', 'itemShelfLifeValue', 'itemShelfLifeUnit', 'itemExpiry', 'itemBarcode', 'itemReminderDate', 'itemReminderEvery', 'itemReminderUnit', 'itemReminderNext', 'itemReminderNote', 'itemTags', 'itemNotes', 'itemImage', 'itemSourceShoppingId'];
             const state = {};
             ids.forEach(id => {
                 const el = document.getElementById(id);
@@ -12651,6 +13043,293 @@ $currentUserJson = json_encode([
 
         function closeDetailModal() { document.getElementById('detailModal').classList.remove('show'); }
 
+        const itemImagePreviewState = {
+            scale: 1,
+            minScale: 1,
+            maxScale: 4,
+            step: 0.25,
+            panX: 0,
+            panY: 0,
+            dragging: false,
+            pointerId: null,
+            dragStartX: 0,
+            dragStartY: 0,
+            startPanX: 0,
+            startPanY: 0,
+            bound: false
+        };
+
+        function getCurrentItemImagePreviewSrc() {
+            const preview = document.getElementById('uploadPreview');
+            if (preview && !preview.classList.contains('hidden') && preview.src) {
+                return preview.src;
+            }
+            const imageName = String(document.getElementById('itemImage')?.value || '').trim();
+            if (!imageName) return '';
+            return `?img=${encodeURIComponent(imageName)}`;
+        }
+
+        function getItemImagePreviewElements() {
+            return {
+                modal: document.getElementById('itemImagePreviewModal'),
+                stage: document.getElementById('itemImagePreviewStage'),
+                img: document.getElementById('itemImagePreviewLarge'),
+                empty: document.getElementById('itemImagePreviewEmpty'),
+                zoomInBtn: document.getElementById('itemImagePreviewZoomInBtn'),
+                zoomOutBtn: document.getElementById('itemImagePreviewZoomOutBtn'),
+                resetBtn: document.getElementById('itemImagePreviewResetBtn'),
+                zoomLabel: document.getElementById('itemImagePreviewZoomLabel')
+            };
+        }
+
+        function hasItemImagePreviewImage(img = null) {
+            const target = img || document.getElementById('itemImagePreviewLarge');
+            return !!(target && !target.classList.contains('hidden') && target.getAttribute('src'));
+        }
+
+        function clampItemImagePreviewPan() {
+            const { stage } = getItemImagePreviewElements();
+            if (!stage || itemImagePreviewState.scale <= 1.0001) {
+                itemImagePreviewState.panX = 0;
+                itemImagePreviewState.panY = 0;
+                return;
+            }
+            const maxPanX = ((itemImagePreviewState.scale - 1) * stage.clientWidth) / 2;
+            const maxPanY = ((itemImagePreviewState.scale - 1) * stage.clientHeight) / 2;
+            itemImagePreviewState.panX = Math.min(maxPanX, Math.max(-maxPanX, itemImagePreviewState.panX));
+            itemImagePreviewState.panY = Math.min(maxPanY, Math.max(-maxPanY, itemImagePreviewState.panY));
+        }
+
+        function updateItemImagePreviewControls() {
+            const { img, zoomInBtn, zoomOutBtn, resetBtn, zoomLabel } = getItemImagePreviewElements();
+            const hasImage = hasItemImagePreviewImage(img);
+            const canZoomIn = hasImage && itemImagePreviewState.scale < itemImagePreviewState.maxScale - 0.0001;
+            const canZoomOut = hasImage && itemImagePreviewState.scale > itemImagePreviewState.minScale + 0.0001;
+            const canReset = hasImage && (
+                Math.abs(itemImagePreviewState.scale - 1) > 0.0001 ||
+                Math.abs(itemImagePreviewState.panX) > 0.5 ||
+                Math.abs(itemImagePreviewState.panY) > 0.5
+            );
+
+            if (zoomInBtn) zoomInBtn.disabled = !canZoomIn;
+            if (zoomOutBtn) zoomOutBtn.disabled = !canZoomOut;
+            if (resetBtn) resetBtn.disabled = !canReset;
+            if (zoomLabel) zoomLabel.textContent = `${Math.round(itemImagePreviewState.scale * 100)}%`;
+        }
+
+        function applyItemImagePreviewTransform() {
+            const { img } = getItemImagePreviewElements();
+            if (!img) return;
+            clampItemImagePreviewPan();
+            img.style.transform = `translate(${itemImagePreviewState.panX}px, ${itemImagePreviewState.panY}px) scale(${itemImagePreviewState.scale})`;
+            const movable = hasItemImagePreviewImage(img) && itemImagePreviewState.scale > 1.0001;
+            img.classList.toggle('is-movable', movable);
+            img.classList.toggle('is-dragging', movable && itemImagePreviewState.dragging);
+            updateItemImagePreviewControls();
+        }
+
+        function resetItemImagePreviewTransform() {
+            itemImagePreviewState.scale = 1;
+            itemImagePreviewState.panX = 0;
+            itemImagePreviewState.panY = 0;
+            itemImagePreviewState.dragging = false;
+            itemImagePreviewState.pointerId = null;
+            applyItemImagePreviewTransform();
+        }
+
+        function setItemImagePreviewScale(targetScale) {
+            const { stage, img } = getItemImagePreviewElements();
+            if (!hasItemImagePreviewImage(img)) return;
+
+            const prevScale = itemImagePreviewState.scale;
+            const nextScale = Math.min(itemImagePreviewState.maxScale, Math.max(itemImagePreviewState.minScale, targetScale));
+            if (Math.abs(nextScale - prevScale) <= 0.0001) {
+                updateItemImagePreviewControls();
+                return;
+            }
+
+            const prevMaxX = stage ? ((prevScale - 1) * stage.clientWidth) / 2 : 0;
+            const prevMaxY = stage ? ((prevScale - 1) * stage.clientHeight) / 2 : 0;
+            const ratioX = prevMaxX > 0 ? (itemImagePreviewState.panX / prevMaxX) : 0;
+            const ratioY = prevMaxY > 0 ? (itemImagePreviewState.panY / prevMaxY) : 0;
+
+            itemImagePreviewState.scale = nextScale;
+            if (nextScale <= 1.0001) {
+                itemImagePreviewState.panX = 0;
+                itemImagePreviewState.panY = 0;
+            } else if (stage) {
+                const nextMaxX = ((nextScale - 1) * stage.clientWidth) / 2;
+                const nextMaxY = ((nextScale - 1) * stage.clientHeight) / 2;
+                itemImagePreviewState.panX = ratioX * nextMaxX;
+                itemImagePreviewState.panY = ratioY * nextMaxY;
+            }
+            applyItemImagePreviewTransform();
+        }
+
+        function zoomInItemImagePreview() {
+            setItemImagePreviewScale(itemImagePreviewState.scale + itemImagePreviewState.step);
+        }
+
+        function zoomOutItemImagePreview() {
+            setItemImagePreviewScale(itemImagePreviewState.scale - itemImagePreviewState.step);
+        }
+
+        function bindItemImagePreviewInteractions() {
+            if (itemImagePreviewState.bound) return;
+            const { stage } = getItemImagePreviewElements();
+            if (!stage) return;
+
+            const stopDrag = (event = null) => {
+                if (!itemImagePreviewState.dragging) return;
+                if (event && itemImagePreviewState.pointerId !== null && event.pointerId !== undefined && event.pointerId !== itemImagePreviewState.pointerId) {
+                    return;
+                }
+                if (stage.releasePointerCapture && itemImagePreviewState.pointerId !== null) {
+                    try {
+                        stage.releasePointerCapture(itemImagePreviewState.pointerId);
+                    } catch (e) { }
+                }
+                itemImagePreviewState.dragging = false;
+                itemImagePreviewState.pointerId = null;
+                applyItemImagePreviewTransform();
+            };
+
+            stage.addEventListener('pointerdown', event => {
+                const { img } = getItemImagePreviewElements();
+                if (event.button !== 0) return;
+                if (!hasItemImagePreviewImage(img) || itemImagePreviewState.scale <= 1.0001) return;
+                itemImagePreviewState.dragging = true;
+                itemImagePreviewState.pointerId = event.pointerId;
+                itemImagePreviewState.dragStartX = event.clientX;
+                itemImagePreviewState.dragStartY = event.clientY;
+                itemImagePreviewState.startPanX = itemImagePreviewState.panX;
+                itemImagePreviewState.startPanY = itemImagePreviewState.panY;
+                if (stage.setPointerCapture) {
+                    try {
+                        stage.setPointerCapture(event.pointerId);
+                    } catch (e) { }
+                }
+                event.preventDefault();
+                applyItemImagePreviewTransform();
+            });
+
+            stage.addEventListener('pointermove', event => {
+                if (!itemImagePreviewState.dragging) return;
+                if (itemImagePreviewState.pointerId !== null && event.pointerId !== itemImagePreviewState.pointerId) return;
+                const moveX = event.clientX - itemImagePreviewState.dragStartX;
+                const moveY = event.clientY - itemImagePreviewState.dragStartY;
+                itemImagePreviewState.panX = itemImagePreviewState.startPanX + moveX;
+                itemImagePreviewState.panY = itemImagePreviewState.startPanY + moveY;
+                event.preventDefault();
+                applyItemImagePreviewTransform();
+            });
+
+            stage.addEventListener('pointerup', stopDrag);
+            stage.addEventListener('pointercancel', stopDrag);
+            stage.addEventListener('lostpointercapture', () => stopDrag());
+            stage.addEventListener('dragstart', event => event.preventDefault());
+
+            itemImagePreviewState.bound = true;
+        }
+
+        function refreshItemImagePreviewButton() {
+            const btn = document.getElementById('itemImagePreviewBtn');
+            if (!btn) return;
+            const hasImage = !!getCurrentItemImagePreviewSrc();
+            btn.disabled = !hasImage;
+            btn.classList.toggle('is-disabled', !hasImage);
+            updateItemImagePreviewControls();
+        }
+
+        function openItemImagePreviewModal() {
+            const src = getCurrentItemImagePreviewSrc();
+            if (!src) {
+                toast('当前没有可预览的图片', 'error');
+                refreshItemImagePreviewButton();
+                return;
+            }
+            const { modal, img, empty } = getItemImagePreviewElements();
+            if (!modal || !img || !empty) return;
+
+            bindItemImagePreviewInteractions();
+            img.onload = () => {
+                resetItemImagePreviewTransform();
+            };
+            img.onerror = () => {
+                img.classList.add('hidden');
+                empty.classList.remove('hidden');
+                updateItemImagePreviewControls();
+            };
+            img.src = src;
+            img.classList.remove('hidden');
+            empty.classList.add('hidden');
+            modal.classList.add('show');
+            resetItemImagePreviewTransform();
+        }
+
+        function closeItemImagePreviewModal() {
+            const { modal, img, empty } = getItemImagePreviewElements();
+            if (modal) modal.classList.remove('show');
+            if (img) {
+                img.onload = null;
+                img.onerror = null;
+                img.src = '';
+                img.classList.add('hidden');
+                img.classList.remove('is-movable', 'is-dragging');
+            }
+            if (empty) empty.classList.remove('hidden');
+            itemImagePreviewState.scale = 1;
+            itemImagePreviewState.panX = 0;
+            itemImagePreviewState.panY = 0;
+            itemImagePreviewState.dragging = false;
+            itemImagePreviewState.pointerId = null;
+            updateItemImagePreviewControls();
+        }
+
+        function getItemModalReferenceInputWidth() {
+            const positionInput = document.getElementById('itemDescription');
+            const locationSelect = document.getElementById('itemLocation');
+            const locationWrapper = locationSelect ? locationSelect.closest('.custom-select') : null;
+            const locationTrigger = locationWrapper ? locationWrapper.querySelector('.custom-select-trigger') : null;
+            const candidates = [positionInput, locationTrigger, locationWrapper, locationSelect, locationSelect ? locationSelect.parentElement : null];
+            for (const el of candidates) {
+                if (!el || !el.getBoundingClientRect) continue;
+                const width = Math.round(el.getBoundingClientRect().width);
+                if (width > 40) return width;
+            }
+            return 0;
+        }
+
+        function syncItemModalUploadZoneSize() {
+            const modal = document.getElementById('itemModal');
+            if (!modal || !modal.classList.contains('show')) return;
+            const imageSlot = modal.querySelector('.item-modal-image-slot');
+            const uploadZone = document.getElementById('uploadZone');
+            if (!imageSlot || !uploadZone) return;
+            const targetWidth = getItemModalReferenceInputWidth();
+            if (targetWidth <= 0) return;
+            imageSlot.style.width = `${targetWidth}px`;
+            uploadZone.style.width = `${targetWidth}px`;
+            uploadZone.style.height = `${targetWidth}px`;
+        }
+
+        function scheduleItemModalUploadZoneSizeSync() {
+            window.requestAnimationFrame(() => {
+                syncItemModalUploadZoneSize();
+                window.setTimeout(syncItemModalUploadZoneSize, 80);
+                window.setTimeout(syncItemModalUploadZoneSize, 220);
+            });
+        }
+
+        window.addEventListener('resize', () => {
+            if (document.getElementById('itemModal')?.classList.contains('show')) {
+                syncItemModalUploadZoneSize();
+            }
+            if (document.getElementById('itemImagePreviewModal')?.classList.contains('show')) {
+                applyItemImagePreviewTransform();
+            }
+        });
+
         // ---------- 添加 / 编辑物品 ----------
         async function openAddItem() {
             const now = new Date();
@@ -12665,6 +13344,7 @@ $currentUserJson = json_encode([
             document.getElementById('itemSharePublic').checked = false;
             document.getElementById('itemQuantity').value = '1';
             document.getElementById('itemRemainingCurrent').value = '';
+            document.getElementById('itemDescription').value = '';
             document.getElementById('itemPrice').value = '0';
             document.getElementById('itemDate').value = today;
             document.getElementById('itemProductionDate').value = '';
@@ -12691,6 +13371,7 @@ $currentUserJson = json_encode([
             refreshDateInputPlaceholderDisplay(document.getElementById('itemForm'));
             closeItemUnsavedConfirm();
             markItemFormClean();
+            scheduleItemModalUploadZoneSizeSync();
         }
 
         async function editItem(id) {
@@ -12709,6 +13390,7 @@ $currentUserJson = json_encode([
             document.getElementById('itemRemainingCurrent').value = Number(item.remaining_total || 0) > 0
                 ? String(Math.min(editQty, Math.max(0, Number(item.remaining_current || 0))))
                 : '';
+            document.getElementById('itemDescription').value = item.description || '';
             document.getElementById('itemPrice').value = item.purchase_price;
             document.getElementById('itemDate').value = item.purchase_date;
             document.getElementById('itemProductionDate').value = item.production_date || '';
@@ -12735,6 +13417,7 @@ $currentUserJson = json_encode([
                 document.getElementById('uploadPlaceholder').classList.add('hidden');
                 document.getElementById('uploadZone').classList.add('has-image');
             }
+            refreshItemImagePreviewButton();
 
             // 关键：await 等待下拉框填充完成后再设置值
             await populateSelects({
@@ -12749,6 +13432,7 @@ $currentUserJson = json_encode([
             refreshDateInputPlaceholderDisplay(document.getElementById('itemForm'));
             closeItemUnsavedConfirm();
             markItemFormClean();
+            scheduleItemModalUploadZoneSizeSync();
         }
 
         async function populateSelects(options = {}) {
@@ -12863,6 +13547,7 @@ $currentUserJson = json_encode([
                 category_id: +document.getElementById('itemCategory').value,
                 subcategory_id: +document.getElementById('itemSubcategory').value,
                 location_id: +document.getElementById('itemLocation').value,
+                description: document.getElementById('itemDescription').value.trim(),
                 quantity: quantity,
                 remaining_current: remainingCurrent,
                 remaining_total: hasRemainingValue ? quantity : 0,
@@ -12942,7 +13627,15 @@ $currentUserJson = json_encode([
                 return false;
             }
             setItemFormDateError('');
+            closeItemImagePreviewModal();
             document.getElementById('itemModal').classList.remove('show');
+            const imageSlot = document.querySelector('#itemModal .item-modal-image-slot');
+            const uploadZone = document.getElementById('uploadZone');
+            if (imageSlot) imageSlot.style.width = '';
+            if (uploadZone) {
+                uploadZone.style.width = '';
+                uploadZone.style.height = '';
+            }
             closeItemUnsavedConfirm();
             clearItemFormTrack();
             return true;
@@ -13078,6 +13771,8 @@ $currentUserJson = json_encode([
             document.getElementById('uploadPreview').src = '';
             document.getElementById('uploadPlaceholder').classList.remove('hidden');
             document.getElementById('uploadZone').classList.remove('has-image');
+            closeItemImagePreviewModal();
+            refreshItemImagePreviewButton();
         }
 
         async function handleImageUpload(input) {
@@ -13106,12 +13801,14 @@ $currentUserJson = json_encode([
                     document.getElementById('uploadPreview').classList.remove('hidden');
                     document.getElementById('uploadPlaceholder').classList.add('hidden');
                     document.getElementById('uploadZone').classList.add('has-image');
+                    refreshItemImagePreviewButton();
                 } else {
                     toast((res && res.message) || '上传失败', 'error');
                 }
             } catch (e) {
                 toast('上传失败：网络异常或服务器限制导致中断', 'error');
             }
+            refreshItemImagePreviewButton();
             input.value = '';
         }
 
@@ -13163,6 +13860,7 @@ $currentUserJson = json_encode([
             document.getElementById('publicSharedEditName').value = String(item.item_name || '');
             document.getElementById('publicSharedEditPrice').value = Number(item.purchase_price || 0);
             document.getElementById('publicSharedEditPurchaseFrom').value = String(item.purchase_from || '');
+            document.getElementById('publicSharedEditPurchaseLink').value = String(item.purchase_link || '');
             document.getElementById('publicSharedEditReason').value = String(item.recommend_reason || '');
             document.getElementById('publicSharedEditModal').classList.add('show');
         }
@@ -13185,6 +13883,7 @@ $currentUserJson = json_encode([
                 category_id: Number(document.getElementById('publicSharedEditCategory').value || 0),
                 purchase_price: Number(document.getElementById('publicSharedEditPrice').value || 0),
                 purchase_from: document.getElementById('publicSharedEditPurchaseFrom').value.trim(),
+                purchase_link: document.getElementById('publicSharedEditPurchaseLink').value.trim(),
                 recommend_reason: document.getElementById('publicSharedEditReason').value.trim()
             };
             if (!payload.item_name) {
@@ -13255,6 +13954,7 @@ $currentUserJson = json_encode([
             App.publicChannelItems = list;
             const withPrice = list.filter(x => Number(x.purchase_price || 0) > 0).length;
             const withFrom = list.filter(x => String(x.purchase_from || '').trim() !== '').length;
+            const withLink = list.filter(x => String(x.purchase_link || '').trim() !== '').length;
             const withReason = list.filter(x => String(x.recommend_reason || '').trim() !== '').length;
 
             container.innerHTML = `
@@ -13264,6 +13964,7 @@ $currentUserJson = json_encode([
                     <span class="text-sm text-slate-400"><i class="ri-broadcast-line mr-1 text-cyan-400"></i>共享物品 ${list.length} 条</span>
                     <span class="text-sm text-slate-400"><i class="ri-money-cny-circle-line mr-1 text-amber-400"></i>含价格 ${withPrice} 条</span>
                     <span class="text-sm text-slate-400"><i class="ri-shopping-bag-line mr-1 text-emerald-400"></i>含渠道 ${withFrom} 条</span>
+                    <span class="text-sm text-slate-400"><i class="ri-link-m mr-1 text-sky-400"></i>含链接 ${withLink} 条</span>
                     <span class="text-sm text-slate-400"><i class="ri-thumb-up-line mr-1 text-violet-400"></i>含推荐理由 ${withReason} 条</span>
                 </div>
                 <span class="text-xs text-slate-500">可查看基础属性并一键加入购物清单</span>
@@ -13281,6 +13982,12 @@ $currentUserJson = json_encode([
                 ${list.map((item, i) => {
                     const categoryName = String(item.category_name || '').trim() || '未分类';
                     const purchaseFrom = String(item.purchase_from || '').trim();
+                    const purchaseLink = String(item.purchase_link || '').trim();
+                    const purchaseLinkHtml = purchaseLink
+                        ? (/^https?:\/\//i.test(purchaseLink)
+                            ? `<a href="${esc(purchaseLink)}" target="_blank" rel="noopener noreferrer" class="text-cyan-300 hover:text-cyan-200 underline break-all">${esc(purchaseLink)}</a>`
+                            : `<span class="text-slate-300 break-all">${esc(purchaseLink)}</span>`)
+                        : '<span class="text-slate-600">未填写</span>';
                     const recommendReason = String(item.recommend_reason || '').trim();
                     const ownerName = String(item.owner_name || '').trim() || '未知用户';
                     const updatedDate = String(item.owner_item_updated_at || item.updated_at || '').slice(0, 10);
@@ -13303,6 +14010,7 @@ $currentUserJson = json_encode([
                             <p><i class="ri-price-tag-3-line mr-1 text-sky-400"></i>分类：${esc(categoryName)}</p>
                             <p><i class="ri-money-cny-circle-line mr-1 text-amber-400"></i>购入价格：${priceHtml}</p>
                             <p><i class="ri-shopping-bag-line mr-1 text-emerald-400"></i>购入渠道：${purchaseFrom ? esc(purchaseFrom) : '<span class="text-slate-600">未记录</span>'}</p>
+                            <p><i class="ri-link-m mr-1 text-sky-400"></i>购买链接：${purchaseLinkHtml}</p>
                             <p><i class="ri-thumb-up-line mr-1 text-violet-400"></i>推荐理由：${recommendReason ? esc(recommendReason) : '<span class="text-slate-600">未填写</span>'}</p>
                             <p><i class="ri-time-line mr-1 text-slate-500"></i>最近更新：${updatedDate || '未知'}</p>
                         </div>
@@ -13794,6 +14502,7 @@ $currentUserJson = json_encode([
             const convertedQty = Math.max(1, Number(item.quantity || 1));
             document.getElementById('itemQuantity').value = convertedQty;
             document.getElementById('itemRemainingCurrent').value = '';
+            document.getElementById('itemDescription').value = '';
             document.getElementById('itemPrice').value = Math.max(0, Number(item.planned_price || 0));
             document.getElementById('itemDate').value = today;
             document.getElementById('itemProductionDate').value = '';
@@ -13825,6 +14534,7 @@ $currentUserJson = json_encode([
             refreshDateInputPlaceholderDisplay(document.getElementById('itemForm'));
             closeItemUnsavedConfirm();
             markItemFormClean();
+            scheduleItemModalUploadZoneSizeSync();
         }
 
         function closeShoppingModal() {
@@ -14784,6 +15494,7 @@ $currentUserJson = json_encode([
             document.getElementById('itemRemainingCurrent').value = Number(item.remaining_total || 0) > 0
                 ? String(Math.min(copyQty, Math.max(0, Number(item.remaining_current || 0))))
                 : '';
+            document.getElementById('itemDescription').value = item.description || '';
             document.getElementById('itemPrice').value = item.purchase_price;
             document.getElementById('itemDate').value = item.purchase_date;
             document.getElementById('itemProductionDate').value = item.production_date || '';
@@ -14810,6 +15521,7 @@ $currentUserJson = json_encode([
                 document.getElementById('uploadPlaceholder').classList.add('hidden');
                 document.getElementById('uploadZone').classList.add('has-image');
             }
+            refreshItemImagePreviewButton();
 
             await populateSelects({
                 status: item.status,
@@ -14823,6 +15535,7 @@ $currentUserJson = json_encode([
             refreshDateInputPlaceholderDisplay(document.getElementById('itemForm'));
             closeItemUnsavedConfirm();
             markItemFormClean();
+            scheduleItemModalUploadZoneSizeSync();
             toast('已复制物品资料，请确认后保存');
         }
 
@@ -15037,6 +15750,26 @@ $currentUserJson = json_encode([
  
         // ---------- 更新记录数据 ----------
         const CHANGELOG = [
+            {
+                version: 'v1.10.0', date: '2026-02-22',
+                sections: {
+                    features: [
+                        '“编辑物品 / 已购买入库”图片区域新增“显示大图”按钮，可在独立弹窗查看大图',
+                        '大图预览新增“放大 / 缩小 / 还原”三项操作，并实时显示缩放比例',
+                        '大图放大后支持鼠标按住拖动查看细节，便于核对票据与参数图'
+                    ],
+                    optimizations: [
+                        '物品编辑弹窗布局调整为左中右三列对齐，避免图片尺寸影响名称与分类位置的对齐关系',
+                        '状态与下方字段间距按统一网格收敛，和“状态-购入渠道”间距保持一致',
+                        'Demo 数据新增可预览图片样例，默认覆盖“大图预览 + 缩放 + 拖拽”验证场景',
+                        '“帮助文档”与字段提示补充图片大图预览的使用说明'
+                    ],
+                    fixes: [
+                        '修复大图预览无图状态下按钮仍可点击的问题，无图时按钮自动禁用',
+                        '修复大图预览缩放后窗口尺寸变化导致图片偏移的问题，窗口变化时会自动重算位置'
+                    ]
+                }
+            },
             {
                 version: 'v1.9.3', date: '2026-02-21',
                 sections: {
@@ -15263,6 +15996,7 @@ $currentUserJson = json_encode([
             '日期输入支持两种方式：可直接输入 6-8 位数字（8位 YYYYMMDD、7位 YYYYMDD、6位 YYMMDD，6位会自动转 20YY）并在失焦后标准化为 YYYY-MM-DD，也可点击输入框右侧日历按钮手动选择。',
             '「余量」支持留空：留空时不会触发低余量提醒，后续可在编辑里再补。',
             '填写了“生产日期 + 保质期”后，系统会自动更新“过期日期”；留空保质期时可手动填过期日期。',
+            '上传图片后可点图片区右侧“显示大图”：预览窗口支持放大/缩小/还原，放大后可拖动查看细节。',
             '要用循环提醒时，先填「循环提醒初始日期」，再填「循环频率」，系统会自动算出「下次提醒日期」。',
             '需要采购时先记到「购物清单」，买完后点「已购买入库」可直接转成物品。',
             '编辑购物清单时，可用左下角「转为已购买 / 转为待购买」按钮快速切换采购进度。',
@@ -15273,7 +16007,7 @@ $currentUserJson = json_encode([
         ];
         const HELP_DOC_FEATURES = [
             { name: '仪表盘', desc: '查看总量、分类统计、过期提醒、备忘提醒和低余量提醒。' },
-            { name: '物品管理', desc: '添加、编辑、删除物品，支持筛选、排序、复制和回收站。' },
+            { name: '物品管理', desc: '添加、编辑、删除物品，支持筛选、排序、复制、图片大图预览与回收站。' },
             { name: '购物清单', desc: '记录待买和待收货商品，设置优先级、预算和提醒，并可一键入库。' },
             { name: '任务清单', desc: '多人任务协作，支持待办/完成切换、编辑、删除。' },
             { name: '集合清单', desc: '把已存在物品按场景归集成清单，支持批量加入、旗标标记、快速移除和一键查看详情。' },
@@ -15307,7 +16041,7 @@ $currentUserJson = json_encode([
                     { name: '循环提醒备注', desc: '提醒弹出时要做什么，例如“更换滤芯”；留空也可以。' },
                     { name: '标签（逗号分隔）', desc: '多个关键词用逗号分隔，便于快速搜索；可留空。' },
                     { name: '备注', desc: '其他补充信息都可以写这里，可留空。' },
-                    { name: '图片', desc: '上传物品照片或票据，方便识别和回看。' },
+                    { name: '图片', desc: '上传物品照片或票据后，可点“显示大图”进行放大/缩小/还原；放大后可拖动查看细节。' },
                     { name: '共享到公共频道', desc: '勾选后会分享给其他成员查看。' }
                 ]
             },
@@ -15354,7 +16088,7 @@ $currentUserJson = json_encode([
                 icon: 'ri-broadcast-line',
                 fields: [
                     { name: '物品名称 / 分类', desc: '共享后别人先看到的基础信息。' },
-                    { name: '购入价格 / 购入渠道', desc: '给其他成员做比价和购买参考。' },
+                    { name: '购入价格 / 购入渠道 / 购买链接', desc: '给其他成员做比价和购买参考。' },
                     { name: '推荐理由', desc: '说明你为什么推荐这件物品。' },
                     { name: '评论内容', desc: '成员交流用，评论者本人或管理员可删除评论。' }
                 ]

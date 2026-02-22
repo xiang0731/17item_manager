@@ -2,7 +2,7 @@
 
 > 目标：将实现说明拆分为数据库层、API 层、UI 层，方便按职责快速定位与修改。
 >
-> 行号基于当前版本：`index.php` 约 14300 行，`README.md` 约 330 行。后续行号漂移时请用本文提供的命令重新定位。
+> 行号基于当前版本：`index.php` 约 17200 行，`README.md` 约 380 行。后续行号漂移时请用本文提供的命令重新定位。
 
 ## 目录
 
@@ -63,6 +63,9 @@ rg -n "question_custom|security_question_label|registerClosedPanel|updateAuthHin
 
 # v1.6.0 仪表盘管理（提醒范围）
 rg -n "dashboard_settings|expiry_past_days|expiry_future_days|reminder_past_days|reminder_future_days|settings.dashboard_ranges|dashboard-reminder-grid" index.php
+
+# v1.10.0 图片大图预览（缩放/拖拽）
+rg -n "itemImagePreview|openItemImagePreviewModal|zoomInItemImagePreview|zoomOutItemImagePreview|resetItemImagePreviewTransform|item-image-preview" index.php
 
 # 日期占位相关
 rg -n "DATE_PLACEHOLDER_TEXT|data-date-placeholder|refreshDateInputPlaceholderDisplay" index.php
@@ -259,6 +262,23 @@ php -l index.php
 - 只填过期日期可正常保存；填“生产日期 + 保质期”时过期日期会自动更新。
 - 进入“已购买入库”后，生产日期/保质期为默认空值，填写后可联动并入库成功。
 - 同一物品再次编辑时，生产日期与保质期能正确回填。
+
+### 2.1A 图片大图预览（v1.10.0）
+
+- 代码位置（建议用命令定位）
+- `rg -n "itemImagePreviewBtn|itemImagePreviewModal|itemImagePreviewZoomInBtn|itemImagePreviewZoomOutBtn|itemImagePreviewResetBtn" index.php`
+- `rg -n "openItemImagePreviewModal|closeItemImagePreviewModal|applyItemImagePreviewTransform|bindItemImagePreviewInteractions" index.php`
+
+- 修改步骤
+1. 按钮状态必须和当前图片状态联动：无图禁用，有图启用（`refreshItemImagePreviewButton`）。
+2. 缩放、拖拽、还原必须共用同一状态对象，避免重复状态源（`itemImagePreviewState`）。
+3. 放大后拖拽要限制边界，并在窗口尺寸变化时重算（`clampItemImagePreviewPan` + `window.resize`）。
+4. 关闭弹窗时清空预览图、拖拽态和缩放态，避免下次打开继承旧偏移。
+
+- 验证
+- 无图时“显示大图”按钮禁用；上传或回填图片后按钮可用。
+- 放大后可拖动查看，缩小到 100% 后自动回到居中状态。
+- 连续打开/关闭预览弹窗不会残留上一张图的缩放与位移状态。
 
 ### 2.2 关闭弹窗前提醒保存（忽略修改 / 保存修改）
 
@@ -560,8 +580,9 @@ php -l index.php
 
 - 页面内置更新记录：`index.php` 中 `const CHANGELOG = [...]`
 - 当前版本号来源：`index.php` 中 `const APP_VERSION = CHANGELOG[0].version`
-- README 版本记录：`README.md` 的“更新记录”章节（当前置顶 `v1.6.4`）
+- README 版本记录：`README.md` 的“更新记录”章节（当前置顶 `v1.10.0`）
 - README 功能总览：`README.md` 的“功能概览”章节（含公共频道）
+- 技术栈文档：`TECH_STACK_REPORT.md` 的版本号与生成时间
 
 发布新功能建议同步顺序：
 1. 先改 `index.php` 的 `CHANGELOG`。
